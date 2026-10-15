@@ -283,6 +283,7 @@ Panel {
     if (settling) return "The radio takes a few seconds to come up."
     if (lastError !== "") return lastError
     if (reasonText !== "") return reasonText
+    if (!receiving && doctorText !== "") return doctorText
     if (!receiving) return "Nearby Apple devices cannot see this computer."
     if (visibility === 0) return "The receiver is up, but nothing is advertising on the radio."
     if (visibility === -1) return "Cannot tell whether anyone can see us."
@@ -828,7 +829,8 @@ Panel {
   // already knows exactly which piece is absent, in a sentence written for
   // someone holding a laptop; ask it, and say that instead.
   //
-  // Only when we cannot work: a healthy panel never spawns this.
+  // Recheck while off: packages, the radio backend and its prerequisites can
+  // change outside this panel. A running receiver does not need this check.
   property string doctorText: ""
   property bool driverInstallable: false
   Process {
@@ -877,9 +879,11 @@ Panel {
       if (!audienceProc.running) audience = s.visibility === "contacts" ? "contacts" : "everyone"
       senders = s.senders || 0
       if (!nameField.activeFocus) nameField.text = shownName
-      // Asked once per transition into unusable, not on every poll.
-      if (!usable && doctorText === "" && !doctorProc.running) doctorProc.running = true
-      if (usable) { doctorText = ""; driverInstallable = false }
+      // A helper being present does not mean its prerequisites are met.
+      // Refresh even when an earlier check supplied an explanation; otherwise
+      // installing a backend or changing networks leaves that answer cached.
+      if (!receiving && !busy && !doctorProc.running) doctorProc.running = true
+      if (receiving) { doctorText = ""; driverInstallable = false }
     } catch (e) {
       installed = false
     }
