@@ -272,7 +272,7 @@ Panel {
       return "Only your " + senders + (senders === 1 ? " known sender" : " known senders")
              + " should see " + who + " in AirDrop, after 10 seconds."
     }
-    return "Nearby Apple devices should see " + who + " in AirDrop, after 10 seconds."
+    return "Nearby devices with AirDrop enabled should see " + who + " in AirDrop, after 10 seconds."
   }
   // An empty allow-list is a window nobody can use, so it reads as a fault.
   readonly property bool detailUrgent: detailText === visibleText && audience === "contacts" && senders === 0
@@ -283,7 +283,7 @@ Panel {
     if (settling) return "The radio takes a few seconds to come up."
     if (lastError !== "") return lastError
     if (reasonText !== "") return reasonText
-    if (!receiving) return "Nearby Apple devices cannot see this computer."
+    if (!receiving) return "Nearby devices with AirDrop enabled cannot see this computer."
     if (visibility === 0) return "The receiver is up, but nothing is advertising on the radio."
     if (visibility === -1) return "Cannot tell whether anyone can see us."
     return visibleText
