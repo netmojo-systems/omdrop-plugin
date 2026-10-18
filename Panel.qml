@@ -453,28 +453,33 @@ Panel {
   // otherwise lose its label between lookups.
   //
   // So lookups run back to back only while there is something to find: an
-  // empty listing, where the lookup's wake is what brings phones in, or a
-  // device with no name that has stayed silent through fewer than
-  // `namesTries` full lookups. A new device starts one within a poll. Once
-  // every device has a name, or has stayed silent that long (a watch, a TV, a
-  // phone that only receives from contacts), a lookup runs once a minute, which
-  // keeps waking phones that arrive later and re-asks the silent ones. Each
-  // lookup spawns a sender per peer per attempt and a root helper every 2 s,
-  // so running them back to back for as long as the radar was open kept a
-  // full core busy (#70).
+  // empty listing, or a device with no name that has stayed silent through
+  // fewer than `namesTries` full lookups. With omdrop-awdl, a lookup over an
+  // empty listing holds the wake that brings phones in; omdrop-owl's exits at
+  // once, so there it waits out the guard below. A new device starts a lookup
+  // within a poll. A device's tries count for as long as the radar is open,
+  // even if it leaves and returns, and after `namesTries` full lookups in a
+  // row that learn no new name, new devices wait too: AWDL addresses rotate,
+  // and around other Apple devices fresh anonymous ones keep arriving (#89).
+  // Once nothing is left to find, or nothing is being found, a lookup runs
+  // once a minute, which keeps waking phones that arrive later and re-asks
+  // the silent ones. Each lookup spawns a sender per peer per attempt and a
+  // root helper every 2 s, so running them back to back for as long as the
+  // radar was open kept a full core busy (#70).
   property bool radarOpen: false
   property bool soundOn: true
   property var peers: []            // [{mac, rssi, name}] -- the last listing, names merged in
   property var peerNames: ({})      // mac -> name, everything learnt this session
   property bool namesResolved: false  // a name lookup has answered at least once
   property var unanswered: ({})     // mac -> full lookups it stayed silent through, this radar
+  property int fruitless: 0         // full lookups in a row that learnt no new name
   readonly property int namesTries: 2
   readonly property int namesRetryMs: 250      // something is still to be found
   readonly property int namesGuardMs: 10000    // the last lookup failed at once
   readonly property int namesRecheckMs: 60000  // everyone has a name or stayed silent
-  readonly property bool namesWanted: peers.length === 0 || peers.some(function(p) {
+  readonly property bool namesWanted: peers.length === 0 || (fruitless < namesTries && peers.some(function(p) {
     return p.name === "" && (unanswered[p.mac] || 0) < namesTries
-  })
+  }))
   property var flashedMacs: ({})    // rows that have had their arrival flash
   readonly property bool scanning: radarOpen && root.opened && receiving && visibility === 1
   // The line under the heading. Empty once there is a list to look at.
@@ -532,14 +537,6 @@ Panel {
       out.push({ mac: p.mac, rssi: p.rssi, name: p.name || peerNames[p.mac] || "" })
     }
     peers = out
-    // A device that left and came back may have opened its AirDrop meanwhile,
-    // so it gets its tries again.
-    var kept = {}, dropped = false
-    for (var mac in unanswered) {
-      if (out.some(function(q) { return q.mac === mac })) kept[mac] = unanswered[mac]
-      else dropped = true
-    }
-    if (dropped) unanswered = kept
   }
 
   // One peer's answer, as the lookup reports it. The lookup streams a line
@@ -552,6 +549,7 @@ Panel {
       var known = Object.assign({}, peerNames)
       known[p.mac] = p.name
       peerNames = known
+      namesProc.learnt = true
       mergePeers(peers)
     }
     namesResolved = true
@@ -658,7 +656,8 @@ Panel {
     id: namesProc
     command: [root.cli, "peers", "--json", "-n", "--stream"]
     property double startedAt: 0
-    onStarted: startedAt = Date.now()
+    property bool learnt: false    // this lookup found a name we did not have
+    onStarted: { startedAt = Date.now(); learnt = false }
     stdout: SplitParser {
       onRead: function(line) {
         try { root.learnName(JSON.parse(line)) } catch (e) {}
@@ -681,6 +680,7 @@ Panel {
         var u = Object.assign({}, root.unanswered)
         root.peers.forEach(function(p) { if (p.name === "") u[p.mac] = (u[p.mac] || 0) + 1 })
         root.unanswered = u
+        root.fruitless = learnt ? 0 : root.fruitless + 1
       }
       // A lookup that fails at once (no sender, the radio just went) would
       // otherwise restart in a tight loop, so a quick exit waits before the
@@ -712,6 +712,7 @@ Panel {
   onScanningChanged: {
     if (scanning) {
       unanswered = ({})
+      fruitless = 0
       lookUpNames(0)
     } else {
       namesAgain.stop()
