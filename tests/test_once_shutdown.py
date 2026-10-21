@@ -28,6 +28,9 @@ class OneFileShutdownTests(unittest.TestCase):
             (root / "arrived.jpg").write_text("x")
             capture = root / "events"
             stored = f"upload ABC: stored {root}/arrived.jpg"
+            # Outside the f-string: a backslash in its expressions needs Python 3.12.
+            systemd_run_body = ("printf 'systemd-run %s\\n' \"$*\" >> \"$CAPTURE\""
+                                if systemd_run else "return 1")
             harness = f"""
 set -uo pipefail
 SELF={root}/omdrop
@@ -35,7 +38,7 @@ UNIT=airdrop-receiver.service
 CAPTURE={capture}
 effective_dir(){{ printf '%s' {str(root)!r}; }}
 journalctl(){{ printf '%s\\n' {stored!r}; }}
-systemd-run(){{ {"printf 'systemd-run %s\\n' \"$*\" >> \"$CAPTURE\"" if systemd_run else "return 1"}; }}
+systemd-run(){{ {systemd_run_body}; }}
 {fragment}
 cmd_watch {"--once" if once else ""}
 """

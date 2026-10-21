@@ -69,14 +69,13 @@ def config_namespace():
 
 
 def cpio_bytes(files):
+    # add_file_from_memory names members the same way in libarchive-c 2.9 to
+    # 5.3; add_files(pathname=) is a TypeError in 2.9 and ignored in 5.1.
     with tempfile.TemporaryDirectory() as work:
-        work = Path(work)
-        archive_path = work / "payload.cpio"
+        archive_path = Path(work) / "payload.cpio"
         with libarchive.file_writer(str(archive_path), "cpio") as archive:
-            for index, (name, data) in enumerate(files):
-                source = work / f"source-{index}"
-                source.write_bytes(data)
-                archive.add_files(str(source), pathname=name)
+            for name, data in files:
+                archive.add_file_from_memory(name, len(data), data)
         return archive_path.read_bytes()
 
 
