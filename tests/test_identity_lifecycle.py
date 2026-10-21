@@ -639,6 +639,14 @@ class DebugDumpTests(unittest.TestCase):
     def test_sensitive_dumps_are_verbatim(self):
         self.assertEqual(self.dump(OMDROP_DEBUG_SENSITIVE='1').read_bytes(), self.body)
 
+    def test_a_plist_whose_references_expand_is_dumped_opaque(self):
+        # The redacted dump is XML, which writes every reference out in full.
+        entry = {'FileName': 'A' * 10_000}
+        self.body = __import__('plistlib').dumps({'Files': [entry] * 2000},
+                                                 fmt=__import__('plistlib').FMT_BINARY)
+        self.assertEqual(self.dump(OMDROP_DEBUG='1').read_bytes(),
+                         f'<opaque {len(self.body)} bytes>'.encode())
+
 
 import unittest.mock  # noqa: E402
 

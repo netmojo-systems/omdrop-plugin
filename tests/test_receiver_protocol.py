@@ -333,6 +333,19 @@ class ContactsOnlyTests(ReceiverFixture):
                               plistlib.dumps({}, fmt=plistlib.FMT_BINARY))
         self.assertEqual(status, 200)
 
+    def test_an_ask_whose_references_expand_is_refused_without_expanding_them(self):
+        # One 10 KB file entry named 2000 times: a 30 KB body whose listing
+        # would be a 20 MB log line. The same shape at 900 000 references
+        # needed 54 GB (omacom/omarchy-plugin-marketplace#10665).
+        entry = {"FileName": "A" * 10_000, "FileType": "public.data", "FileSize": 1}
+        ask = plistlib.dumps({"SenderComputerName": "Mac", "TransferType": {"files": 1},
+                              "Files": [entry] * 2000}, fmt=plistlib.FMT_BINARY)
+        before = self.log.stat().st_size
+        status, _ = self.post(self.connection(), "/Ask", ask)
+        self.assertEqual(status, 403)
+        self.assertLess(self.log.stat().st_size - before, 64 * 1024)
+        self.assertIn("ask: undecodable", self.log.read_text())
+
 
 class StalledHandshakeTests(ReceiverFixture):
     def test_a_connection_that_never_finishes_its_handshake_does_not_block_the_next_sender(self):
