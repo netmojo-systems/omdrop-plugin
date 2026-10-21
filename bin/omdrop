@@ -1442,7 +1442,7 @@ cmd_install_core() {
   fi
   if have=$(pacman -Q "$CORE_PKG" 2>/dev/null); then
     have=${have##* }
-    if (( $(vercmp "$have" "$want") >= 0 )); then
+    if version_ge "$have" "$want"; then
       echo "omdrop-core $have is installed and current. Nothing to do."
       return 0
     fi
@@ -1451,7 +1451,7 @@ cmd_install_core() {
   receiving && die "Omdrop is receiving. Turn it off first (omdrop off), then run omdrop install-core again."
 
   repo=$(pacman -Si "$CORE_PKG" 2>/dev/null | sed -n 's/^Version *: *//p' | head -n 1)
-  if [[ -n "$repo" ]] && (( $(vercmp "$repo" "$want") >= 0 )); then
+  if [[ -n "$repo" ]] && version_ge "$repo" "$want"; then
     build="set -e
 sudo pacman -S --needed $CORE_PKG"
   else
@@ -1907,7 +1907,7 @@ driver_current() {
   local installed
   installed=$(pacman -Q "$DRIVER_PKG" 2>/dev/null) || return 1
   installed=${installed##* }
-  (( $(vercmp "$installed" "$DRIVER_VERSION") >= 0 ))
+  version_ge "$installed" "$DRIVER_VERSION"
 }
 
 # What a send is of, in a few words: the file's name, or how many there are.

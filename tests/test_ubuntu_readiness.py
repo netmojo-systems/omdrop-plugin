@@ -99,6 +99,23 @@ ctypes.CDLL = load
         self.env['MISSING_LIBRARY'] = '1'
         self.assertNotEqual(self.run_function('receiver_libs_installed').returncode, 0)
 
+    def test_driver_current_compares_without_vercmp(self):
+        self.command('pacman', 'echo "brcmfmac-awdl-dkms $INSTALLED"\n')
+        preamble = 'DRIVER_PKG=brcmfmac-awdl-dkms\nDRIVER_VERSION=0.10.0'
+        for installed, current in (('0.10.0-1', True), ('0.10.2-1', True), ('0.9.9-1', False)):
+            with self.subTest(installed=installed):
+                self.env['INSTALLED'] = installed
+                result = self.run_function('driver_current', preamble)
+                self.assertEqual(result.returncode == 0, current, result.stderr)
+                self.assertNotIn('syntax error', result.stderr)
+
+    def test_only_version_ge_runs_vercmp(self):
+        # Every other comparison goes through version_ge, so none of them reads
+        # a missing vercmp as an arithmetic error.
+        outside = SOURCE.replace(function('version_ge'), '')
+        code = [line for line in outside.splitlines() if not line.lstrip().startswith('#')]
+        self.assertEqual([line for line in code if '$(vercmp' in line], [])
+
 
 if __name__ == '__main__':
     unittest.main()
