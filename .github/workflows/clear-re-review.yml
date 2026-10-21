@@ -1,0 +1,31 @@
+# Removes "re-review" from open pull requests whose latest decisive review
+# (approved or changes requested) is an approval.
+#
+# Triggered by "Review submitted". It trusts nothing from that run: it reads
+# the labels and reviews from the API, and never checks out pull request code.
+name: Clear re-review label
+
+on:
+  workflow_run:
+    workflows: [Review submitted]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  clear:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove re-review from approved pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for pr in $(gh pr list --state open --label re-review --json number -q '.[].number'); do
+            state=$(gh api "repos/$GH_REPO/pulls/$pr/reviews" --paginate \
+              -q '.[] | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED") | .state' | tail -n 1)
+            if [ "$state" = APPROVED ]; then
+              gh pr edit "$pr" --remove-label re-review
+            fi
+          done

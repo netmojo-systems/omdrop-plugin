@@ -89,7 +89,7 @@ OMDROP_INTEROP_RS_SERVE=target/debug/omdrop-receiver \
 
 `crates/omdrop-radio/tests/python/` runs omdrop-awdl's privileged-input and supervisor tests against `omdrop-radio` and a mock backend.
 
-Fuzzing: `fuzz/` has cargo-fuzz targets for the archive decoder, extraction, the plist parser and HTTP request parsing. They need a nightly toolchain:
+Fuzzing: `fuzz/` has cargo-fuzz targets for the archive decoder, extraction, the plist parser and HTTP request parsing. The corpus and crash inputs stay local, out of the repository, because the marketplace's security scan cannot process them. The targets need a nightly toolchain:
 
 ```bash
 cd fuzz && cargo +nightly fuzz run cpio_extract -- -max_total_time=300

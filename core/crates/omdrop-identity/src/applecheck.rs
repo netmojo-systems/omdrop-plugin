@@ -491,6 +491,44 @@ pub(crate) mod tests {
         assert_eq!(crate::apple::certificate_account(&der(&cert)), "");
     }
 
+    /// Apple's first Application Integration CA, as first vendored, expired
+    /// on 2026-10-21. Apple re-issued it with the same name and key, valid
+    /// until 2028-10-04. Trusting the expired copy refuses every Contacts Only
+    /// sender it issued, even when the sender sends the renewed one (#75).
+    #[test]
+    fn every_vendored_intermediate_chains_to_the_root_after_2026_10_21() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&dir.path().join("root.pem"), crate::apple::ROOT_CA_PEM).expect("root");
+        for (i, (pem, name)) in crate::apple::INTERMEDIATES_PEM
+            .iter()
+            .zip(crate::apple::INTERMEDIATE_NAMES)
+            .enumerate()
+        {
+            let file = format!("int{i}.pem");
+            write_file(&dir.path().join(&file), pem).expect("intermediate");
+            let out = openssl(
+                &[
+                    "verify",
+                    "-attime",
+                    "1792627200",
+                    "-CAfile",
+                    "root.pem",
+                    &file,
+                ],
+                None,
+                Some(dir.path()),
+                None,
+            )
+            .expect("openssl runs");
+            assert!(
+                out.status.success(),
+                "{name}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     #[test]
     fn expiry_follows_valid_as_of_plus_duration() {
         let p = plist("A", "2030-01-01T00:00:00Z", 60, &[]);

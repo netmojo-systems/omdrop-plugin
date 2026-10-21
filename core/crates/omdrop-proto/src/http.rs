@@ -51,12 +51,17 @@ pub enum BodyError {
     /// what had arrived was already a whole archive (see [`Patience`]). The
     /// extractor treats it as the body's end; it never reaches a sender.
     Complete,
+    /// Not a refusal either: the connection failed mid-body (reset, aborted,
+    /// or a TLS session that ended without close_notify), so the sender has
+    /// gone and nothing can be answered (plugin #90).
+    ConnectionLost(String),
 }
 
 impl BodyError {
     pub fn status(&self) -> u16 {
         match self {
-            BodyError::Invalid(_) => 400,
+            // ConnectionLost is never answered; 400 only keeps this total.
+            BodyError::Invalid(_) | BodyError::ConnectionLost(_) => 400,
             BodyError::TooLarge(_) => 413,
             BodyError::Timeout(_) | BodyError::Complete => 408,
         }
@@ -67,8 +72,8 @@ impl BodyError {
     }
 
     /// What an I/O error from a body read means: a `BodyError` raised inside a
-    /// reader, a socket timeout ([`Stall::Idle`]), or neither (`Err`: the
-    /// connection failed, the disk failed).
+    /// reader (including [`BodyError::ConnectionLost`]), a socket timeout
+    /// ([`Stall::Idle`]), or neither (`Err`: the disk failed).
     pub fn classify(e: io::Error) -> Result<BodyError, io::Error> {
         if e.get_ref().is_some_and(|inner| inner.is::<BodyError>()) {
             return match e.into_inner().map(|inner| inner.downcast::<BodyError>()) {
@@ -86,7 +91,9 @@ impl BodyError {
 impl fmt::Display for BodyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BodyError::Invalid(m) | BodyError::TooLarge(m) => f.write_str(m),
+            BodyError::Invalid(m) | BodyError::TooLarge(m) | BodyError::ConnectionLost(m) => {
+                f.write_str(m)
+            }
             BodyError::Timeout(Stall::Idle) => f.write_str("timed out"),
             BodyError::Timeout(Stall::Rate) => {
                 f.write_str("request body did not meet minimum read rate")
@@ -161,6 +168,11 @@ impl ReadDeadline {
 
     pub fn transferred(&self) -> u64 {
         self.transferred
+    }
+
+    /// How long the body has been read for.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 
     /// Count `size` received bytes; a [`Stall::Rate`] timeout when the body is
@@ -331,8 +343,8 @@ enum Chunk {
 }
 
 /// Streams one framed request body under a byte limit and a [`ReadDeadline`].
-/// Its errors are `io::Error`s wrapping a [`BodyError`]; pass them to
-/// [`BodyError::classify`].
+/// Its errors are `io::Error`s wrapping a [`BodyError`], or a socket timeout;
+/// pass them to [`BodyError::classify`].
 pub struct BodyReader<'a, R: BufRead> {
     r: &'a mut R,
     limit: u64,
@@ -525,6 +537,27 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
 
 impl<R: BufRead> Read for BodyReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_framed(buf).map_err(connection_lost)
+    }
+}
+
+/// Everything a `BodyReader` reads comes from the socket, so an error that is
+/// neither one of ours nor a timeout means the connection failed.
+fn connection_lost(e: io::Error) -> io::Error {
+    if e.get_ref().is_some_and(|inner| inner.is::<BodyError>()) || is_timeout(&e) {
+        return e;
+    }
+    // rustls's own text for this one carries a documentation link.
+    let why = if e.kind() == io::ErrorKind::UnexpectedEof {
+        "the connection closed without TLS close_notify".to_string()
+    } else {
+        e.to_string()
+    };
+    BodyError::ConnectionLost(why).into_io()
+}
+
+impl<R: BufRead> BodyReader<'_, R> {
+    fn read_framed(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -554,7 +587,6 @@ pub fn read_small_body(
         Ok(_) => Ok(body),
         Err(e) => match BodyError::classify(e) {
             Ok(err) => Err(err),
-            // A connection that failed mid-body: the caller can only close it.
             Err(e) => Err(BodyError::Invalid(format!("request body read failed: {e}"))),
         },
     }
@@ -996,6 +1028,66 @@ mod tests {
         ));
         let e = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
         assert!(BodyError::classify(e).is_err());
+    }
+
+    /// A socket that delivers some of a body, then fails with `kind`.
+    struct FailsAfter {
+        sent: bool,
+        kind: io::ErrorKind,
+    }
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if std::mem::replace(&mut self.sent, true) {
+                return Err(io::Error::new(self.kind, "socket failed"));
+            }
+            buf[..10].fill(b'x');
+            Ok(10)
+        }
+    }
+
+    #[test]
+    fn a_connection_that_fails_mid_body_is_lost_not_a_disk_error() {
+        // Everything a body reader reads is the socket's, so any failure
+        // there means the sender has gone (plugin #90). A timeout is still a
+        // stall, and an error that never passed through a body reader is
+        // still the disk's.
+        use io::ErrorKind::*;
+        for kind in [
+            ConnectionReset,
+            ConnectionAborted,
+            BrokenPipe,
+            UnexpectedEof,
+            InvalidData,
+            WouldBlock,
+        ] {
+            let mut sock = io::BufReader::new(FailsAfter { sent: false, kind });
+            let mut deadline = ReadDeadline::new();
+            let mut body = BodyReader::new(&mut sock, BodyPlan::Length(100), 100, &mut deadline);
+            let e = io::copy(&mut body, &mut io::sink()).unwrap_err();
+            match BodyError::classify(e) {
+                Ok(BodyError::Timeout(Stall::Idle)) => assert_eq!(kind, WouldBlock),
+                Ok(BodyError::ConnectionLost(m)) => {
+                    assert_ne!(kind, WouldBlock);
+                    let why = if kind == UnexpectedEof {
+                        "the connection closed without TLS close_notify"
+                    } else {
+                        "socket failed"
+                    };
+                    assert_eq!(m, why);
+                }
+                other => panic!("{kind:?}: {other:?}"),
+            }
+        }
+        let headers = Headers(vec![("Content-Length".into(), "100".into())]);
+        let mut sock = io::BufReader::new(FailsAfter {
+            sent: false,
+            kind: ConnectionReset,
+        });
+        assert!(matches!(
+            read_small_body(&mut sock, &headers, 100),
+            Err(BodyError::ConnectionLost(_))
+        ));
     }
 
     #[test]

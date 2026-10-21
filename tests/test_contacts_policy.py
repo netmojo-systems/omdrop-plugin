@@ -254,5 +254,30 @@ class ContactsPolicyTests(unittest.TestCase):
             self.assertIn(contacts.hash_identifier("15550109999"), hashes)
 
 
+class VendoredAppleCATests(unittest.TestCase):
+    """The CAs shipped beside contacts.py keep verifying Apple senders.
+
+    Apple's first Application Integration CA, as first vendored, expired on
+    2026-10-21. Apple re-issued it with the same name and key, valid until
+    2028-10-04, and iPhones send that copy. A receiver that trusts the expired
+    copy picks it over the one in the handshake, and from then refuses every
+    Contacts Only sender whose certificate it issued (#75).
+    """
+
+    AFTER_THE_OLD_EXPIRY = 1792627200  # 2026-10-22T00:00:00Z
+
+    def test_every_vendored_intermediate_chains_to_the_root_after_2026_10_21(self):
+        root = contacts.apple_root_ca()
+        self.assertIsNotNone(root)
+        intermediates = contacts.apple_intermediates()
+        self.assertTrue(intermediates)
+        for pem in intermediates:
+            with self.subTest(pem=Path(pem).name):
+                verified = subprocess.run(
+                    ["openssl", "verify", "-attime", str(self.AFTER_THE_OLD_EXPIRY),
+                     "-CAfile", root, pem], capture_output=True, text=True)
+                self.assertEqual(0, verified.returncode, verified.stdout + verified.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

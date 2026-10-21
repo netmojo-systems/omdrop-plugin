@@ -1,6 +1,6 @@
 target
 artifacts
 coverage
-# Only the hand-made seeds are kept; what the fuzzer adds stays local.
-corpus/*/*
-!corpus/*/seed-*
+# Inputs stay local: the marketplace security scan cannot process them.
+corpus
+artifacts-keep

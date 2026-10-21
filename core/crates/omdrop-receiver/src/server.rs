@@ -7,6 +7,8 @@
 //!   TLS connection, and a swapped-out reader once made the keep-alive loop see
 //!   EOF.
 //! - `/Upload` arrives as `application/x-dvzip` and is decoded while it streams.
+//!   iOS 16 labels the same compressed archive `application/x-cpio`
+//!   (plugin #40); that body is decoded alike.
 //!
 //! Anything else POSTed is answered 400, GET and HEAD a bare 200, and every
 //! other method 501. One thread per connection, because sharingd opens several
@@ -233,6 +235,13 @@ fn host(addr: &SocketAddr) -> String {
         SocketAddr::V6(v6) => v6.ip().to_string(),
         SocketAddr::V4(v4) => v4.ip().to_string(),
     }
+}
+
+/// A sender that left mid-request: logged, as the Python receiver logs it
+/// (plugin #39), and the connection closed without an answer it can't read.
+fn peer_disconnected(req: &Request, reason: &str) -> Flow {
+    info!("{} peer disconnected: {reason}", req.path);
+    Flow::Close
 }
 
 fn set_reset_on_close(sock: &TcpStream) {
@@ -983,6 +992,7 @@ impl Conn<'_> {
             Err(BodyError::Timeout(_)) => {
                 return self.reject(io, req, 408, "request body read timed out");
             }
+            Err(BodyError::ConnectionLost(m)) => return Ok(peer_disconnected(req, &m)),
             Err(e) => return self.reject(io, req, e.status(), &e.to_string()),
         };
         debug!("buffered bounded {}-byte body for {}", body.len(), req.path);
@@ -1199,7 +1209,7 @@ impl Conn<'_> {
             .unwrap_or_default()
             .trim()
             .to_lowercase();
-        if ctype != "application/x-dvzip" {
+        if ctype != "application/x-dvzip" && ctype != "application/x-cpio" {
             return self.reject(
                 io,
                 req,
@@ -1337,6 +1347,17 @@ impl Conn<'_> {
                         ),
                     )
                 }
+                // The sender left mid-upload: no answer can reach it, and it is
+                // not a storage failure. The partial files and the upload slot
+                // were released when extract and the slot guard returned.
+                Ok(BodyError::ConnectionLost(m)) => Ok(peer_disconnected(
+                    req,
+                    &format!(
+                        "upload {tid}: {m}; {} HTTP body/framing bytes read in {:.1} s",
+                        deadline.transferred(),
+                        deadline.elapsed().as_secs_f64()
+                    ),
+                )),
                 Ok(e) => self.reject(io, req, e.status(), &e.to_string()),
                 Err(e) => self.reject(io, req, 507, &format!("storage failed: {e}")),
             },

@@ -92,15 +92,18 @@ version_ge() {
 # installed another way. Asking costs about a millisecond. Raise CORE_MIN, and
 # core's pkgver with it, when the plugin starts relying on something newer:
 # 0.1.3 pins omdrop-awdl 0.10.0 (install-driver goes to core, so an older core
-# would build the older driver), and 0.1.4 has #57's HEIC previews and Files
-# fallback, which an older core would silently lack.
+# would build the older driver), 0.1.4 has #57's HEIC previews and Files
+# fallback, which an older core would silently lack, and 0.1.7 has Apple's
+# renewed Application Integration CA: an older core trusts the copy that
+# expired on 2026-10-21 and refuses Contacts Only senders it issued (#75),
+# while the Python receiver beside this script has the renewed one.
 #
 # Core also needs a radio backend that ships its hooks (core's
 # docs/backend-contract.md): omdrop-awdl from 0.10.0 does, omdrop-owl does not
 # yet. Without them this script and the Python programs run, so a core that
 # arrives with the omdrop package never drives a backend it has not been
 # tested with. The check is one file test. OMDROP_HOOKS moves it for tests.
-CORE_MIN=0.1.4
+CORE_MIN=0.1.7
 CORE_TOO_OLD=
 CORE_NO_HOOKS=
 core_version() {
@@ -153,7 +156,7 @@ esac
 # A fallback that silently substitutes for the real value is the same class of
 # defect as a status line reporting a state that was never entered, so this one
 # says when it is guessing, and says when the two disagree.
-VERSION_FALLBACK=0.18.0
+VERSION_FALLBACK=0.18.2
 omdrop_version() {
   local dir manifest version= real
   real=$(readlink -f "$0" 2>/dev/null) || real="$0"
@@ -1439,7 +1442,7 @@ cmd_install_core() {
   fi
   if have=$(pacman -Q "$CORE_PKG" 2>/dev/null); then
     have=${have##* }
-    if (( $(vercmp "$have" "$want") >= 0 )); then
+    if version_ge "$have" "$want"; then
       echo "omdrop-core $have is installed and current. Nothing to do."
       return 0
     fi
@@ -1448,7 +1451,7 @@ cmd_install_core() {
   receiving && die "Omdrop is receiving. Turn it off first (omdrop off), then run omdrop install-core again."
 
   repo=$(pacman -Si "$CORE_PKG" 2>/dev/null | sed -n 's/^Version *: *//p' | head -n 1)
-  if [[ -n "$repo" ]] && (( $(vercmp "$repo" "$want") >= 0 )); then
+  if [[ -n "$repo" ]] && version_ge "$repo" "$want"; then
     build="set -e
 sudo pacman -S --needed $CORE_PKG"
   else
@@ -1904,7 +1907,7 @@ driver_current() {
   local installed
   installed=$(pacman -Q "$DRIVER_PKG" 2>/dev/null) || return 1
   installed=${installed##* }
-  (( $(vercmp "$installed" "$DRIVER_VERSION") >= 0 ))
+  version_ge "$installed" "$DRIVER_VERSION"
 }
 
 # What a send is of, in a few words: the file's name, or how many there are.

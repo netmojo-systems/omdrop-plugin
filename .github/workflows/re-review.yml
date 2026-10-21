@@ -1,0 +1,27 @@
+# When the author pushes to a pull request labelled "changes requested",
+# swap that label for "re-review" so maintainers know it is ready again.
+#
+# pull_request_target runs in the base repository's context, so it can label
+# pull requests from forks. It never checks out or runs the pull request's code.
+name: Re-review label
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  relabel:
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'changes requested') &&
+      github.actor == github.event.pull_request.user.login
+    runs-on: ubuntu-latest
+    steps:
+      - name: Swap labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR" --remove-label "changes requested" --add-label "re-review"

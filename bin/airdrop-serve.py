@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import contacts  # noqa: E402  -- sibling module, found via the line above
 import debugdump  # noqa: E402
 import identity  # noqa: E402
+import safeplist  # noqa: E402
 
 # The identity's key is loaded into this process for the life of the window;
 # keep it out of core dumps and away from same-UID ptrace.
@@ -772,7 +773,9 @@ class Handler(BaseHTTPRequestHandler):
       swapped-out rfile once made the keep-alive loop see EOF.
     - /Upload arrives as application/x-dvzip, not the plain x-cpio older
       AirDrop implementations take (answering 406 to it makes the sender
-      report a failed transfer). Decode it.
+      report a failed transfer). Decode it. Older iOS still sends x-cpio
+      (seen from iOS 16): its compressed body decodes to the same CPIO
+      archive, and refusing it failed every transfer from that phone.
     Anything else POSTed is answered 400, GET and HEAD a bare 200, and every
     other method the stock 501.
     """
@@ -803,17 +806,20 @@ class Handler(BaseHTTPRequestHandler):
         # Its first byte ends it, so a request line, headers or body that stall
         # get the ordinary idle limit. peek() blocks for that byte, counts any
         # already buffered, and consumes nothing.
-        if self.awaiting_upload:
-            try:
-                self.rfile.peek(1)
-            except TimeoutError:
-                logging.warning('no Upload within %d s of an accepted Ask; closing the connection',
-                                UPLOAD_WAIT_SECONDS)
-                self.close_connection = True
-                return
-            self.awaiting_upload = False
-            self.request.settimeout(READ_IDLE_TIMEOUT_SECONDS)
-        super().handle_one_request()
+        try:
+            if self.awaiting_upload:
+                try:
+                    self.rfile.peek(1)
+                except TimeoutError:
+                    logging.warning('no Upload within %d s of an accepted Ask; closing the connection',
+                                    UPLOAD_WAIT_SECONDS)
+                    self.close_connection = True
+                    return
+                self.awaiting_upload = False
+                self.request.settimeout(READ_IDLE_TIMEOUT_SECONDS)
+            super().handle_one_request()
+        except (ConnectionError, ssl.SSLError) as e:
+            self.peer_disconnected(str(e))
 
     def handle_expect_100(self):
         # BaseHTTPRequestHandler would acknowledge an upload before its framing
@@ -822,6 +828,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/Upload':
             return True
         return super().handle_expect_100()
+
+    def peer_disconnected(self, reason):
+        self.close_connection = True
+        logging.info('%s peer disconnected: %s',
+                     getattr(self, 'path', 'request'), reason)
 
     def reject(self, status, reason):
         logging.warning('%s rejected: %s', self.path, reason)
@@ -898,7 +909,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_discover(self, body):
         if contacts.visibility() == 'contacts':
             try:
-                record = (plistlib.loads(body) or {}).get('SenderRecordData')
+                record = (safeplist.loads(body) or {}).get('SenderRecordData')
             except Exception:
                 record = None
             outcome, detail = contacts.decide_discovery(record)
@@ -935,7 +946,11 @@ class Handler(BaseHTTPRequestHandler):
     def handle_ask(self, body):
         write_debug(body, 'receive_ask_request.plist')
         try:
-            ask = plistlib.loads(body)
+            # Never plistlib.loads: the log line below walks every reference
+            # in a binary plist, and a sub-MiB body can name one entry
+            # hundreds of thousands of times. Over safeplist's limits, the
+            # Ask is undecodable, as in omdrop-core.
+            ask = safeplist.loads(body)
         except Exception as e:
             logging.error('ask: undecodable %d-byte body: %r', len(body), e)
             ask = {}
@@ -1011,7 +1026,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reject(403, 'contacts-only upload has no accepted Ask')
             return
         ctype = self.headers.get('Content-Type', '').split(';')[0].strip().lower()
-        if ctype != 'application/x-dvzip':
+        if ctype not in ('application/x-dvzip', 'application/x-cpio'):
             self.reject(415, f'unsupported Content-Type {ctype!r}')
             return
         if not UPLOAD_SLOTS.acquire(blocking=False):
@@ -1063,6 +1078,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         except RequestBodyError as e:
             self.reject(e.status, str(e))
+            return
+        except (ConnectionError, ssl.SSLError) as e:
+            # Socket errors are OSErrors too. They do not mean storage failed,
+            # and replying 507 on the dead socket just raises BrokenPipeError.
+            # The temporary file and upload slot are released by with/finally.
+            self.peer_disconnected(
+                f'upload {tid}: {e}; {deadline.transferred} HTTP body/framing '
+                f'bytes read in {time.monotonic() - deadline.started:.1f} s')
             return
         except OSError as e:
             self.reject(507, f'storage failed: {e}')

@@ -1,0 +1,19 @@
+# Signals "Clear re-review label" that a review was submitted.
+#
+# A pull_request_review run on a pull request from a fork gets a read-only
+# token, so it can't change labels. This run does nothing itself; the
+# workflow_run it triggers runs from main with write access.
+name: Review submitted
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  signal:
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Approved review on #${{ github.event.pull_request.number }}"

@@ -9,6 +9,7 @@ AirDrop for [Omarchy](https://omarchy.org), on Macs and PCs. Send and receive fi
 Omdrop needs a radio backend: the package that gives this computer an `awdl0` interface for AWDL, the Wi-Fi link AirDrop runs on. Install one of these:
 
 - **Apple Silicon Macs with Broadcom Wi-Fi (M1 and M2)**: [omdrop-awdl](https://github.com/netmojo-systems/omdrop-awdl), a `brcmfmac` driver that uses the AWDL built into the Wi-Fi firmware. The plugin installs it on first use. See its [Hardware Compatibility](https://github.com/netmojo-systems/omdrop-awdl/blob/main/README.md#hardware-compatibility).
+- **Intel MacBooks with Broadcom BCM4360 Wi-Fi (2013–2017)**: [omdrop-bcm4360](https://github.com/bydash-xyz/omdrop-bcm4360), which runs AWDL in software over Broadcom's `wl` driver. Install it before the plugin. Your Wi-Fi network needs an access point on 5 GHz channel 149, and Wi-Fi moves to it while Omdrop is visible.
 - **PCs with other Wi-Fi cards**: [omdrop-owl](https://github.com/t4t5/omdrop-owl), which runs AWDL in software through [OWL](https://github.com/seemoo-lab/owl). Install it before the plugin. Its [Supported hardware](https://github.com/t4t5/omdrop-owl#supported-hardware) table lists the cards that work; on some, Wi-Fi is off while Omdrop is visible.
 
 The two packages conflict, so a computer has one or the other. [docs/radio-backend.md](docs/radio-backend.md) describes what a backend provides.
@@ -41,11 +42,11 @@ omarchy pkg add omdrop      # plain Arch: sudo pacman -S omdrop
 /usr/bin/omdrop setup       # once per user: adds the widget to the bar
 ```
 
-The package puts the plugin in `/usr/share/omdrop`, and `setup` links it into `~/.config/omarchy/plugins`. Run it as `/usr/bin/omdrop` the first time: if you installed Omdrop before with `omarchy plugin add`, a plain `omdrop` may still run that copy, from `~/.local/bin`. `setup` asks before replacing that copy, and moves it aside to a hidden `.netmojo.omdrop.replaced-<date>` directory beside it rather than deleting it. Afterwards `omdrop` runs the package. The radio still comes from its own package: `brcmfmac-awdl-dkms` on a Mac, `omdrop-owl` on other Wi-Fi cards.
+The package puts the plugin in `/usr/share/omdrop`, and `setup` links it into `~/.config/omarchy/plugins`. Run it as `/usr/bin/omdrop` the first time: if you installed Omdrop before with `omarchy plugin add`, a plain `omdrop` may still run that copy, from `~/.local/bin`. `setup` asks before replacing that copy, and moves it aside to a hidden `.netmojo.omdrop.replaced-<date>` directory beside it rather than deleting it. Afterwards `omdrop` runs the package. The radio still comes from its own package: `brcmfmac-awdl-dkms` on an Apple Silicon Mac, `omdrop-bcm4360` on an Intel MacBook, `omdrop-owl` on other Wi-Fi cards.
 
 ### omdrop-core
 
-Omdrop runs as omdrop-core, its Rust version, wherever the radio backend supports it, and as its bash and Python programs on other backends. Today omdrop-core supports omdrop-awdl; omdrop-owl follows once it ships omdrop-core's hooks ([#73](https://github.com/netmojo-systems/omdrop-plugin/issues/73)).
+Omdrop runs as omdrop-core, its Rust version, wherever the radio backend supports it, and as its bash and Python programs on other backends. Today omdrop-core supports omdrop-awdl and omdrop-bcm4360; omdrop-owl follows once it ships omdrop-core's hooks ([#73](https://github.com/netmojo-systems/omdrop-plugin/issues/73)).
 
 With a supported backend, `omdrop setup` and `omdrop doctor` offer omdrop-core. Install it with Omdrop off:
 
@@ -213,7 +214,7 @@ What the cache does and doesn't protect against:
 
 ## Privileges
 
-The radio helper, `/usr/lib/omdrop/omdrop-discoverable`, runs as root through `pkexec`, because configuring AWDL needs root: vendor commands to the Broadcom firmware, or monitor-mode frame injection with OWL. The radio backend package installs the helper and a polkit action that covers only that root-owned path: `org.omarchy.omdrop.discover` from omdrop-awdl, `io.github.t4t5.omdrop-owl.discover` from omdrop-owl. It needs no password from your own active session, and an administrator's password from remote or inactive sessions.
+The radio helper, `/usr/lib/omdrop/omdrop-discoverable`, runs as root through `pkexec`, because configuring AWDL needs root: vendor commands to the Broadcom firmware, or monitor-mode frame injection with OWL or omdrop-bcm4360. The radio backend package installs the helper and a polkit action that covers only that root-owned path: `org.omarchy.omdrop.discover` from omdrop-awdl, `io.github.bydash-xyz.omdrop-bcm4360.discover` from omdrop-bcm4360, `io.github.t4t5.omdrop-owl.discover` from omdrop-owl. It needs no password from your own active session, and an administrator's password from remote or inactive sessions.
 
 With omdrop-core installed, its root helper, `/usr/lib/omdrop-core/omdrop-radio`, runs as root instead, through polkit action `org.omarchy.omdrop.radio`, with the same password rules. It runs the radio backend's hooks in `/usr/lib/omdrop/radio/`, and the backend's `omdrop-discoverable` when there are none.
 
@@ -232,7 +233,7 @@ omdrop skill remove
 omdrop identity lock                # clear a cached identity
 omarchy plugin remove netmojo.omdrop
 sudo pacman -R omdrop-core          # omdrop-core, if installed
-sudo pacman -R brcmfmac-awdl-dkms   # the radio backend on a Mac; omdrop-owl on a PC
+sudo pacman -R brcmfmac-awdl-dkms   # the radio backend on an Apple Silicon Mac; omdrop-bcm4360 on an Intel MacBook, omdrop-owl on a PC
 rm -rf ~/.omdrop                    # this computer's AirDrop identity
 ```
 

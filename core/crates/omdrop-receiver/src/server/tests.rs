@@ -439,13 +439,46 @@ fn ask_then_upload_on_one_connection_stores_the_files() {
 }
 
 #[test]
+fn an_x_cpio_upload_from_older_ios_is_stored() {
+    // iOS 16 labels the same compressed CPIO archive `application/x-cpio`;
+    // a 415 made the iPhone report every transfer as failed (plugin #40).
+    let fx = start(false, |_| {});
+    for (name, body) in [
+        ("dvzip.jpg", dvzip(&[("dvzip.jpg", b"jpeg bytes")])),
+        ("gzip.jpg", gzip(&cpio_of(&[("gzip.jpg", b"jpeg bytes")]))),
+    ] {
+        let mut c = connect(&fx, false);
+        let (status, _) = post(&mut c, "/Ask", &ask_body(None));
+        assert_eq!(status, 200, "{name}");
+        request(
+            &mut c,
+            "/Upload",
+            &[
+                ("Content-Type", "application/x-cpio"),
+                ("TransferID", name),
+                ("Expect", "100-continue"),
+            ],
+            &body,
+            true,
+        );
+        assert_eq!(response(&mut c).0, 200, "{name}");
+        assert_eq!(
+            std::fs::read(fx.dest().join(name)).unwrap(),
+            b"jpeg bytes",
+            "{name}"
+        );
+    }
+    assert_eq!(fx.files(), ["dvzip.jpg", "gzip.jpg"]);
+}
+
+#[test]
 fn hostile_uploads_are_refused_and_leave_nothing() {
     let fx = start(false, |_| {});
     let mut c = connect(&fx, false);
     request(
         &mut c,
         "/Upload",
-        &[("Content-Type", "application/x-cpio")],
+        &[("Content-Type", "text/plain")],
         b"x",
         false,
     );
@@ -1105,4 +1138,93 @@ fn racing_threads_never_hold_more_slots_than_the_cap() {
         peak.load(Ordering::SeqCst)
     );
     assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
+
+/// Send a request head and part of its body, then end the TCP stream without
+/// TLS's close_notify, as a sender does when it cancels or walks out of range.
+/// The receiver reads an unclean end; this side keeps reading, to see whether
+/// anything is answered. Returns what arrived.
+fn leave_mid_request(
+    c: &mut Client,
+    path: &str,
+    content_type: &str,
+    partial: &[u8],
+    chunked: bool,
+) -> Vec<u8> {
+    let mut out = format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: {content_type}\r\n");
+    if chunked {
+        out.push_str("Transfer-Encoding: chunked\r\n\r\n3e8\r\n");
+    } else {
+        out.push_str("Content-Length: 1000\r\n\r\n");
+    }
+    let mut bytes = out.into_bytes();
+    bytes.extend(partial);
+    c.get_mut().write_all(&bytes).unwrap();
+    c.get_mut().flush().unwrap();
+    let sock = c.get_mut().get_mut();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut answer = Vec::new();
+    // The receiver's clean close ends this with Ok, a reset with an error;
+    // either way, only what arrived before it matters. A timeout means the
+    // receiver kept the connection open, which a departed sender must not
+    // cost it.
+    if let Err(e) = c.read_to_end(&mut answer) {
+        assert!(
+            !omdrop_proto::http::is_timeout(&e),
+            "the receiver kept the connection open: {e}"
+        );
+    }
+    answer
+}
+
+#[test]
+fn a_sender_that_leaves_mid_upload_gets_no_answer_and_frees_its_slot() {
+    let fx = start(false, |_| {});
+    // The start of a real archive, so the decoder is still waiting for the
+    // rest when the sender leaves.
+    let archive = dvzip(&[("big.bin", &vec![5u8; 200_000])]);
+    // More departures than there are upload slots: each must give its back.
+    for chunked in [false, true, false, true] {
+        let mut c = connect(&fx, false);
+        let answer = leave_mid_request(
+            &mut c,
+            "/Upload",
+            "application/x-dvzip",
+            &archive[..300],
+            chunked,
+        );
+        // Not "507 storage failed": the disk is fine, and the sender has gone.
+        assert_eq!(String::from_utf8_lossy(&answer), "", "chunked={chunked}");
+    }
+    assert!(fx.files().is_empty(), "{:?}", fx.files());
+    let mut c = connect(&fx, false);
+    request(
+        &mut c,
+        "/Upload",
+        &[("Content-Type", "application/x-dvzip")],
+        &dvzip(&[("after.txt", b"after")]),
+        true,
+    );
+    assert_eq!(response(&mut c).0, 200);
+    assert_eq!(fx.files(), ["after.txt"]);
+}
+
+#[test]
+fn a_sender_that_leaves_mid_ask_gets_no_answer() {
+    let fx = start(false, |_| {});
+    for chunked in [false, true] {
+        let mut c = connect(&fx, false);
+        let answer = leave_mid_request(
+            &mut c,
+            "/Ask",
+            "application/octet-stream",
+            &ask_body(None)[..20],
+            chunked,
+        );
+        // Not "400 request body read failed": nothing was wrong with it.
+        assert_eq!(String::from_utf8_lossy(&answer), "", "chunked={chunked}");
+    }
+    let mut c = connect(&fx, false);
+    assert_eq!(post(&mut c, "/Ask", &ask_body(None)).0, 200);
 }

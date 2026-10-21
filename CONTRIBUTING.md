@@ -17,7 +17,7 @@ Describe what the change does, then provide each of the following that applies.
 Paste the whole output of this command. It reports the computer's model, Wi-Fi chip, kernel, radio backend, Omdrop's version and readiness, the identity in use, the Wi-Fi firmware, and `awdl0`. omdrop-awdl's hardware-report form asks for the same details.
 
 ```bash
-{ tr -d '\0' < /proc/device-tree/model 2>/dev/null || cat /sys/class/dmi/id/product_name; echo; lspci -nn | grep -i network; uname -r; pacman -Q brcmfmac-awdl-dkms omdrop-owl; omdrop --version; omdrop doctor --json; omdrop identity; journalctl -k -b | grep -m1 'brcmfmac.*Firmware:'; ip -br link show awdl0; } 2>&1
+{ tr -d '\0' < /proc/device-tree/model 2>/dev/null || cat /sys/class/dmi/id/product_name; echo; lspci -nn | grep -i network; uname -r; pacman -Q brcmfmac-awdl-dkms omdrop-bcm4360 omdrop-owl; omdrop --version; omdrop doctor --json; omdrop identity; journalctl -k -b | grep -m1 'brcmfmac.*Firmware:'; ip -br link show awdl0; } 2>&1
 ```
 
 One of the two radio backend packages is reported as not found; that's expected.
@@ -48,7 +48,7 @@ If the change affects how Omdrop talks to an Apple device, show the behaviour be
 
 ### omdrop-core
 
-`core/` holds omdrop-core, the same programs in Rust, as one Cargo workspace. Omdrop runs it wherever the radio backend supports it; today that is omdrop-awdl, and omdrop-owl follows once it ships core's hooks (#73). Other backends run the bash and Python programs. Core builds and installs as its own package; nothing in it runs from the plugin's clone. Users install it with `omdrop install-core`, which `omdrop setup` and `omdrop doctor` offer with a supported backend, and which builds this `core/` with makepkg when no repository carries its version. Its tests run as an ordinary user, never root:
+`core/` holds omdrop-core, the same programs in Rust, as one Cargo workspace. Omdrop runs it wherever the radio backend supports it; today that is omdrop-awdl and omdrop-bcm4360, and omdrop-owl follows once it ships core's hooks (#73). Other backends run the bash and Python programs. Core builds and installs as its own package; nothing in it runs from the plugin's clone. Users install it with `omdrop install-core`, which `omdrop setup` and `omdrop doctor` offer with a supported backend, and which builds this `core/` with makepkg when no repository carries its version. Its tests run as an ordinary user, never root:
 
 ```bash
 cd core
