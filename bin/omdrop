@@ -156,7 +156,7 @@ esac
 # A fallback that silently substitutes for the real value is the same class of
 # defect as a status line reporting a state that was never entered, so this one
 # says when it is guessing, and says when the two disagree.
-VERSION_FALLBACK=0.18.2
+VERSION_FALLBACK=0.18.3
 omdrop_version() {
   local dir manifest version= real
   real=$(readlink -f "$0" 2>/dev/null) || real="$0"
