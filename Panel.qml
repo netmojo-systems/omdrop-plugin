@@ -447,15 +447,39 @@ Panel {
   //
   // Two listings run while the radar is open. The bare one is passive and
   // quick, so it is polled for the dots and their signal. The named one
-  // connects to every peer and takes half a minute, so it runs back to back:
-  // each lookup starts when the last one ends, and the names it finds are
-  // kept for the rest of the session, since a device answers only while its
-  // AirDrop is listening and would otherwise lose its label between lookups.
+  // connects to every peer and takes half a minute, holding a wake up the
+  // whole time, and the names it finds are kept for the rest of the session,
+  // since a device answers only while its AirDrop is listening and would
+  // otherwise lose its label between lookups.
+  //
+  // So lookups run back to back only while there is something to find: an
+  // empty listing, or a device with no name that has stayed silent through
+  // fewer than `namesTries` full lookups. With omdrop-awdl, a lookup over an
+  // empty listing holds the wake that brings phones in; omdrop-owl's exits at
+  // once, so there it waits out the guard below. A new device starts a lookup
+  // within a poll. A device's tries count for as long as the radar is open,
+  // even if it leaves and returns, and after `namesTries` full lookups in a
+  // row that learn no new name, new devices wait too: AWDL addresses rotate,
+  // and around other Apple devices fresh anonymous ones keep arriving (#89).
+  // Once nothing is left to find, or nothing is being found, a lookup runs
+  // once a minute, which keeps waking phones that arrive later and re-asks
+  // the silent ones. Each lookup spawns a sender per peer per attempt and a
+  // root helper every 2 s, so running them back to back for as long as the
+  // radar was open kept a full core busy (#70).
   property bool radarOpen: false
   property bool soundOn: true
   property var peers: []            // [{mac, rssi, name}] -- the last listing, names merged in
   property var peerNames: ({})      // mac -> name, everything learnt this session
   property bool namesResolved: false  // a name lookup has answered at least once
+  property var unanswered: ({})     // mac -> full lookups it stayed silent through, this radar
+  property int fruitless: 0         // full lookups in a row that learnt no new name
+  readonly property int namesTries: 2
+  readonly property int namesRetryMs: 250      // something is still to be found
+  readonly property int namesGuardMs: 10000    // the last lookup failed at once
+  readonly property int namesRecheckMs: 60000  // everyone has a name or stayed silent
+  readonly property bool namesWanted: peers.length === 0 || (fruitless < namesTries && peers.some(function(p) {
+    return p.name === "" && (unanswered[p.mac] || 0) < namesTries
+  }))
   property var flashedMacs: ({})    // rows that have had their arrival flash
   readonly property bool scanning: radarOpen && root.opened && receiving && visibility === 1
   // The line under the heading. Empty once there is a list to look at.
@@ -525,6 +549,7 @@ Panel {
       var known = Object.assign({}, peerNames)
       known[p.mac] = p.name
       peerNames = known
+      namesProc.learnt = true
       mergePeers(peers)
     }
     namesResolved = true
@@ -631,33 +656,72 @@ Panel {
     id: namesProc
     command: [root.cli, "peers", "--json", "-n", "--stream"]
     property double startedAt: 0
-    onStarted: startedAt = Date.now()
+    property bool learnt: false    // this lookup found a name we did not have
+    onStarted: { startedAt = Date.now(); learnt = false }
     stdout: SplitParser {
       onRead: function(line) {
         try { root.learnName(JSON.parse(line)) } catch (e) {}
       }
     }
-    // A lookup that fails at once (no sender, the radio just went) would
-    // otherwise restart in a tight loop, so a quick exit waits before the next.
-    // A lookup that ran to its end has answered, names or not, so the
-    // "resolving" line goes.
+    property bool stopped: false   // we ended it, so it says nothing about the peers
     onExited: {
-      namesAgain.interval = Date.now() - startedAt < 5000 ? 10000 : 250
-      if (Date.now() - startedAt >= 5000) root.namesResolved = true
+      if (stopped) {
+        stopped = false
+        if (root.scanning) root.lookUpNames(root.namesRetryMs)
+        return
+      }
+      if (!root.scanning) return
+      // A lookup that ran to its end has answered, names or not, so the
+      // "resolving" line goes, and every device still without a name has
+      // stayed silent through one more.
+      var full = Date.now() - startedAt >= 5000
+      if (full) {
+        root.namesResolved = true
+        var u = Object.assign({}, root.unanswered)
+        root.peers.forEach(function(p) { if (p.name === "") u[p.mac] = (u[p.mac] || 0) + 1 })
+        root.unanswered = u
+        root.fruitless = learnt ? 0 : root.fruitless + 1
+      }
+      // A lookup that fails at once (no sender, the radio just went) would
+      // otherwise restart in a tight loop, so a quick exit waits before the
+      // next. A quick exit with nothing left to find is everyone answering.
+      if (root.namesWanted) root.lookUpNames(full ? root.namesRetryMs : root.namesGuardMs)
+      else root.lookUpNames(root.namesRecheckMs)
     }
   }
 
   Timer {
     id: namesAgain
-    interval: 250
-    repeat: true
-    running: root.scanning && !namesProc.running
-    triggeredOnStart: true
-    onTriggered: if (!namesProc.running) namesProc.running = true
+    onTriggered: if (root.scanning && !namesProc.running) namesProc.running = true
+  }
+  function lookUpNames(ms) {
+    namesAgain.interval = ms
+    namesAgain.restart()
   }
 
-  // A radar that has been closed should not keep broadcasting.
-  onScanningChanged: if (!scanning && namesProc.running) namesProc.signal(15)
+  // A device with a name still to find starts a lookup now, unless the last
+  // one failed at once and is waiting out its guard.
+  onNamesWantedChanged: {
+    if (!namesWanted || !scanning || namesProc.running) return
+    if (namesAgain.running && namesAgain.interval === namesGuardMs) return
+    lookUpNames(namesRetryMs)
+  }
+
+  // A radar that has been closed should not keep broadcasting. One that opens
+  // again gives every silent device its tries again.
+  onScanningChanged: {
+    if (scanning) {
+      unanswered = ({})
+      fruitless = 0
+      lookUpNames(0)
+    } else {
+      namesAgain.stop()
+      if (namesProc.running) {
+        namesProc.stopped = true
+        namesProc.signal(15)
+      }
+    }
+  }
 
   Process { id: soundProc; onExited: root.refreshStatus() }
   function toggleSound() {
@@ -911,9 +975,12 @@ Panel {
 
   // The resync. Slower than the tick, and what notices a window that ended
   // somewhere else -- an expiry we did not predict, or someone running
-  // `omdrop off` in a terminal.
+  // `omdrop off` in a terminal. Every 3 s only while the open panel waits for
+  // the radio to come up, so it shows us visible soon after; otherwise every
+  // 10 s, since each poll is a few dozen processes and the panel's own
+  // commands ask for a fresh status when they finish.
   Timer {
-    interval: root.opened ? 3000 : 10000
+    interval: root.opened && root.receiving && root.visibility !== 1 ? 3000 : 10000
     repeat: true
     running: true
     triggeredOnStart: true
