@@ -7,6 +7,8 @@ request carries validation records, ours and the sender's.
 import os
 import plistlib
 
+import safeplist
+
 _REDACT_SUFFIXES = ('RecordData', 'Certificate')
 
 
@@ -41,7 +43,7 @@ def dump(name, data):
             out = data
         else:
             try:
-                out = plistlib.dumps(_redact(plistlib.loads(data)), fmt=plistlib.FMT_XML)
+                out = plistlib.dumps(_redact(safeplist.loads(data)), fmt=plistlib.FMT_XML)
             except Exception:
                 out = f'<opaque {len(data)} bytes>'.encode()
         path = os.path.join(directory(), name)

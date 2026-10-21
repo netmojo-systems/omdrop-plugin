@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import contacts  # noqa: E402  -- sibling module, found via the line above
 import debugdump  # noqa: E402
 import identity  # noqa: E402
+import safeplist  # noqa: E402
 
 # The identity's key is loaded into this process for the life of the window;
 # keep it out of core dumps and away from same-UID ptrace.
@@ -908,7 +909,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_discover(self, body):
         if contacts.visibility() == 'contacts':
             try:
-                record = (plistlib.loads(body) or {}).get('SenderRecordData')
+                record = (safeplist.loads(body) or {}).get('SenderRecordData')
             except Exception:
                 record = None
             outcome, detail = contacts.decide_discovery(record)
@@ -945,7 +946,11 @@ class Handler(BaseHTTPRequestHandler):
     def handle_ask(self, body):
         write_debug(body, 'receive_ask_request.plist')
         try:
-            ask = plistlib.loads(body)
+            # Never plistlib.loads: the log line below walks every reference
+            # in a binary plist, and a sub-MiB body can name one entry
+            # hundreds of thousands of times. Over safeplist's limits, the
+            # Ask is undecodable, as in omdrop-core.
+            ask = safeplist.loads(body)
         except Exception as e:
             logging.error('ask: undecodable %d-byte body: %r', len(body), e)
             ask = {}
