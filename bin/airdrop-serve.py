@@ -1282,6 +1282,8 @@ def write_debug(data, name):
 APPLE_ROOT = contacts.apple_root_ca()
 if APPLE_ROOT is None:
     raise SystemExit(f'Apple root CA certificate missing: {contacts.APPLE_ROOT_CA}')
+if contacts.record_ca() is None:
+    raise SystemExit(f'Apple validation-record CA certificate missing: {contacts.RECORD_CA}')
 
 # ----------------------------------------------------------------------- TLS
 #
