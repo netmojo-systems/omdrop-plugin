@@ -246,6 +246,34 @@ class PreviewTests(NotificationFixture):
         self.assertEqual(self.logged("heif-convert|"), [])
 
 
+class HeadlineTests(NotificationFixture):
+    """The toast's headline is the name a sender chose. omarchy-notification-send
+    reads options until its headline and has no `--`, so a name such as `-t`
+    would be read as an option, and the toast lost or changed."""
+
+    def argv(self):
+        # Each argument on its own line, so the headline can be told apart.
+        return self.logged("arg|")
+
+    def setUp(self):
+        super().setUp()
+        self.stub("omarchy-notification-send", 'for a; do printf "arg|%s\\n" "$a" >> "$LOG"; done')
+
+    def test_a_name_starting_with_a_dash_is_never_an_option(self):
+        for name in ("-t", "--app-name=Omarchy", "-p", "--exec"):
+            with self.subTest(name=name):
+                self.log.unlink(missing_ok=True)
+                self.arrive(name)
+                self.assertEqual(self.argv()[:3], ["arg|-t", "arg|8000", f"arg|./{name}"])
+
+    def test_other_names_are_shown_unchanged(self):
+        for name in ("notes.txt", "a -b.txt", "x--y.pdf"):
+            with self.subTest(name=name):
+                self.log.unlink(missing_ok=True)
+                self.arrive(name)
+                self.assertEqual(self.argv()[2], f"arg|{name}")
+
+
 class DecodeLockTests(NotificationFixture):
     """A burst of HEIC photos from a nearby sender must not decode all at
     once: every decode takes $XDG_RUNTIME_DIR/omdrop/decode.lock, the lock

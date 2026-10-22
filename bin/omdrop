@@ -2874,7 +2874,7 @@ cmd_open_link() {
   else
     why="There is no web link in it."
   fi
-  omarchy-notification-send "Can't open $(basename "$f")" "$why" >/dev/null 2>&1 \
+  omarchy-notification-send "Can't open $(basename -- "$f")" "$why" >/dev/null 2>&1 \
     || echo "omdrop: can't open $f: $why" >&2
   return 1
 }
@@ -3149,6 +3149,17 @@ heif_to_jpeg() {
   return 1
 }
 
+# A received file's name, for a toast. omarchy-notification-send reads options
+# up to its headline and takes no `--`, so a name a sender chose, such as `-t`
+# or `--app-name=Omarchy`, would be read as an option instead of shown. A name
+# that starts with a dash is shown as ./NAME; every other name is unchanged.
+toast_name() {
+  local name=${1%/}
+  name=${name##*/}
+  [[ "$name" == -* ]] && name="./$name"
+  printf '%s' "$name"
+}
+
 act_notify() {
   local f=$1 args=()
   copy_to_clipboard "$f"
@@ -3172,9 +3183,9 @@ act_notify() {
   # the name of what landed appears, and the only thing to click to open it,
   # so it gets 8 s -- what a normal-urgency toast would get -- without
   # claiming the urgency of one.
-  local what="Saved to $(tildify "$(dirname "$f")")/"
-  command -v wl-copy >/dev/null 2>&1 && what="Copied to clipboard, saved to $(tildify "$(dirname "$f")")/"
-  omarchy-notification-send -t 8000 "$(basename "$f")" "$what (or click this)" \
+  local what="Saved to $(tildify "$(dirname -- "$f")")/"
+  command -v wl-copy >/dev/null 2>&1 && what="Copied to clipboard, saved to $(tildify "$(dirname -- "$f")")/"
+  omarchy-notification-send -t 8000 "$(toast_name "$f")" "$what (or click this)" \
     "${args[@]}" --exec "$SELF" act open "$f" >/dev/null \
     || echo "omdrop: notification failed for $f" >&2
 }
