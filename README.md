@@ -10,7 +10,7 @@ Omdrop needs a radio backend: the package that gives this computer an `awdl0` in
 
 - **Apple Silicon Macs with Broadcom Wi-Fi (M1 and M2)**: [omdrop-awdl](https://github.com/netmojo-systems/omdrop-awdl), a `brcmfmac` driver that uses the AWDL built into the Wi-Fi firmware. The plugin installs it on first use. See its [Hardware Compatibility](https://github.com/netmojo-systems/omdrop-awdl/blob/main/README.md#hardware-compatibility).
 - **Intel MacBooks with Broadcom BCM4360 Wi-Fi (2013–2017)**: [omdrop-bcm4360](https://github.com/bydash-xyz/omdrop-bcm4360), which runs AWDL in software over Broadcom's `wl` driver. Install it before the plugin. Your Wi-Fi network needs an access point on 5 GHz channel 149, and Wi-Fi moves to it while Omdrop is visible.
-- **PCs with other Wi-Fi cards**: [omdrop-owl](https://github.com/t4t5/omdrop-owl), which runs AWDL in software through [OWL](https://github.com/seemoo-lab/owl). Install it before the plugin. Its [Supported hardware](https://github.com/t4t5/omdrop-owl#supported-hardware) table lists the cards that work; on some, Wi-Fi is off while Omdrop is visible.
+- **PCs with other Wi-Fi cards**: omdrop-owl, from [Owly](https://github.com/t4t5/owly), which runs AWDL in software through Owly's radio service, `owlyd`. Install it before the plugin. Owly's [Supported hardware](https://github.com/t4t5/owly#supported-hardware) table lists the cards that work; on some, Wi-Fi is off while Omdrop is visible.
 
 The two packages conflict, so a computer has one or the other. [docs/radio-backend.md](docs/radio-backend.md) describes what a backend provides.
 
@@ -46,7 +46,7 @@ The package puts the plugin in `/usr/share/omdrop`, and `setup` links it into `~
 
 ### omdrop-core
 
-Omdrop runs as omdrop-core, its Rust version, wherever the radio backend supports it, and as its bash and Python programs on other backends. Today omdrop-core supports omdrop-awdl and omdrop-bcm4360; omdrop-owl follows once it ships omdrop-core's hooks ([#73](https://github.com/netmojo-systems/omdrop-plugin/issues/73)).
+Omdrop runs as omdrop-core, its Rust version, wherever the radio backend supports it, and as its bash and Python programs on other backends. Today omdrop-core supports omdrop-awdl and omdrop-bcm4360. omdrop-owl ships omdrop-core's hooks since 0.4.0, so an omdrop-core that is already installed runs on it too, but `setup` and `doctor` don't offer omdrop-core there until it has been tested on that hardware ([#73](https://github.com/netmojo-systems/omdrop-plugin/issues/73)).
 
 With a supported backend, `omdrop setup` and `omdrop doctor` offer omdrop-core. Install it with Omdrop off:
 
@@ -214,7 +214,7 @@ What the cache does and doesn't protect against:
 
 ## Privileges
 
-The radio helper, `/usr/lib/omdrop/omdrop-discoverable`, runs as root through `pkexec`, because configuring AWDL needs root: vendor commands to the Broadcom firmware, or monitor-mode frame injection with OWL or omdrop-bcm4360. The radio backend package installs the helper and a polkit action that covers only that root-owned path: `org.omarchy.omdrop.discover` from omdrop-awdl, `io.github.bydash-xyz.omdrop-bcm4360.discover` from omdrop-bcm4360, `io.github.t4t5.omdrop-owl.discover` from omdrop-owl. It needs no password from your own active session, and an administrator's password from remote or inactive sessions.
+The radio helper, `/usr/lib/omdrop/omdrop-discoverable`, runs as root through `pkexec`, because configuring AWDL needs root: vendor commands to the Broadcom firmware, or monitor-mode frame injection with Owly or omdrop-bcm4360. The radio backend package installs the helper and a polkit action that covers only that root-owned path: `org.omarchy.omdrop.discover` from omdrop-awdl, `io.github.bydash-xyz.omdrop-bcm4360.discover` from omdrop-bcm4360, `io.github.t4t5.omdrop-owl.discover` from omdrop-owl. It needs no password from your own active session, and an administrator's password from remote or inactive sessions.
 
 With omdrop-core installed, its root helper, `/usr/lib/omdrop-core/omdrop-radio`, runs as root instead, through polkit action `org.omarchy.omdrop.radio`, with the same password rules. It runs the radio backend's hooks in `/usr/lib/omdrop/radio/`, and the backend's `omdrop-discoverable` when there are none.
 

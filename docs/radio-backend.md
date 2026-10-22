@@ -6,9 +6,9 @@ receiver (`airdrop-serve.py`, on `awdl0`, TCP 8771). The **radio backend** makes
 [omdrop-awdl](https://github.com/netmojo-systems/omdrop-awdl), for the Broadcom
 Wi-Fi in Apple Silicon Macs, whose firmware speaks AWDL.
 
-Another backend can drive a different radio. For example,
-[omdrop-owl](https://github.com/t4t5/omdrop-owl) runs AWDL in userspace through
-OWL on a MediaTek MT7925, and
+Another backend can drive a different radio. For example, omdrop-owl, from
+[Owly](https://github.com/t4t5/owly), runs AWDL in userspace through Owly's
+radio service on cards such as the MediaTek MT7925, and
 [omdrop-bcm4360](https://github.com/bydash-xyz/omdrop-bcm4360) runs it in
 userspace over Broadcom's `wl` driver on Intel MacBooks with the BCM4360. The
 plugin finds the backend's helpers in `/usr/lib/omdrop`, on `PATH`, or through
@@ -16,9 +16,10 @@ plugin finds the backend's helpers in `/usr/lib/omdrop`, on `PATH`, or through
 
 This page describes the interface the bash and Python programs use. Omdrop
 runs omdrop-core (`core/`) instead wherever the radio backend supports it:
-today omdrop-awdl and omdrop-bcm4360, with omdrop-owl to follow once it ships
-core's hooks (#73). Core uses the same `omdrop-discoverable` when a backend
-ships nothing else. A backend can instead provide per-operation hooks in
+today omdrop-awdl and omdrop-bcm4360. omdrop-owl ships core's hooks since
+0.4.0, so an installed core runs on it, though `setup` and `doctor` don't
+offer core there yet (#73). Core uses the same `omdrop-discoverable` when a
+backend ships nothing else. A backend can instead provide per-operation hooks in
 `/usr/lib/omdrop/radio/`, as described in
 [the backend contract](../core/docs/backend-contract.md); core then drives the
 radio through them directly.

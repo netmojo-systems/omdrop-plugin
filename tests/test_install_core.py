@@ -193,7 +193,7 @@ exit 0
                         doctor["offers"][0]["say"])
 
     def test_core_without_hooks_on_another_backend_offers_nothing(self):
-        # omdrop-owl has no hooks yet, and that isn't the user's to fix.
+        # A backend with no hooks, which isn't the user's to fix.
         self.backend("owl")
         self.old_core(owner="omdrop", hooks=False)
         self.assertEqual(self.doctor()["offers"], [])
