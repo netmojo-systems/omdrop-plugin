@@ -162,8 +162,53 @@ MAX_RECEIVE_PERCENT = validate_receive_percent(
     args.max_receive_percent if args.max_receive_percent is not None
     else _cfg.get('max_receive_percent', DEFAULT_MAX_RECEIVE_PERCENT))
 
-logging.basicConfig(level=logging.DEBUG, stream=sys.stdout,
-                    format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+# Longest log message, in bytes, as in omdrop-core (log::MAX_MESSAGE_BYTES).
+# journald splits a stdout line longer than its LineMax (48 KiB by default)
+# into several entries, and with `-o cat` a fragment would read as a line of
+# its own, starting with whatever text a peer placed at the cut.
+MAX_LOG_MESSAGE_BYTES = 32 * 1024
+# What omdrop-core's log::escape() escapes: C0 and C1 controls (newlines
+# included) as \xNN; line and paragraph separators, zero-width characters,
+# bidi controls and the BOM as \uNNNN. Lone surrogates, which only a Python
+# string can hold (a name decoded with surrogateescape), go as \uNNNN too
+# rather than failing the write.
+LOG_ESCAPE = re.compile('[\x00-\x1f\x7f-\x9f]|'
+                        '[\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\ud800-\udfff]')
+
+
+def escape_log(message):
+    """message as one bounded log line, the way omdrop-core writes it."""
+    out = LOG_ESCAPE.sub(lambda m: f'\\x{ord(m[0]):02x}' if ord(m[0]) < 0xa0
+                         else f'\\u{ord(m[0]):04x}', message)
+    data = out.encode('utf-8')
+    if len(data) <= MAX_LOG_MESSAGE_BYTES:
+        return out
+    cut = MAX_LOG_MESSAGE_BYTES
+    while (data[cut] & 0xc0) == 0x80:     # back to a character boundary
+        cut -= 1
+    return f'{data[:cut].decode("utf-8")} [... {len(data) - cut} more bytes]'
+
+
+class EscapingFormatter(logging.Formatter):
+    """Every record as one escaped, bounded line. Peers write into this log
+    (names, file names, headers, request lines), and `omdrop watch` acts on
+    what it reads here, so no peer text may start a line of its own. A
+    traceback belongs to its record and is escaped with it."""
+
+    def format(self, record):
+        text = record.getMessage()
+        if record.exc_info:
+            text += '\n' + self.formatException(record.exc_info)
+        if record.stack_info:
+            text += '\n' + self.formatStack(record.stack_info)
+        record.message = escape_log(text)
+        record.asctime = self.formatTime(record, self.datefmt)
+        return self.formatMessage(record)
+
+
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(EscapingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+logging.basicConfig(level=logging.DEBUG, handlers=[_log_handler])
 
 with open(f'/sys/class/net/{args.iface}/address') as f:
     sid = f.read().strip().replace(':', '')
@@ -209,7 +254,11 @@ class ThreadingHTTPServerV6(ThreadingHTTPServer):
         # readline is the normal end of a session, not a fault.
         if isinstance(sys.exc_info()[1], (ConnectionResetError, HandshakeFailed)):
             return
-        super().handle_error(request, client_address)
+        # Into the log rather than socketserver's traceback on stderr: an
+        # exception's text can carry what a peer sent, and only the log
+        # escapes it.
+        logging.error('exception while serving [%s]:%s', client_address[0],
+                      client_address[1], exc_info=True)
 
 
 # Raised by Handler.setup once a failed handshake is logged, so handle_error

@@ -113,9 +113,10 @@ class ReceiverFixture(unittest.TestCase):
         env = dict(os.environ, XDG_CONFIG_HOME=str(xdg), XDG_RUNTIME_DIR=str(runtime))
         with open(cls.log, "w") as log:
             cls.proc = subprocess.Popen(
-                [sys.executable, str(SERVE), "--iface", "lo", "--port", str(cls.port),
-                 "--name", NAME, "--model", MODEL, "--keys", str(cls.identity),
-                 "--outdir", str(cls.out), "--config", str(xdg / "airdrop" / "config.toml")],
+                cls.receiver_command(
+                    "--iface", "lo", "--port", str(cls.port),
+                    "--name", NAME, "--model", MODEL, "--keys", str(cls.identity),
+                    "--outdir", str(cls.out), "--config", str(xdg / "airdrop" / "config.toml")),
                 stdout=log, stderr=subprocess.STDOUT, env=env)
         deadline = time.monotonic() + 30
         while "receiving into" not in cls.log.read_text():
@@ -123,6 +124,10 @@ class ReceiverFixture(unittest.TestCase):
                 cls.tearDownClass()
                 raise AssertionError("receiver did not start:\n" + cls.log.read_text())
             time.sleep(0.05)
+
+    @classmethod
+    def receiver_command(cls, *argv):
+        return [sys.executable, str(SERVE), *argv]
 
     @classmethod
     def tearDownClass(cls):
