@@ -31,6 +31,7 @@ use std::sync::{Condvar, Mutex, PoisonError, mpsc};
 use std::time::Duration;
 
 use crate::args::{self, Exit, Kind, Opt, Spec};
+use crate::client::clean_peer_name;
 use crate::pyfmt::float_str;
 
 pub const AIRDROP_PORT: u16 = 8770;
@@ -375,7 +376,11 @@ pub fn peer_names<E: Env + ?Sized>(
             let tx = tx.clone();
             s.spawn(move || {
                 slots.acquire();
-                let name = env.peer_name(&mac, port, sender_name, ready_by);
+                // Cleaned whatever Env answered: every row, match and
+                // listing below shows these names.
+                let name = env
+                    .peer_name(&mac, port, sender_name, ready_by)
+                    .map(|n| clean_peer_name(&n).unwrap_or_default());
                 slots.release();
                 let _ = tx.send((mac, name));
             });
