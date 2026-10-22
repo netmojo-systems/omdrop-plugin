@@ -111,6 +111,10 @@ pub(crate) fn record_from_plist(payload: &[u8], now: f64) -> Option<Record> {
 /// AirDrop certificate is one: its holder could sign a record claiming
 /// anyone's email and phone hashes.
 ///
+/// `-no-CApath -no-CAstore`: `-CAfile` adds to openssl's default trust store
+/// rather than replacing it, so without them every CA in `/etc/ssl/certs`
+/// (or `SSL_CERT_DIR`) could anchor a record's signer.
+///
 /// `-purpose any` is required: the signer is a record-signing certificate,
 /// not an S/MIME one, so openssl's default purpose check rejects genuine
 /// records.
@@ -130,6 +134,8 @@ pub(crate) fn verify_record_with(record: &[u8], anchor_pem: &[u8]) -> Option<Rec
             "DER".as_ref(),
             "-CAfile".as_ref(),
             ca.as_os_str(),
+            "-no-CApath".as_ref(),
+            "-no-CAstore".as_ref(),
             "-partial_chain".as_ref(),
             "-purpose".as_ref(),
             "any".as_ref(),
@@ -214,6 +220,7 @@ fn account_from_subject(subject: &str) -> String {
 /// earlier version checked only that the issuer name said Apple, and a name
 /// is a string an attacker writes into their own self-signed certificate.
 /// Everyone-mode peers present a self-signed `CN=airdrop`; those yield "".
+/// openssl's default trust store is left out, as for records.
 pub(crate) fn certificate_account_with(
     der: &[u8],
     root_pem: &[u8],
@@ -246,6 +253,8 @@ pub(crate) fn certificate_account_with(
             "verify".as_ref(),
             "-CAfile".as_ref(),
             ca.as_os_str(),
+            "-no-CApath".as_ref(),
+            "-no-CAstore".as_ref(),
             "-purpose".as_ref(),
             "any".as_ref(),
         ];
