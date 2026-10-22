@@ -13,7 +13,9 @@ use serde_json::{Map, Value};
 
 use crate::ctx::ctx;
 use crate::identity::{Out, id};
-use crate::proc::{Captured, capture, capture_bounded, run, run_quiet, timeout_duration};
+use crate::proc::{
+    Captured, capture, capture_bounded, capture_cmd, run, run_quiet, timeout_duration,
+};
 use crate::util::{
     die, env_nonempty, have, home, is_executable, py_json, shell_quote, strip_trailing_newlines,
 };
@@ -338,6 +340,32 @@ fn installed_pkg(name: &str) -> Option<String> {
     }
     let text = crate::util::strip_trailing_newlines(&String::from_utf8_lossy(&out)).to_string();
     Some(text.rsplit(' ').next().unwrap_or_default().to_string())
+}
+
+/// The version of `name` the sync databases on disk offer, from `pacman -Si`
+/// in the C locale (its field names are translated otherwise).
+fn repo_pkg_version(name: &str) -> Option<String> {
+    let (code, out) = capture_cmd(
+        Command::new("pacman")
+            .args(["-Si", name])
+            .env("LC_ALL", "C")
+            .stderr(std::process::Stdio::null()),
+    );
+    if code != 0 {
+        return None;
+    }
+    si_version(&String::from_utf8_lossy(&out))
+}
+
+/// The first `Version : ...` field of `pacman -Si` output: the first
+/// repository's, which `pacman -S` installs.
+fn si_version(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "Version").then(|| value.trim().to_owned())
+        })
+        .filter(|v| !v.is_empty())
 }
 
 /// Whether version `a` is older than `b`, in pacman's order.
@@ -839,8 +867,11 @@ pub fn cmd_install_driver() -> i32 {
     let libs_missing = !receiver_libs_installed();
     let driver_needed = !helper || !driver_current();
     // `pacman -Si` reads the sync databases already on disk and deliberately
-    // does not refresh them: -Sy alone is how partial upgrades happen.
-    let repo_has_driver = driver_needed && run_quiet("pacman", &["-Si", DRIVER_PKG]) == 0;
+    // does not refresh them: -Sy alone is how partial upgrades happen. So
+    // they can be stale: a repository package older than the pin is not the
+    // driver this version needs, and the pinned commit is built instead.
+    let repo_has_driver = driver_needed
+        && repo_pkg_version(DRIVER_PKG).is_some_and(|v| vercmp(&v, DRIVER_VERSION).is_ge());
     let build = build_script(
         &self_q,
         libs_missing,

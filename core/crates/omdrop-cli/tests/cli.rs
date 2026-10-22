@@ -1790,6 +1790,48 @@ fn awdl_with_a_current_driver_has_nothing_to_install() {
     }
 }
 
+/// pacman with brcmfmac-awdl-dkms 0.9.0-1 installed and its sync databases
+/// offering `offered`. Outside the C locale it answers in Spanish, as a
+/// translated pacman does.
+fn with_repo_driver(r: &Radio, offered: &str) {
+    write_exec(
+        &r.f.root.join("bin/pacman"),
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n  '-Q brcmfmac-awdl-dkms') echo 'brcmfmac-awdl-dkms 0.9.0-1' ;;\n  '-Si brcmfmac-awdl-dkms') key=Versión; [ \"$LC_ALL\" = C ] && key=Version\n    printf 'Repository      : omarchy\\nName            : brcmfmac-awdl-dkms\\n%s         : {offered}\\nDescription     : x: y\\n\\nRepository      : extra\\nName            : brcmfmac-awdl-dkms\\n%s         : 0.0.1-1\\n' \"$key\" \"$key\" ;;\n  *) exit 1 ;;\nesac\n"
+        ),
+    );
+}
+
+#[test]
+fn a_repository_driver_older_than_the_pin_is_not_installed() {
+    // The sync databases are read as they are on disk, never refreshed, so
+    // they can offer a driver older than this version needs.
+    let r = Radio::new();
+    r.helper(&backend_helper(Some(awdl_hooks(serde_json::json!([])))));
+    for (offered, from_repo) in [
+        ("0.9.0-1", false),
+        ("0.10.0rc1-1", false),
+        ("0.10.0-1", true),
+        ("0.10.1-1", true),
+        ("1:0.1.0-1", true),
+    ] {
+        with_repo_driver(&r, offered);
+        let out = r.run(&["install-driver"]);
+        let stdout = text(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+        assert_eq!(
+            stdout.contains("sudo pacman -S --needed --noconfirm brcmfmac-awdl-dkms"),
+            from_repo,
+            "{offered}: {stdout}"
+        );
+        assert_eq!(
+            stdout.contains("omdrop-awdl.git") && stdout.contains("&& makepkg"),
+            !from_repo,
+            "{offered}: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn awdl_on_hardware_it_cannot_drive_is_refused_alone() {
     let mut r = Radio::new();
