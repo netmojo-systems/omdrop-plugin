@@ -800,11 +800,42 @@ def store_upload(raw, dest, tid, receive_budget):
     return written
 
 
+# Longest list of names in one `upload ...: stored ...` record, in UTF-8
+# bytes. Half the log cap: a longer list would be cut by it, and `omdrop
+# watch`, which reads names from these records, would miss the files cut.
+MAX_STORED_LINE_BYTES = 16 * 1024
+
+
+def arrival_records(tid, names):
+    """The `stored` log records for one upload, as in omdrop-core: one,
+    `upload TID: stored A, B`, when the names fit MAX_STORED_LINE_BYTES;
+    otherwise `upload TID (k/n): stored ...` for k = 1..n, each holding whole
+    names in order. A name is at most 255 bytes, so every one fits."""
+    joined = ', '.join(names)
+    if len(joined.encode('utf-8')) <= MAX_STORED_LINE_BYTES:
+        return [f'upload {tid}: stored {joined}']
+    chunks, chunk, size = [], [], 0
+    for name in names:
+        cost = len(name.encode('utf-8')) + (2 if chunk else 0)
+        if chunk and size + cost > MAX_STORED_LINE_BYTES:
+            chunks.append(chunk)
+            chunk, size, cost = [], 0, cost - 2
+        chunk.append(name)
+        size += cost
+    chunks.append(chunk)
+    return [f'upload {tid} ({k}/{len(chunks)}): stored {", ".join(c)}'
+            for k, c in enumerate(chunks, 1)]
+
+
 # Longest URL a links Ask may store, in UTF-8 bytes, as in omdrop-core.
 MAX_LINK_BYTES = 8192
 # Charged per stored link on top of its bytes, against the same budget an
 # upload gets: a file costs an inode and at least a block, however short.
 LINK_FILE_ALLOWANCE = 4096
+# Held by a links Ask from its budget check through its last write, so two
+# Asks cannot both be checked against the same free bytes and together
+# write past the reserve. Short: at most 512 small files under it.
+LINKS_LOCK = threading.Lock()
 
 
 def link_shortcut(url):
@@ -1102,31 +1133,15 @@ class Handler(BaseHTTPRequestHandler):
                                     MAX_LINK_BYTES, item)
                     continue
                 urls.append(item)
-            # Checked as a whole before the first is written: a refused Ask
-            # stores nothing. The budget is the one an upload gets, so links
-            # cannot fill the disk past what a file transfer may.
+            # Checked as a whole before the first is written, and under
+            # LINKS_LOCK: a refused Ask stores nothing. The answer is sent
+            # after the lock is released, so a slow peer cannot hold it.
             if urls:
-                need = sum(len(link_shortcut(url)) + LINK_FILE_ALLOWANCE for url in urls)
-                try:
-                    budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
-                except UploadLimitError as e:
-                    self.reject(507, str(e))
+                with LINKS_LOCK:
+                    refused = self.store_links(urls)
+                if refused:
+                    self.reject(507, refused)
                     return
-                except OSError as e:
-                    self.reject(507, f'storage failed: {e}')
-                    return
-                if need > budget.byte_limit:
-                    self.reject(507, f'links need {need} bytes; {budget.percent}% of '
-                                     f'{budget.free_bytes} free bytes allows {budget.byte_limit}')
-                    return
-            for url in urls:
-                try:
-                    stored = store_link(url, DEST)
-                except OSError as e:
-                    # Answering 200 would tell the sender a lost link arrived.
-                    self.reject(507, f'storage failed: {e}')
-                    return
-                logging.info('link stored as %s -> %s', stored, url)
         resp = plistlib.dumps({
             'ReceiverModelName': MODEL,
             'ReceiverComputerName': NAME,
@@ -1140,6 +1155,30 @@ class Handler(BaseHTTPRequestHandler):
         if 'links' not in (ask.get('TransferType') or {}):
             self.awaiting_upload = True
             self.request.settimeout(UPLOAD_WAIT_SECONDS)
+
+    @staticmethod
+    def store_links(urls):
+        """Store urls if they fit the receive budget an upload gets, so links
+        cannot fill the disk past what a file transfer may. Returns None, or
+        why the Ask is refused (507). Call with LINKS_LOCK held."""
+        need = sum(len(link_shortcut(url)) + LINK_FILE_ALLOWANCE for url in urls)
+        try:
+            budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
+        except UploadLimitError as e:
+            return str(e)
+        except OSError as e:
+            return f'storage failed: {e}'
+        if need > budget.byte_limit:
+            return (f'links need {need} bytes; {budget.percent}% of '
+                    f'{budget.free_bytes} free bytes allows {budget.byte_limit}')
+        for url in urls:
+            try:
+                stored = store_link(url, DEST)
+            except OSError as e:
+                # Answering 200 would tell the sender a lost link arrived.
+                return f'storage failed: {e}'
+            logging.info('link stored as %s -> %s', stored, url)
+        return None
 
     def handle_upload(self):
         # An Upload that never passed an Ask has nothing vouching for it, and
@@ -1189,7 +1228,8 @@ class Handler(BaseHTTPRequestHandler):
                 logging.info('upload %s: %d bytes dvzip (TotalBytes %s)',
                              tid, wire_bytes, self.headers.get('TotalBytes'))
                 written = store_upload(raw, DEST, tid, receive_budget)
-            logging.info('upload %s: stored %s', tid, ', '.join(written))
+            for record in arrival_records(tid, written):
+                logging.info('%s', record)
         except socket.timeout as e:
             # Chunked framing announces no length, so there is none to name.
             expected = plan[1] if plan else None

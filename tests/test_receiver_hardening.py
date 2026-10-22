@@ -12,9 +12,10 @@ import os
 import plistlib
 import re
 import sys
+import threading
 import unittest
 
-from test_receiver_protocol import SERVE, ReceiverFixture
+from test_receiver_protocol import SERVE, ReceiverFixture, dvzip
 
 
 def log_namespace():
@@ -196,31 +197,37 @@ class LinkTests(ReceiverFixture):
 GIB = 1 << 30
 
 # Runs the receiver with os.statvfs reporting FREE bytes free in its download
-# folder, so a test can put the disk near Omdrop's 1 GiB reserve without
-# filling one. argv: download folder, FREE, then the receiver's own argv.
+# folder, less what the files in it take in 4 KiB blocks, so a test can put
+# the disk near Omdrop's 1 GiB reserve without filling one. DELAY seconds
+# pass before the answer, so two requests can be made to check at once.
+# argv: download folder, FREE, DELAY, then the receiver's own argv.
 LOW_DISK = """
-import os, runpy, sys
-out, free = sys.argv[1], int(sys.argv[2])
+import os, runpy, sys, time
+out, free, delay = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 real = os.statvfs
 def statvfs(path):
     st = real(path)
     if os.path.realpath(path) != out:
         return st
-    return os.statvfs_result((4096, 4096, st.f_blocks, free // 4096, free // 4096,
+    used = sum(-(-e.stat().st_size // 4096) * 4096 for e in os.scandir(out) if e.is_file())
+    time.sleep(delay)
+    left = max(0, free - used) // 4096
+    return os.statvfs_result((4096, 4096, st.f_blocks, left, left,
                               st.f_files, st.f_ffree, st.f_favail, st.f_flag, st.f_namemax))
 os.statvfs = statvfs
-sys.argv = sys.argv[3:]
+sys.argv = sys.argv[4:]
 runpy.run_path(sys.argv[0], run_name="__main__")
 """
 
 
 class LowDiskFixture(ReceiverFixture):
     free_bytes = None
+    statvfs_delay = 0
 
     @classmethod
     def receiver_command(cls, *argv):
         return [sys.executable, "-c", LOW_DISK, os.path.realpath(cls.out),
-                str(cls.free_bytes), str(SERVE), *argv]
+                str(cls.free_bytes), str(cls.statvfs_delay), str(SERVE), *argv]
 
     def links(self, items):
         ask = plistlib.dumps({"SenderComputerName": "Phone", "SenderModelName": "iPhone17,1",
@@ -249,6 +256,7 @@ class LinkBudgetTests(LowDiskFixture):
         status, new = self.links([self.url(4096)])
         self.assertEqual(status, 200)
         self.assertEqual(len(new), 1)
+        (self.out / new[0]).unlink()      # free for the other tests again
 
     def test_links_past_the_budget_are_refused_and_none_stored(self):
         # Each fits alone; together they do not, and nothing is written.
@@ -269,6 +277,95 @@ class LinkReserveTests(LowDiskFixture):
         self.assertEqual((status, new), (507, []))
         self.assertIn("/Ask rejected: not enough free space while preserving 1073741824 bytes",
                       self.log.read_text())
+
+
+class LinkRaceTests(LowDiskFixture):
+    # Room for one 1000-byte link (5096 bytes charged) and not two: after
+    # the first, its 4 KiB block leaves a 4096-byte budget.
+    free_bytes = GIB + 8192
+    # Long enough that both Asks are checking at once without the lock.
+    statvfs_delay = 1.0
+
+    def test_two_links_asks_that_fit_alone_but_not_together_store_one(self):
+        def ask(host, results):
+            base = f"https://{host}/a?q="
+            url = base + "x" * (1000 - len(f"[InternetShortcut]\nURL={base}\n"))
+            body = plistlib.dumps({"SenderComputerName": "Phone", "SenderModelName": "iPhone17,1",
+                                   "TransferType": {"links": 1}, "Items": [url]},
+                                  fmt=plistlib.FMT_BINARY)
+            results[host], _ = self.post(self.connection(), "/Ask", body)
+
+        results = {}
+        threads = [threading.Thread(target=ask, args=(host, results))
+                   for host in ("first.example", "second.example")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(sorted(results.values()), [200, 507], results)
+        stored = sorted(p.name for p in self.out.iterdir())
+        [winner] = [host for host, status in results.items() if status == 200]
+        self.assertEqual(len(stored), 1, stored)
+        self.assertTrue(stored[0].startswith(winner), stored)
+        self.assertIn("/Ask rejected: links need 5096 bytes; 30% of 1073745920 free bytes "
+                      "allows 4096", self.log.read_text())
+
+
+def arrival_namespace():
+    source = SERVE.read_text()
+    start = source.index("MAX_STORED_LINE_BYTES = ")
+    end = source.index("\n# Longest URL a links Ask")
+    namespace = {}
+    exec(source[start:end], namespace)
+    return namespace["arrival_records"]
+
+
+class ArrivalRecordTests(unittest.TestCase):
+    """`omdrop watch` finds received files in `upload ...: stored ...` records,
+    so a list the log cap would cut is split across records of whole names."""
+
+    def setUp(self):
+        self.records = arrival_namespace()
+
+    def test_a_list_that_fits_is_one_record_as_before(self):
+        self.assertEqual(self.records("T1", ["a.txt", "b c.txt"]),
+                         ["upload T1: stored a.txt, b c.txt"])
+        self.assertEqual(self.records("T1", []), ["upload T1: stored "])
+
+    def test_a_list_past_16_kib_is_split_into_numbered_records_of_whole_names(self):
+        names = [f"{i:03}-" + "n" * 192 + ".txt" for i in range(200)]
+        records = self.records("T2", names)
+        self.assertEqual(len(records), 3)
+        seen = []
+        for k, record in enumerate(records, 1):
+            prefix = f"upload T2 ({k}/3): stored "
+            self.assertTrue(record.startswith(prefix), record[:40])
+            part = record[len(prefix):]
+            self.assertLessEqual(len(part.encode()), 16_384)
+            seen += part.split(", ")
+        self.assertEqual(seen, names)
+
+    def test_the_split_happens_one_byte_past_the_limit(self):
+        one = "a" * 16_382
+        self.assertEqual(len(self.records("T", [one[:16_380], "b"])), 1)   # 16 383 bytes
+        self.assertEqual(len(self.records("T", [one[:16_381], "b"])), 1)   # 16 384
+        self.assertEqual(self.records("T", [one, "b"]),                    # 16 385
+                         [f"upload T (1/2): stored {one}", "upload T (2/2): stored b"])
+
+
+class ArrivalLogTests(ReceiverFixture):
+    def test_every_name_of_a_large_upload_reaches_the_log_whole(self):
+        names = [f"{i:03}-" + "n" * 192 + ".txt" for i in range(200)]
+        status, _ = self.post(self.connection(), "/Upload",
+                              dvzip([(name, b"x") for name in names]),
+                              {"Content-Type": "application/x-dvzip", "TransferID": "BIG"})
+        self.assertEqual(status, 200)
+        records = re.findall(r"INFO root: upload BIG \((\d+)/(\d+)\): stored (.*)$",
+                             self.log.read_text(), re.M)
+        self.assertEqual([(k, n) for k, n, _ in records], [("1", "3"), ("2", "3"), ("3", "3")])
+        logged = [name for _, _, part in records for name in part.split(", ")]
+        self.assertEqual(sorted(logged), sorted(names))
+        self.assertNotIn("more bytes]", self.log.read_text())
 
 
 if __name__ == "__main__":
