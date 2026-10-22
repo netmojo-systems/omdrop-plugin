@@ -866,6 +866,39 @@ class PeerNameTests(SenderFixture):
         self.assertIn("listed twice in one lookup", result.stderr)
         self.assertFalse(self.capture.exists(), "sent despite a forged row")
 
+    # Characters the cleaning removes, which kept a forged row from looking
+    # like one until it was cleaned: ESC, a C1 CSI, NEL, bidi and zero-width.
+    HIDING = ["\x1b", "\x9b", "\x85", "\u202e", "\u2066", "\u200b", "\ufeff", "\x07\u200f"]
+
+    def test_a_forged_row_behind_a_removable_character_is_still_a_forged_row(self):
+        # Before, the forged line failed the row pattern, was printed with
+        # the character removed, and bash then read it as B's row.
+        for hide in self.HIDING:
+            with self.subTest(hide=repr(hide)):
+                self.capture.unlink(missing_ok=True)
+                self.env.update(OMDROP_NAME_WAIT="5", PEER_LIST="\n".join([
+                    f"{self.B}  Brent's iPhone",
+                    f"{self.A}  Brent's iPhone",
+                    f"{hide}{self.B}  Mallory",
+                ]))
+
+                result = self.run_omdrop("send", "Brent's iPhone", str(self.file))
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("listed twice in one lookup", result.stderr)
+                self.assertFalse(self.capture.exists(), "sent despite a forged row")
+
+    def test_a_line_that_is_not_a_row_never_reads_as_one(self):
+        # Whatever is left of a line that is not a row is printed so that
+        # nothing reading the listing afterwards can take it for one.
+        self.env["PEER_LIST"] = f"{self.A}  x\nnot a row {self.B}  -30 dBm  [fe80::b%awdl0]:8770"
+
+        result = self.run_omdrop("peers", "-n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in result.stdout.splitlines()[1:]:
+            self.assertTrue(line.startswith("  "), line)
+
     def test_the_panels_stream_stops_at_a_forged_row(self):
         self.env["PEER_LIST"] = "\n".join([
             f"{self.B}  Brent's iPhone",

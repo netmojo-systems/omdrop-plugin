@@ -2520,6 +2520,12 @@ cmd_peers() {
 # characters, at most 255 UTF-8 bytes, no surrounding whitespace. Lines end at
 # \n only, never at a \r, so the rows bash sees are the rows parsed here.
 #
+# Each whole line is cleaned before its shape is judged: a forged row behind
+# an escape or an invisible character would otherwise pass here as some other
+# line, and become a row once cleaned. A line that still is not a row but
+# holds " dBm" is printed indented, so nothing reading the output further on
+# can take it for one.
+#
 # One lookup lists each address once. An address listed twice means a name
 # held a line break that the sender passed on, and the text after it posed as
 # a row of its own: possibly another device's address with a name of the
@@ -2527,7 +2533,7 @@ cmd_peers() {
 # the listing is refused: a message on stderr and exit 65, with nothing
 # further printed.
 #
-#   --text   the listing, cleaned; other lines kept, without control characters
+#   --text   the listing, cleaned; other lines kept, cleaned the same way
 #   --json   one JSON array, for `peers --json`
 #   --lines  one JSON object per row as it arrives, for the panel's stream
 # The placeholders a lookup prints for a peer that did not answer are not
@@ -2549,11 +2555,11 @@ seen, peers, forged = set(), [], False
 for raw in iter(sys.stdin.buffer.readline, b""):
     if forged:
         continue
-    line = (raw[:-1] if raw.endswith(b"\n") else raw).decode("utf-8", "replace")
+    line = unsafe.sub("", (raw[:-1] if raw.endswith(b"\n") else raw).decode("utf-8", "replace"))
     m = row.match(line)
     if not m:
         if mode == "--text":
-            print(unsafe.sub("", line), flush=True)
+            print("  " + line if " dBm" in line else line, flush=True)
         continue
     if m.group(1) in seen:
         # Read to the end, so the lookup finishes as it would have.
@@ -2565,7 +2571,7 @@ for raw in iter(sys.stdin.buffer.readline, b""):
     seen.add(m.group(1))
     name = clean(line[m.end():])
     if mode == "--text":
-        head = unsafe.sub("", line[:m.end()])
+        head = line[:m.end()]
         print(head + name if name else head.rstrip(space), flush=True)
         continue
     peer = {
