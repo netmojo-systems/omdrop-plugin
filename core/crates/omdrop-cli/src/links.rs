@@ -316,12 +316,48 @@ fn is_image(lower: &str) -> Option<&'static str> {
 /// crafted to decode slowly must not hold the watcher.
 const HEIF_DECODE_SECS: u64 = 10;
 
+/// The memory each arrival's `handle` unit may use, decodes included, as the
+/// plugin's bash `omdrop` sets it.
+const HANDLE_MEMORY_MAX: &str = "MemoryMax=512M";
+
 /// HEIC, HEIF and AVIF: what an iPhone sends since the receiver asks for
 /// original-format photos (#62), and what few applications can paste.
 fn is_heif(lower: &str) -> bool {
     [".heic", ".heif", ".avif"]
         .iter()
         .any(|e| lower.ends_with(e))
+}
+
+/// The lock every decode of an arrival holds, `$XDG_RUNTIME_DIR/omdrop/
+/// decode.lock`, exclusive, waited for: one decode at a time per user. A
+/// HEIC is decoded at the size it declares, whatever its file size, and a
+/// sender in Everyone mode can send hundreds in one transfer, each arrival
+/// with its own `handle` running at once. The plugin's bash `omdrop` takes
+/// the same lock with flock(1), so decodes from both stacks queue together.
+/// Each decode is bounded by its timeout, so the wait is too. `None` when the
+/// lock cannot be taken: then nothing is decoded.
+fn decode_lock() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = ctx().state_dir();
+    mkdir_private(&dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("decode.lock"))
+        .ok()?;
+    loop {
+        // SAFETY: flock on a descriptor `file` owns; released when it closes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Some(file);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
 }
 
 /// Decode `f` to a JPEG in a private directory of its own under the runtime
@@ -334,6 +370,7 @@ fn heif_to_jpeg(f: &Path) -> Option<(PathBuf, PathBuf)> {
     if !have("heif-convert") {
         return None;
     }
+    let _decoding = decode_lock()?;
     let base = ctx().runtime.join("omdrop");
     std::fs::create_dir_all(&base).ok()?;
     let nanos = std::time::SystemTime::now()
@@ -394,6 +431,8 @@ fn heic_preview(f: &Path) -> Option<PathBuf> {
     let limit = preview_timeout()?;
     let dir = ctx().state_dir().join("previews");
     mkdir_private(&dir).ok()?;
+    // The decode and the shrink run under the decode lock; the rest does not.
+    let decoding = decode_lock()?;
     // A unique name: IMG_1.heic and IMG_1.avif, or two arrivals with the same
     // name, each keep their own preview. Arrivals are handled in parallel, so
     // a preview is decoded and shrunk under working.*, and becomes preview.*
@@ -431,6 +470,7 @@ fn heic_preview(f: &Path) -> Option<PathBuf> {
         return None;
     }
     shrink_preview(&work, limit);
+    drop(decoding);
     // Pruning goes by when a preview was finished. A shrink that failed or
     // timed out leaves the decode's older time, and the newer previews of a
     // burst would prune this one before its toast could show it.
@@ -592,10 +632,18 @@ pub fn cmd_handle(args: &[OsString]) -> i32 {
     } else {
         format!("Saved to {where_}/")
     };
+    // The sender chose the name, and omarchy-notification-send takes no `--`:
+    // a name like `-t` or `--app-name=X` would be read as an option.
+    let mut title = basename(f.as_os_str());
+    if title.as_bytes().starts_with(b"-") {
+        let mut dotted = OsString::from("./");
+        dotted.push(&title);
+        title = dotted;
+    }
     let mut argv: Vec<OsString> = vec![
         "-t".into(),
         "8000".into(),
-        basename(f.as_os_str()),
+        title,
         format!("{what} (or click this)").into(),
     ];
     if let Some(image) = image {
@@ -669,11 +717,14 @@ pub fn cmd_watch(args: &[String]) -> i32 {
             // kills its whole cgroup, and a notification still decoding its
             // preview would be lost. systemd-run returns once the unit has
             // started. Without it, handle runs here, and a one-file window
-            // waits for it before closing.
-            let unit: [&OsStr; 6] = [
+            // waits for it before closing. MemoryMax caps what a decode of
+            // a crafted photo can take: the unit is killed, not the session.
+            let unit: [&OsStr; 8] = [
                 "--user".as_ref(),
                 "--quiet".as_ref(),
                 "--collect".as_ref(),
+                "-p".as_ref(),
+                HANDLE_MEMORY_MAX.as_ref(),
                 self_exe,
                 "handle".as_ref(),
                 path.as_os_str(),
