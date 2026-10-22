@@ -693,14 +693,27 @@ def safe_name(name, fallback):
     stem, ext = os.path.splitext(name)
     while len((stem + ext).encode('utf-8')) > 255 and stem:
         stem = stem[:-1]
-    return (stem + ext) or fallback
+    # An extension that alone is too long leaves no stem: "a.<300 x>" would
+    # come back as ".xxx..", hidden and still too long. Core's fallback.
+    out = stem + ext
+    if not stem or len(out.encode('utf-8')) > 255 or out.startswith('.'):
+        return fallback
+    return out
 
 
 def open_new(dest, name):
-    """Create dest/name atomically without clobbering an existing file."""
+    """Create dest/name atomically without clobbering an existing file:
+    name, then stem-1.ext, stem-2.ext, ..., the stem shortened so each still
+    fits 255 bytes."""
     stem, ext = os.path.splitext(name)
     for i in range(10000):
-        cand = name if i == 0 else f'{stem}-{i}{ext}'
+        if i == 0:
+            cand = name
+        else:
+            suffix, short = f'-{i}{ext}', stem
+            while len((short + suffix).encode('utf-8')) > 255 and short:
+                short = short[:-1]
+            cand = short + suffix
         try:
             fd = os.open(os.path.join(dest, cand),
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -787,6 +800,10 @@ def store_upload(raw, dest, tid, receive_budget):
     return written
 
 
+# Longest URL a links Ask may store, in UTF-8 bytes, as in omdrop-core.
+MAX_LINK_BYTES = 8192
+
+
 def store_link(url, dest):
     """Write a received URL into dest as an inert .url shortcut and return the
     stored name. INI form ([InternetShortcut]) because it is plain text, needs
@@ -800,7 +817,10 @@ def store_link(url, dest):
     from urllib.parse import urlsplit
     parts = urlsplit(url)
     stem = '-'.join(p for p in (parts.netloc, parts.path.rstrip('/').rsplit('/', 1)[-1]) if p)
-    name, f = open_new(dest, safe_name(stem, 'link') + '.url')
+    base = safe_name(stem, 'link')
+    while len(base.encode('utf-8')) > 255 - len('.url'):   # room for ".url"
+        base = base[:-1]
+    name, f = open_new(dest, base + '.url')
     with f:
         f.write(f'[InternetShortcut]\nURL={url}\n'.encode('utf-8'))
     return name
@@ -1059,6 +1079,18 @@ class Handler(BaseHTTPRequestHandler):
             for item in items:
                 if not isinstance(item, str) or not item.startswith(('http://', 'https://')):
                     logging.warning('ask: ignoring non-http item %.80r', item)
+                    continue
+                # A line break would end the shortcut's URL= line early and
+                # start another, and whitespace would make the `link stored
+                # as NAME -> URL` log line ambiguous to `omdrop watch`: such
+                # a URL is malformed (a real one is percent-encoded), not a
+                # link. isspace() is Unicode's White_Space, as in core.
+                if any(c.isspace() or unicodedata.category(c) == 'Cc' for c in item):
+                    logging.warning('ask: ignoring item with control characters or spaces %.80r', item)
+                    continue
+                if len(item.encode('utf-8')) > MAX_LINK_BYTES:
+                    logging.warning('ask: ignoring item longer than %d bytes %.80r',
+                                    MAX_LINK_BYTES, item)
                     continue
                 stored = store_link(item, DEST)
                 logging.info('link stored as %s -> %s', stored, item)

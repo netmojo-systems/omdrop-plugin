@@ -132,5 +132,65 @@ class AskListingTests(ReceiverFixture):
                                           "2 item(s): None None NoneB; None None NoneB")])
 
 
+class LinkTests(ReceiverFixture):
+    def links(self, items):
+        ask = plistlib.dumps({"SenderComputerName": "Phone", "SenderModelName": "iPhone17,1",
+                              "TransferType": {"links": 1}, "Items": items},
+                             fmt=plistlib.FMT_BINARY)
+        status, _ = self.post(self.connection(), "/Ask", ask)
+        return status
+
+    def stored(self, host):
+        return sorted(p.name for p in self.out.iterdir() if p.name.startswith(host))
+
+    def test_a_url_with_spaces_or_control_characters_is_not_stored(self):
+        bad = {"space.example": "https://space.example/a b",
+               "tab.example": "https://tab.example/a\tb",
+               "newline.example": "https://newline.example/a\nIconFile=/etc/passwd",
+               "nbsp.example": "https://nbsp.example/a\u00a0b",
+               "nel.example": "https://nel.example/a\u0085b",
+               "del.example": "https://del.example/a\x7fb"}
+        self.assertEqual(self.links([*bad.values(), "https://good.example/ok"]), 200)
+        for host in bad:
+            self.assertEqual(self.stored(host), [], host)
+        self.assertEqual(self.stored("good.example"), ["good.example-ok.url"])
+        log = self.log.read_text()
+        self.assertEqual(log.count("ask: ignoring item with control characters or spaces "), 6)
+
+    def test_a_url_over_8192_bytes_is_not_stored(self):
+        prefix = "https://edge.example/"
+        at_cap = prefix + "b" * (8192 - len(prefix))
+        over = "https://long.example/" + "a" * 8200
+        self.assertEqual(self.links([at_cap, over]), 200)
+        self.assertNotIn("-> https://long.example/", self.log.read_text())
+        self.assertIn("ask: ignoring item longer than 8192 bytes 'https://long.example/aaa",
+                      self.log.read_text())
+        self.assertEqual((self.out / self.stored_as(at_cap)).read_text(),
+                         f"[InternetShortcut]\nURL={at_cap}\n")
+
+    def stored_as(self, url):
+        names = re.findall(r"INFO root: link stored as (\S+) -> (\S+)$",
+                           self.log.read_text(), re.M)
+        [name] = [name for name, logged in names if logged == url]
+        return name
+
+    def test_a_long_path_segment_is_stored_under_a_trimmed_name(self):
+        url = "https://trim.example/" + "c" * 400 + ".x"
+        self.assertEqual(self.links([url, url + "#again"]), 200)
+        first, second = self.stored_as(url), self.stored_as(url + "#again")
+        self.assertEqual(len(first.encode()), 255)
+        self.assertRegex(first, r"^trim\.example-c+\.url$")
+        self.assertLessEqual(len(second.encode()), 255)
+        self.assertRegex(second, r"^trim\.example-c+-1\.url$")
+
+    def test_a_name_that_would_be_all_extension_falls_back_to_link(self):
+        # "trim.example-<400 c>" splits at the host's dot, leaving an
+        # extension too long for any stem: never a hidden ".example-ccc".
+        url = "https://hidden.example/" + "d" * 400
+        self.assertEqual(self.links([url]), 200)
+        self.assertRegex(self.stored_as(url), r"^link(-\d+)?\.url$")
+        self.assertEqual([p.name for p in self.out.iterdir() if p.name.startswith(".")], [])
+
+
 if __name__ == "__main__":
     unittest.main()
