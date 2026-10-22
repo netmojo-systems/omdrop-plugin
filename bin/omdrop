@@ -2613,9 +2613,8 @@ cmd_watch() {
   local dir; dir=$(effective_dir)
   echo "omdrop watch: following $UNIT, saving into $dir"
   journalctl --user -u "$UNIT" -f -n 0 -o cat 2>/dev/null | arrival_names "$dir" \
-    | while IFS=/ read -r -a names; do
-    (( ${#names[@]} )) || continue
-    local inline=() name f
+    | while IFS=/ read -r -a fields; do
+    local state=${fields[0]-} names=("${fields[@]:1}") inline=() name f
     for name in "${names[@]}"; do
       f="${dir%/}/$name"
       echo "omdrop watch: announcing $f"
@@ -2630,7 +2629,7 @@ cmd_watch() {
         inline+=("$!")
       fi
     done
-    if (( once )); then
+    if (( once )) && [[ "$state" == done ]]; then
       (( ${#inline[@]} )) && wait "${inline[@]}"
       # In its OWN transient unit, not in this process. `off` calls
       # cancel_window, which stops omdrop-watch.service -- this service -- and
@@ -2649,22 +2648,30 @@ cmd_watch() {
 # The files one of the receiver's records says it stored, read off its log on
 # stdin, by the rules omdrop-core's links.rs applies (arrivals,
 # resolve_arrivals, arrived_file). A record is the receiver's own
-# `%(asctime)s INFO root: ` prefix, then `upload TID: stored NAME, NAME` or
-# `link stored as NAME.url -> http(s)://...`; anything else is not one, however
-# much of it matches. A name counts only if it is a plain file name -- no
-# slash, no leading dot, no control character -- naming a regular file directly
-# in the download folder $1, by lstat, so a symlink planted there is not
-# followed. `, ` both separates names and may occur inside one, so a piece that
-# is not a file is joined with the pieces after it until one is. Prints one
-# line per record that named a file, its names joined by `/`, which no name
-# can hold; names that are not files are reported on stderr.
+# `%(asctime)s INFO root: ` prefix, then `upload TID: stored NAME, NAME`,
+# `upload TID (K/N): stored NAME, NAME` or `link stored as NAME.url ->
+# http(s)://...`; anything else is not one, however much of it matches. The
+# receiver logs an upload whose names would not fit one record as N records,
+# K = 1..N, each holding whole names; ` (K/N)` sits where no file name can.
+# A name counts only if it is a plain file name -- no slash, no leading dot,
+# no control character -- naming a regular file directly in the download
+# folder $1, by lstat, so a symlink planted there is not followed. `, ` both
+# separates names and may occur inside one, so a piece that is not a file is
+# joined with the pieces after it until one is, up to the 255 bytes a name
+# can have.
+#
+# Prints a line per record that named a file or ended a transfer: `more` or
+# `done`, then the record's file names, all joined by `/`, which no name can
+# hold. `done` marks the last record of a transfer that named a file in any
+# of its records: the plain form, a link, or K = N. Names that are not files
+# are reported on stderr.
 arrival_names() {
   python3 -c '
 import os, re, signal, stat, sys
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 folder = sys.argv[1]
 prefix = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} INFO root: ")
-transfer = re.compile(r"[A-Za-z0-9._-]{1,64}")
+upload = re.compile(r"([A-Za-z0-9._-]{1,64})(?: \(([1-9][0-9]*)/([1-9][0-9]*)\))?")
 # Unicode White_Space, which is what Rust calls whitespace.
 space = set("\t\n\x0b\x0c\r \x85\xa0\u1680\u2028\u2029\u202f\u205f\u3000")
 space.update(map(chr, range(0x2000, 0x200B)))
@@ -2673,15 +2680,22 @@ def control(c):
     return c < "\x20" or "\x7f" <= c <= "\x9f"
 
 def arrivals(line):
+    """(transfer, whether this record is its last, the pieces), or None."""
     m = prefix.match(line)
     if not m:
         return None
     msg = line[m.end():]
     if msg.startswith("upload "):
-        tid, sep, names = msg[len("upload "):].partition(": stored ")
-        if sep and transfer.fullmatch(tid) and names:
-            return names.split(", ")
-        return None
+        head, sep, names = msg[len("upload "):].partition(": stored ")
+        u = upload.fullmatch(head)
+        if not sep or not u or not names:
+            return None
+        if u.group(2) is None:
+            return u.group(1), True, names.split(", ")
+        k, n = int(u.group(2)), int(u.group(3))
+        if k > n or n > 512:
+            return None
+        return u.group(1), k == n, names.split(", ")
     if not msg.startswith("link stored as "):
         return None
     name, sep, url = msg[len("link stored as "):].partition(" -> ")
@@ -2695,7 +2709,7 @@ def arrivals(line):
         return None
     if not rest or any(c in space for c in rest):
         return None
-    return [name]
+    return None, True, [name]
 
 def arrived(name):
     if not name or "/" in name or name.startswith(".") or any(map(control, name)):
@@ -2705,28 +2719,43 @@ def arrived(name):
     except OSError:
         return False
 
+# Transfers whose earlier records named a file, until their last record.
+announced = set()
 for raw in iter(sys.stdin.buffer.readline, b""):
     try:
         line = raw[:-1].decode() if raw.endswith(b"\n") else raw.decode()
     except UnicodeDecodeError:
         continue
-    pieces = arrivals(line)
-    if pieces is None:
+    record = arrivals(line)
+    if record is None:
         continue
+    tid, last, pieces = record
     found, i = [], 0
     while i < len(pieces):
+        hit = None
         for j in range(i, len(pieces)):
             name = ", ".join(pieces[i:j + 1])
-            if arrived(name):
-                found.append(name)
-                i = j + 1
+            # A longer join is no file name (NAME_MAX), so stop there.
+            if len(name.encode()) > 255:
                 break
-        else:
+            if arrived(name):
+                hit = j
+                break
+        if hit is None:
             print(f"omdrop watch: receiver named \x27{pieces[i]}\x27, which is not a file in {folder}; ignored",
                   file=sys.stderr, flush=True)
             i += 1
-    if found:
-        print("/".join(found), flush=True)' "$1"
+        else:
+            found.append(name)
+            i = hit + 1
+    done = last and bool(found or tid in announced)
+    if tid is not None:
+        if last:
+            announced.discard(tid)
+        elif found:
+            announced.add(tid)
+    if found or done:
+        print("/".join(["done" if done else "more"] + found), flush=True)' "$1"
 }
 
 # The URL inside an Apple .webloc or a Windows .url shortcut, unchecked. Both

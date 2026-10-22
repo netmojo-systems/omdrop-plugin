@@ -103,6 +103,47 @@ cmd_watch {"--once" if once else ""}
         self.assertRegex(events, r"systemd-run .*-p MemoryMax=512M .*\bhandle\b",
                          result.stdout + result.stderr)
 
+    def split_upload(self, downloads, count=200):
+        """The receiver's records for one upload of `count` files with names of
+        about 200 bytes: past 16 KiB of names, so `upload TID (K/N): ...`."""
+        names = [f"{n:03d}-" + "x" * 190 + ".jpg" for n in range(count)]
+        parts, part = [], []
+        for name in names:
+            if part and len(", ".join(part + [name]).encode()) > 16384:
+                parts.append(part)
+                part = []
+            part.append(name)
+            (downloads / name).write_text("x")
+        parts.append(part)
+        return names, [f"{TS}upload ABC ({k}/{len(parts)}): stored {', '.join(p)}"
+                       for k, p in enumerate(parts, 1)]
+
+    def test_a_one_file_window_closes_after_the_last_record_of_a_split_upload(self):
+        records = []
+
+        def journal(root, downloads):
+            names, lines = self.split_upload(downloads)
+            records.extend(lines)
+            return "".join(line + "\n" for line in lines)
+        result, events = self.run_watch(once=True, journal=journal)
+
+        self.assertGreater(len(records), 1)
+        handled = [line for line in events.splitlines() if " handle " in line]
+        self.assertEqual(len(handled), 200, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("announcing"), 200)
+        lines = events.splitlines()
+        self.assertTrue(lines[-1].endswith(" off --force"), events[-500:])
+        self.assertEqual(sum(line.endswith(" off --force") for line in lines), 1)
+
+    def test_a_one_file_window_stays_open_until_the_last_record(self):
+        def journal(root, downloads):
+            _, lines = self.split_upload(downloads)
+            return "".join(line + "\n" for line in lines[:-1])
+        result, events = self.run_watch(once=True, journal=journal)
+
+        self.assertIn(" handle ", events, result.stdout + result.stderr)
+        self.assertNotIn("off", events)
+
     def test_a_forged_record_naming_a_file_outside_the_download_folder_is_ignored(self):
         # A sender's text reaches the receiver's log. Neither a line without
         # the receiver's own prefix, nor one where a record's words appear
