@@ -78,15 +78,20 @@ class _BoundedBinaryParser(plistlib._BinaryPlistParser):
 
     plistlib caches a decoded object by its ID, but a binary plist can give
     one object many IDs: 1000 IDs naming one 200 000-member array make
-    plistlib build 1000 separate lists (1.6 GB) from a 400 KB input. Every
-    object read here, from the cache or not, counts as a value and its size
-    against the byte budget, so nothing larger than the limits is built."""
+    plistlib build 1000 separate lists (1.6 GB) from a 400 KB input. And it
+    reads a collection's whole reference list before its first member, at
+    every nesting level: 34 nested arrays whose reference lists overlap held
+    13 MB of pending references for a 21 KB input. So every reference is
+    charged as a value when its list is read, before plistlib builds the
+    list, and every object's size when it is built: nothing is allocated
+    past MAX_EVENTS references or the byte budget."""
 
     def __init__(self, input_len):
         super().__init__(dict_type=dict)
         self._input_len = input_len
         self._budget = byte_budget(input_len)
-        self._events = self._decoded = self._depth = 0
+        self._events = 1  # the top object, which no reference names
+        self._decoded = self._depth = 0
         self.too_complex = False
 
     def _refuse(self):
@@ -102,10 +107,18 @@ class _BoundedBinaryParser(plistlib._BinaryPlistParser):
             raise plistlib.InvalidFileException()
         return super()._read_ints(n, size)
 
+    def _read_refs(self, n):
+        # A collection's members (a dictionary reads its keys and its values
+        # as two lists), charged before the list exists. Each is read later
+        # by _read_object, from the cache or not, so each costs one value.
+        self._events += n
+        if self._events > MAX_EVENTS:
+            self._refuse()
+        return super()._read_refs(n)
+
     def _read_object(self, ref):
-        self._events += 1
         # One past MAX_DEPTH: the exact depth limit is _measure's, after.
-        if self._events > MAX_EVENTS or self._depth > MAX_DEPTH:
+        if self._depth > MAX_DEPTH:
             self._refuse()
         self._depth += 1
         try:
