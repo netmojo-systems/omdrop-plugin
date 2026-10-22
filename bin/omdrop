@@ -1987,12 +1987,19 @@ find_by_name() {
     # child that closes its output but stays alive. Its session also contains
     # probes and Bluetooth advertising, so cancellation stops them together.
     # The two-second grace matches stop_group; neither wait can run forever.
+    # peer_rows cleans the names and refuses a forged row (exit 65), so every
+    # line read below, and every name printed from it, is already clean.
     exec {fd}< <(exec setsid timeout --kill-after=2 "$left" bash -c '
       sender=$1
       flags=()
       "$sender" --help 2>&1 | grep -- "--stream" >/dev/null && flags=(--stream)
-      exec "$sender" --list --names "${flags[@]}"
-    ' bash "$SENDER" 2>&1)
+      # Waits for the pipeline through a TERM, as the sender alone did when it
+      # was exec-ed here: timeout KILLs only while its child is alive, and a
+      # sender that outlives TERM must still get that KILL.
+      trap : TERM
+      set -o pipefail
+      "$sender" --list --names "${flags[@]}" 2>&1 | python3 -c "$2" --text
+    ' bash "$SENDER" "$PEER_ROWS_PY" 2>&1)
     pid=$!
     while :; do
       left=$(( deadline - SECONDS ))
@@ -2444,7 +2451,7 @@ cmd_peers() {
   if (( stream )); then
     local sflag=()
     "$SENDER" --help 2>&1 | grep -q -- '--stream' && sflag=(--stream)
-    peers_stream() { "$SENDER" --list "${names[@]}" "${wake[@]}" "${sflag[@]}" | peers_json --lines; }
+    peers_stream() { "$SENDER" --list "${names[@]}" "${wake[@]}" "${sflag[@]}" | peer_rows --lines; }
     run_cancellable peers_stream
     return
   fi
@@ -2484,10 +2491,12 @@ cmd_peers() {
     # An empty room is still an answer the panel can draw: `[]` on stdout, and
     # the same exit status and sentence as the text form on stderr.
     if (( rc == 1 )); then printf '[]\n'
-    elif (( rc == 0 )); then printf '%s\n' "$out" | peers_json; return
-    else die "$out"
+    elif (( rc == 0 )); then printf '%s\n' "$out" | peer_rows --json || exit 1; return 0
+    else die "$(printf '%s\n' "$out" | peer_rows --text)"
     fi
   fi
+  # Whole, before any of it is printed: a forged row refuses the listing.
+  out=$(printf '%s\n' "$out" | peer_rows --text) || exit 1
   if (( rc == 1 )); then
     # The RADIO, not the receiver: the receiver can be up with no window open,
     # and it is the window that runs the peer watcher which fills this table.
@@ -2503,34 +2512,77 @@ cmd_peers() {
   return "$rc"
 }
 
-# The sender's listing as one JSON array, for the panel. Same pattern as
-# choose_peer: address, signal (or `?`), endpoint, then a name column that -n
-# fills. The placeholders a lookup prints for a peer that did not answer are
-# not names, so they become null rather than labels on the radar.
-peers_json() {
-  python3 -c '
+# The sender's listing, read the way choose_peer reads it: address, signal (or
+# `?`), endpoint, then a name column that -n fills. A name is whatever a
+# nearby device chose to call itself, so it is cleaned before anything prints
+# or matches it, by the rule omdrop-core's sender applies: no C0 or C1
+# controls, DEL, line or paragraph separators, bidi controls or zero-width
+# characters, at most 255 UTF-8 bytes, no surrounding whitespace. Lines end at
+# \n only, never at a \r, so the rows bash sees are the rows parsed here.
+#
+# One lookup lists each address once. An address listed twice means a name
+# held a line break that the sender passed on, and the text after it posed as
+# a row of its own: possibly another device's address with a name of the
+# sender's choosing. There is no telling the forged row from the real one, so
+# the listing is refused: a message on stderr and exit 65, with nothing
+# further printed.
+#
+#   --text   the listing, cleaned; other lines kept, without control characters
+#   --json   one JSON array, for `peers --json`
+#   --lines  one JSON object per row as it arrives, for the panel's stream
+# The placeholders a lookup prints for a peer that did not answer are not
+# names, so they become null rather than labels on the radar.
+PEER_ROWS_PY='
 import json, re, sys
-row = re.compile(r"^((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\s+(-?\d+|\?) dBm\s+\S+\s*(.*)$")
-lines = sys.argv[1:] == ["--lines"]
-peers = []
+mode = sys.argv[1]
+row = re.compile(r"((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\s+(-?[0-9]+|\?) dBm\s+\S+\s*")
+unsafe = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]")
+# Unicode White_Space, as omdrop-core trims it.
+space = "\t\n\x0b\x0c\r \x85\xa0\u1680\u2028\u2029\u202f\u205f\u3000" + "".join(map(chr, range(0x2000, 0x200B)))
+
+def clean(name):
+    name = unsafe.sub("", name).encode()[:255].decode("utf-8", "ignore")
+    return name.strip(space)
+
+seen, peers, forged = set(), [], False
 # readline, not iteration: each line is passed on as soon as it arrives.
-for line in iter(sys.stdin.readline, ""):
-    m = row.match(line.rstrip("\n"))
-    if not m:
+for raw in iter(sys.stdin.buffer.readline, b""):
+    if forged:
         continue
-    name = m.group(3).strip()
+    line = (raw[:-1] if raw.endswith(b"\n") else raw).decode("utf-8", "replace")
+    m = row.match(line)
+    if not m:
+        if mode == "--text":
+            print(unsafe.sub("", line), flush=True)
+        continue
+    if m.group(1) in seen:
+        # Read to the end, so the lookup finishes as it would have.
+        print(f"{m.group(1)} was listed twice in one lookup: a nearby device sent a name with a "
+              "line break in it, which can pass one device off as another. Nothing from this "
+              "lookup was used. Look again in a moment.", file=sys.stderr, flush=True)
+        forged = True
+        continue
+    seen.add(m.group(1))
+    name = clean(line[m.end():])
+    if mode == "--text":
+        head = unsafe.sub("", line[:m.end()])
+        print(head + name if name else head.rstrip(space), flush=True)
+        continue
     peer = {
         "mac": m.group(1),
         "rssi": None if m.group(2) == "?" else int(m.group(2)),
         "name": None if name in ("", "(no response)", "(anonymous)") else name,
     }
-    if lines:
+    if mode == "--lines":
         print(json.dumps(peer), flush=True)
     else:
         peers.append(peer)
-if not lines:
-    print(json.dumps(peers))' "$@"
-}
+if forged:
+    sys.exit(65)
+if mode == "--json":
+    print(json.dumps(peers))
+'
+peer_rows() { python3 -c "$PEER_ROWS_PY" "$@"; }
 
 # The unit is hardened with ProtectHome=read-only, so the download folder has
 # to be named in ReadWritePaths or the receiver cannot write there. Rather than

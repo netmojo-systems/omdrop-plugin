@@ -835,6 +835,111 @@ class NamedRecipientTests(SenderFixture):
         self.assertFalse(self.capture.exists())
 
 
+class PeerNameTests(SenderFixture):
+    """A device's name is whatever it chose to call itself. Until the sender
+    cleans it, a name can carry terminal escapes, bidi overrides, or a line
+    break followed by text shaped like another device's row. The command
+    line cleans every name it prints or matches, and refuses a lookup in which
+    one device was listed twice, since one of those rows was forged."""
+
+    A = "02:00:00:00:00:0a  -40 dBm  [fe80::a%awdl0]:8770"
+    B = "02:00:00:00:00:0b  -30 dBm  [fe80::b%awdl0]:8770"
+    UNSAFE = "\x1b\x07\x7f\x85\u2028\u2029\u202a\u202e\u2066\u2069\u200b\u200f\ufeff"
+
+    def assert_clean(self, text):
+        for c in self.UNSAFE:
+            self.assertNotIn(c, text, f"{ord(c):#x} printed")
+
+    def test_a_row_forged_inside_a_name_cannot_relabel_another_device(self):
+        # The attacker A calls itself "Brent's iPhone", and the line break in
+        # its name forges a row that renames the real Brent's iPhone, B.
+        # Before, the forged row replaced B's, and the send went to A.
+        self.env.update(OMDROP_NAME_WAIT="5", PEER_LIST="\n".join([
+            f"{self.B}  Brent's iPhone",
+            f"{self.A}  Brent's iPhone",
+            f"{self.B}  Mallory",
+        ]))
+
+        result = self.run_omdrop("send", "Brent's iPhone", str(self.file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("listed twice in one lookup", result.stderr)
+        self.assertFalse(self.capture.exists(), "sent despite a forged row")
+
+    def test_the_panels_stream_stops_at_a_forged_row(self):
+        self.env["PEER_LIST"] = "\n".join([
+            f"{self.B}  Brent's iPhone",
+            f"{self.A}  x",
+            f"{self.B}  Mallory",
+        ])
+
+        result = self.run_omdrop("peers", "--json", "-n", "--stream")
+
+        names = [json.loads(line)["name"] for line in result.stdout.splitlines()]
+        self.assertEqual(names, ["Brent's iPhone", "x"])
+
+    def test_the_json_listing_refuses_a_forged_row(self):
+        self.env["PEER_LIST"] = f"{self.B}  Brent's iPhone\n{self.B}  Mallory"
+
+        result = self.run_omdrop("peers", "--json", "-n")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Mallory", result.stdout)
+        self.assertIn("listed twice in one lookup", result.stderr)
+
+    def test_a_carriage_return_does_not_end_a_row(self):
+        # bash reads rows up to \n; Python's text mode also ended them at \r,
+        # so the panel saw a row the command line never did.
+        self.env["PEER_LIST"] = f"{self.A}  Mallory\r{self.B}  Brent's iPhone"
+
+        result = self.run_omdrop("peers", "--json", "-n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        peers = json.loads(result.stdout)
+        self.assertEqual([p["mac"] for p in peers], ["02:00:00:00:00:0a"])
+        self.assertNotIn("\r", peers[0]["name"])
+
+    def test_names_are_printed_without_control_or_invisible_characters(self):
+        self.env["PEER_LIST"] = f"{self.A}  Studio{self.UNSAFE} Mac \t"
+
+        result = self.run_omdrop("peers", "-n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{self.A}  Studio Mac\n")
+
+        result = self.run_omdrop("peers", "--json", "-n")
+        self.assertEqual(json.loads(result.stdout)[0]["name"], "Studio Mac")
+
+    def test_a_name_is_cut_to_255_bytes_on_a_character_boundary(self):
+        self.env["PEER_LIST"] = f"{self.A}  {'é' * 200}"
+
+        result = self.run_omdrop("peers", "--json", "-n")
+
+        self.assertEqual(json.loads(result.stdout)[0]["name"], "é" * 127)
+
+    def test_a_name_of_only_unsafe_characters_is_no_name(self):
+        self.env["PEER_LIST"] = f"{self.A}  {self.UNSAFE}"
+
+        result = self.run_omdrop("peers", "--json", "-n")
+
+        self.assertEqual(json.loads(result.stdout)[0]["name"], None)
+
+    def test_heard_from_and_several_devices_print_clean_names(self):
+        self.env.update(OMDROP_NAME_WAIT="5", PEER_LIST="\n".join([
+            f"{self.A}  Studio\x1b[31m Mac{self.UNSAFE}",
+            f"{self.B}  Studio\u202e Phone",
+        ]))
+
+        result = self.run_omdrop("send", "studio", str(self.file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Heard from Studio[31m Mac.", result.stdout)
+        self.assertIn("Heard from Studio Phone.", result.stdout)
+        self.assertIn("Several devices match", result.stderr)
+        self.assert_clean(result.stdout + result.stderr)
+        self.assertFalse(self.capture.exists())
+
+
 class SendPickTests(SenderFixture):
     """`send --pick`: where the chooser opens, and what it remembers."""
 
