@@ -326,6 +326,25 @@ impl ReceiveBudget {
     }
 }
 
+/// The longest URL a `links` Ask may have stored. Browsers handle a few
+/// kilobytes; a longer item is skipped like a non-http one.
+pub const MAX_LINK_URL_BYTES: usize = 8192;
+/// What each stored link costs against the receive budget beyond its own
+/// bytes: the filesystem block a small file takes.
+const LINK_FILE_OVERHEAD: u64 = 4096;
+
+/// The bytes [`store_link`] writes for `url`.
+fn link_file(url: &str) -> String {
+    format!("[InternetShortcut]\nURL={url}\n")
+}
+
+/// What storing `urls` costs against a [`ReceiveBudget`].
+fn links_cost(urls: &[&str]) -> u64 {
+    urls.iter()
+        .map(|u| link_file(u).len() as u64 + LINK_FILE_OVERHEAD)
+        .sum()
+}
+
 /// The URL a `links` Ask carries, stored in `dest` as an inert `.url`
 /// shortcut; returns the stored name. INI form (`[InternetShortcut]`) because
 /// it is plain text, needs no execute bit, and is what browsers and file
@@ -354,7 +373,7 @@ pub fn store_link(url: &str, dest: &Path) -> io::Result<String> {
         base.pop();
     }
     let (name, mut file) = open_new(dest, &format!("{base}.url"))?;
-    file.write_all(format!("[InternetShortcut]\nURL={url}\n").as_bytes())?;
+    file.write_all(link_file(url).as_bytes())?;
     Ok(name)
 }
 
@@ -1145,6 +1164,7 @@ impl Conn<'_> {
         // Everyone mode any device in range could make this machine visit an
         // arbitrary URL. A file the user clicks is all we offer.
         if types.iter().any(|t| t == "links") {
+            let mut urls: Vec<&str> = Vec::new();
             for item in items {
                 let url = match item.as_string() {
                     Some(u) if u.starts_with("http://") || u.starts_with("https://") => u,
@@ -1170,6 +1190,35 @@ impl Conn<'_> {
                     );
                     continue;
                 }
+                if url.len() > MAX_LINK_URL_BYTES {
+                    let shown = py_repr(url);
+                    warning!(
+                        "ask: ignoring item longer than {MAX_LINK_URL_BYTES} bytes {}",
+                        shown.chars().take(80).collect::<String>()
+                    );
+                    continue;
+                }
+                urls.push(url);
+            }
+            // The links are the whole transfer, so they get the budget an
+            // upload would: nothing is stored unless all of them fit.
+            if !urls.is_empty() {
+                let s = self.settings();
+                let cost = links_cost(&urls);
+                match ReceiveBudget::of(&s.dest, s.max_receive_percent, s.min_free_bytes) {
+                    Ok(Ok(b)) if cost <= b.byte_limit => {}
+                    Ok(Ok(b)) => {
+                        let reason = format!(
+                            "links need {cost} bytes; {}% of {} free bytes allows {}",
+                            b.percent, b.free_bytes, b.byte_limit
+                        );
+                        return self.reject(io, req, 507, &reason);
+                    }
+                    Ok(Err(e)) => return self.reject(io, req, 507, &e),
+                    Err(e) => return self.reject(io, req, 507, &format!("storage failed: {e}")),
+                }
+            }
+            for url in urls {
                 match store_link(url, &self.settings().dest) {
                     Ok(stored) => info!("link stored as {stored} -> {url}"),
                     // Answering 200 would tell the sender a lost link arrived.

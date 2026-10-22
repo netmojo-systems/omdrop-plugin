@@ -875,6 +875,64 @@ fn links_with_spaces_are_not_stored() {
     assert!(fx.files().is_empty());
 }
 
+fn links_ask(urls: &[&str]) -> Vec<u8> {
+    let mut d = Dictionary::new();
+    d.insert(
+        "TransferType".into(),
+        Value::Dictionary(Dictionary::from_iter([(
+            "links".to_string(),
+            Value::Integer(1.into()),
+        )])),
+    );
+    d.insert(
+        "Items".into(),
+        Value::Array(urls.iter().map(|u| Value::String((*u).into())).collect()),
+    );
+    plist_bytes(d)
+}
+
+/// A links Ask is the whole transfer, so it gets an upload's budget: 512
+/// links a time, any number of times, must not fill the disk past
+/// MIN_FREE_BYTES.
+#[test]
+fn links_past_the_receive_budget_are_refused_and_none_stored() {
+    let ask = links_ask(&["https://example.com/a", "https://example.com/b"]);
+    for tweak in [
+        (|s: &mut Settings| s.min_free_bytes = u64::MAX) as fn(&mut Settings),
+        |s| s.max_receive_percent = 0,
+    ] {
+        let fx = start(false, tweak);
+        assert_eq!(post(&mut connect(&fx, false), "/Ask", &ask).0, 507);
+        assert!(fx.files().is_empty());
+    }
+    // Within budget, all are stored.
+    let fx = start(false, |_| {});
+    assert_eq!(post(&mut connect(&fx, false), "/Ask", &ask).0, 200);
+    assert_eq!(fx.files(), ["example.com-a.url", "example.com-b.url"]);
+    // Each costs its file and a block.
+    let url = "https://example.com/";
+    assert_eq!(
+        links_cost(&[url, url]),
+        2 * ("[InternetShortcut]\nURL=\n".len() + url.len() + 4096) as u64
+    );
+}
+
+#[test]
+fn links_longer_than_8192_bytes_are_not_stored() {
+    let fx = start(false, |_| {});
+    let base = "https://example.com/";
+    let longest = format!("{base}{}", "a".repeat(MAX_LINK_URL_BYTES - base.len()));
+    let over = format!("{longest}b");
+    let ask = links_ask(&[&over, &longest]);
+    assert_eq!(post(&mut connect(&fx, false), "/Ask", &ask).0, 200);
+    let files = fx.files();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(
+        std::fs::read_to_string(fx.dest().join(&files[0])).unwrap(),
+        format!("[InternetShortcut]\nURL={longest}\n")
+    );
+}
+
 #[test]
 fn peer_certificates_are_captured_when_asked() {
     let capture = tempfile::tempdir().unwrap();
