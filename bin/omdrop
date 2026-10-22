@@ -2565,8 +2565,9 @@ cmd_watch() {
       # (`off`, or a one-file window closing right after this) kills its whole
       # cgroup, and a notification still decoding its preview would be lost.
       # systemd-run returns once the unit has started. Without it, handle runs
-      # here, and a one-file window waits for it before closing.
-      if ! systemd-run --user --quiet --collect "$SELF" handle "$f" >/dev/null 2>&1; then
+      # here, and a one-file window waits for it before closing. MemoryMax
+      # bounds what decoding a sender's photo for its preview can take.
+      if ! systemd-run --user --quiet --collect -p MemoryMax=512M "$SELF" handle "$f" >/dev/null 2>&1; then
         "$SELF" handle "$f" &
         inline+=("$!")
       fi
@@ -2782,6 +2783,30 @@ PREVIEW_KEEP=10
 PREVIEW_SIZE=512
 PREVIEW_TIMEOUT=${OMDROP_PREVIEW_TIMEOUT:-10}
 
+# Run "$@" holding the per-user decode lock. Every arrival gets its own
+# `handle`, so a burst of photos from a nearby sender would otherwise decode
+# all at once, each at full size in RAM. omdrop-core takes the same lock file,
+# so the two never decode together either. Each decode is bounded by its own
+# timeout, so waiting for the lock is bounded too.
+DECODE_LOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omdrop/decode.lock"
+with_decode_lock() {
+  (umask 077 && mkdir -p -- "$(dirname "$DECODE_LOCK")") || return 1
+  (
+    umask 077
+    exec 9>>"$DECODE_LOCK" && flock 9 || exit 1
+    "$@"
+  )
+}
+
+# Decode $1 into the preview $2 and shrink it: what heic_preview does under
+# the decode lock.
+decode_preview() {
+  timeout -k 1 "$PREVIEW_TIMEOUT" heif-convert -q 80 "$1" "$2" >/dev/null 2>&1 \
+    && [[ -s "$2" ]] || return 1
+  shrink_preview "$2"
+  return 0
+}
+
 # A small JPEG preview for formats the notification daemon cannot decode (HEIC
 # from an iPhone). Prints the path of the preview, or nothing when none is
 # possible; a failed or timed-out decode only costs the toast its thumbnail.
@@ -2795,9 +2820,7 @@ heic_preview() {
   # the only name pruning looks at -- once it is complete.
   work=$(mktemp --suffix=.jpg "$PREVIEW_DIR/working.XXXXXX") || return 0
   final="$PREVIEW_DIR/preview.${work#"$PREVIEW_DIR/working."}"
-  if timeout -k 1 "$PREVIEW_TIMEOUT" heif-convert -q 80 "$f" "$work" >/dev/null 2>&1 \
-     && [[ -s "$work" ]]; then
-    shrink_preview "$work"
+  if with_decode_lock decode_preview "$f" "$work"; then
     # Pruning goes by when a preview was finished. A shrink that failed or
     # timed out leaves the decode's older time, and the newer previews of a
     # burst would prune this one before its toast could show it.
@@ -3109,7 +3132,7 @@ copy_to_clipboard() {
 # The file came from whoever was nearby, so the decode is time-limited:
 # 10 s. A 48 MP iPhone photo decodes in a second or two even on modest
 # hardware, so this never cuts off a real photo, but it bounds a hostile file
-# built to stall the handler.
+# built to stall the handler. It runs under the decode lock, one at a time.
 HEIF_TIMEOUT=10
 heif_to_jpeg() {
   local src=$1 base tmp
@@ -3117,7 +3140,7 @@ heif_to_jpeg() {
   base="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omdrop"
   (umask 077 && mkdir -p -- "$base") || return 1
   tmp=$(mktemp -d "$base/clip.XXXXXX") || return 1
-  if timeout -k 2 "$HEIF_TIMEOUT" heif-convert -q 90 "$src" "$tmp/clip.jpg" </dev/null >/dev/null 2>&1 \
+  if with_decode_lock timeout -k 2 "$HEIF_TIMEOUT" heif-convert -q 90 "$src" "$tmp/clip.jpg" </dev/null >/dev/null 2>&1 \
      && [[ -s "$tmp/clip.jpg" ]]; then
     printf '%s' "$tmp"
     return 0

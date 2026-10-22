@@ -96,6 +96,13 @@ cmd_watch {"--once" if once else ""}
         _, events = self.run_watch(once=False)
         self.assertNotIn("off", events)
 
+    def test_the_notification_unit_has_a_memory_ceiling(self):
+        # handle decodes a sender's HEIC for its preview, and in Everyone mode
+        # anyone nearby chooses that file.
+        result, events = self.run_watch(once=False)
+        self.assertRegex(events, r"systemd-run .*-p MemoryMax=512M .*\bhandle\b",
+                         result.stdout + result.stderr)
+
     def test_a_forged_record_naming_a_file_outside_the_download_folder_is_ignored(self):
         # A sender's text reaches the receiver's log. Neither a line without
         # the receiver's own prefix, nor one where a record's words appear
