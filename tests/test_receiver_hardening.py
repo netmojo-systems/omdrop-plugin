@@ -97,5 +97,40 @@ class LogInjectionTests(ReceiverFixture):
         self.assertRegex(line, r" \[\.\.\. \d+ more bytes\]$")
 
 
+class AskListingTests(ReceiverFixture):
+    def ask(self, fields):
+        ask = {"SenderModelName": "MacBookPro18,3", "TransferType": {"files": 1},
+               "Items": [], "Files": []}
+        ask.update(fields)
+        status, _ = self.post(self.connection(), "/Ask",
+                              plistlib.dumps(ask, fmt=plistlib.FMT_BINARY))
+        return status, self.log.read_text().splitlines()
+
+    def test_the_listing_names_at_most_512_files(self):
+        files = [{"FileName": f"f{i:03}.txt", "FileType": "public.data", "FileSize": 1}
+                 for i in range(600)]
+        status, lines = self.ask({"SenderComputerName": "Many", "Files": files})
+        self.assertEqual(status, 200)
+        [line] = [line for line in lines if "ask from Many (" in line]
+        self.assertIn("600 item(s)", line)
+        self.assertIn("; f511.txt public.data 1B", line)
+        self.assertNotIn("f512.txt", line)
+
+    def test_an_ask_over_the_item_limit_is_refused_before_it_is_listed(self):
+        status, lines = self.ask({"SenderComputerName": "TooMany",
+                                  "Items": [f"https://example.com/{i}" for i in range(513)]})
+        self.assertEqual(status, 413)
+        self.assertFalse([line for line in lines if "ask from TooMany" in line])
+        self.assertTrue([line for line in lines
+                         if line.endswith("/Ask rejected: Ask exceeds 512-item limit")])
+
+    def test_a_file_entry_that_is_not_a_dictionary_is_listed_not_fatal(self):
+        status, lines = self.ask({"SenderComputerName": "Odd", "Files": ["x", 1]})
+        self.assertEqual(status, 200)
+        self.assertTrue([line for line in lines
+                         if line.endswith("ask from Odd (MacBookPro18,3): type files, "
+                                          "2 item(s): None None NoneB; None None NoneB")])
+
+
 if __name__ == "__main__":
     unittest.main()

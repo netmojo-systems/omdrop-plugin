@@ -1003,16 +1003,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             logging.error('ask: undecodable %d-byte body: %r', len(body), e)
             ask = {}
-        files = ask.get('Files') or []
-        logging.info('ask from %s (%s): type %s, %d item(s): %s',
-                     ask.get('SenderComputerName'), ask.get('SenderModelName'),
-                     ','.join(ask.get('TransferType') or {}) or '?', len(files),
-                     '; '.join(f"{f.get('FileName')} {f.get('FileType')} {f.get('FileSize')}B"
-                               for f in files) or (ask.get('Items') or '-'))
-        items = ask.get('Items') or []
+        if not isinstance(ask, dict):
+            ask = {}
+        files = ask.get('Files')
+        files = files if isinstance(files, list) else []
+        items = ask.get('Items')
+        items = items if isinstance(items, list) else []
+        # Before anything is built from them: the log line below grows with
+        # the item count.
         if len(items) > MAX_ARCHIVE_MEMBERS:
             self.reject(413, f'Ask exceeds {MAX_ARCHIVE_MEMBERS}-item limit')
             return
+        listing = '; '.join(
+            f"{d.get('FileName')} {d.get('FileType')} {d.get('FileSize')}B"
+            for d in (f if isinstance(f, dict) else {} for f in files[:MAX_ARCHIVE_MEMBERS]))
+        logging.info('ask from %s (%s): type %s, %d item(s): %s',
+                     ask.get('SenderComputerName'), ask.get('SenderModelName'),
+                     ','.join(ask.get('TransferType') or {}) or '?', len(files),
+                     listing or items or '-')
         # Contacts Only is enforced here rather than at /Discover, for two
         # reasons measured on 2026-09-18: a sender presents its Apple-issued
         # client certificate on /Ask and never on /Discover, and /Ask is the
