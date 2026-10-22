@@ -150,11 +150,15 @@ pub fn short_hostname() -> String {
 pub mod apple {
     /// Apple Root CA, PEM. Vendored: public, no account needed.
     pub const ROOT_CA_PEM: &[u8] = include_bytes!("../certs/apple_root_ca.pem");
+    /// Apple Application Integration 2 CA, PEM: the issuer of the certificate
+    /// Apple signs validation records with, and the only certificate a
+    /// record's signature may chain to.
+    pub const RECORD_SIGNING_CA_PEM: &[u8] = include_bytes!("../certs/apple-aai2-ca.pem");
     /// Apple's issuing intermediates, PEM. A sender presents only its leaf,
     /// so a chain to the root needs these.
     pub const INTERMEDIATES_PEM: &[&[u8]] = &[
         include_bytes!("../certs/apple-aai-ca.pem"),
-        include_bytes!("../certs/apple-aai2-ca.pem"),
+        RECORD_SIGNING_CA_PEM,
     ];
     /// The subject common names of [`INTERMEDIATES_PEM`], in the same order.
     pub const INTERMEDIATE_NAMES: &[&str] = &[
@@ -175,9 +179,10 @@ pub mod apple {
     }
 
     /// Apple's signature over a DER validation record, and its contents.
-    /// `None` if the signature does not verify to Apple's root.
+    /// `None` unless the record is signed by one certificate named
+    /// `AppleIDValidationRecordSigning…` issued by [`RECORD_SIGNING_CA_PEM`].
     pub fn verify_record(record: &[u8]) -> Option<Record> {
-        crate::applecheck::verify_record_with(record, ROOT_CA_PEM)
+        crate::applecheck::verify_record_with(record, RECORD_SIGNING_CA_PEM)
     }
 
     /// The Apple account a DER certificate belongs to, or `""` when it does

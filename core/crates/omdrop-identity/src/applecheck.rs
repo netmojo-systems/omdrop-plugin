@@ -15,6 +15,10 @@ use crate::keys::openssl;
 
 /// The subject prefix of an Apple-issued AirDrop client certificate.
 const CN_PREFIX: &str = "com.apple.idms.appleid.prd.";
+/// The subject prefix of the certificate Apple signs validation records
+/// with: `AppleIDValidationRecordSigning05` in 2026.
+const RECORD_SIGNER_CN_PREFIX: &str = "AppleIDValidationRecordSigning";
+const PEM_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
 
 fn write_file(path: &Path, data: &[u8]) -> Option<()> {
     use std::io::Write;
@@ -96,18 +100,28 @@ pub(crate) fn record_from_plist(payload: &[u8], now: f64) -> Option<Record> {
     })
 }
 
-/// `openssl cms -verify` against `root_pem`, then the record's contents.
+/// `openssl cms -verify` with `anchor_pem` as the only trusted certificate,
+/// then the record's contents.
+///
+/// The anchor is the CA that issues Apple's record-signing certificates (in
+/// production the vendored Application Integration 2 intermediate), trusted
+/// on its own with `-partial_chain`, and the one signer's common name must
+/// start with [`RECORD_SIGNER_CN_PREFIX`]. Anchoring at Apple's root accepted
+/// a record signed by any certificate Apple issues, and an Apple ID's own
+/// AirDrop certificate is one: its holder could sign a record claiming
+/// anyone's email and phone hashes.
 ///
 /// `-purpose any` is required: the signer is a record-signing certificate,
 /// not an S/MIME one, so openssl's default purpose check rejects genuine
 /// records.
-pub(crate) fn verify_record_with(record: &[u8], root_pem: &[u8]) -> Option<Record> {
-    if record.is_empty() || root_pem.is_empty() {
+pub(crate) fn verify_record_with(record: &[u8], anchor_pem: &[u8]) -> Option<Record> {
+    if record.is_empty() || anchor_pem.is_empty() {
         return None;
     }
-    let dir = workdir(root_pem)?;
+    let dir = workdir(anchor_pem)?;
     let ca = dir.path().join("ca.pem");
     let out = dir.path().join("out.bin");
+    let signer = dir.path().join("signer.pem");
     let run = openssl(
         &[
             "cms".as_ref(),
@@ -116,8 +130,11 @@ pub(crate) fn verify_record_with(record: &[u8], root_pem: &[u8]) -> Option<Recor
             "DER".as_ref(),
             "-CAfile".as_ref(),
             ca.as_os_str(),
+            "-partial_chain".as_ref(),
             "-purpose".as_ref(),
             "any".as_ref(),
+            "-signer".as_ref(),
+            signer.as_os_str(),
             "-out".as_ref(),
             out.as_os_str(),
         ],
@@ -129,16 +146,47 @@ pub(crate) fn verify_record_with(record: &[u8], root_pem: &[u8]) -> Option<Recor
     if !run.status.success() {
         return None;
     }
+    // Exactly one signer: openssl writes every verified signer's certificate.
+    let signers = fs::read(&signer).ok()?;
+    if signers
+        .windows(PEM_BEGIN.len())
+        .filter(|w| *w == PEM_BEGIN)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let subject = openssl(
+        &[
+            "x509".as_ref(),
+            "-in".as_ref(),
+            signer.as_os_str(),
+            "-noout".as_ref(),
+            "-subject".as_ref(),
+            "-nameopt".as_ref(),
+            "multiline".as_ref(),
+        ],
+        None,
+        None,
+        None,
+    )
+    .ok()?;
+    if !subject.status.success()
+        || !common_name(&String::from_utf8_lossy(&subject.stdout))
+            .starts_with(RECORD_SIGNER_CN_PREFIX)
+    {
+        return None;
+    }
     let payload = fs::read(&out).ok()?;
     record_from_plist(&payload, now_secs())
 }
 
-/// The account in `openssl x509 -subject -nameopt multiline` output: the
-/// `commonName = value` line (the last, as the plugin's contacts.py reads it),
-/// if it carries Apple's prefix. The one-line default is `CN = value` on
-/// OpenSSL 3.0 (Debian 12, Ubuntu 22.04 and 24.04) and `CN=value` later, so
-/// searching it for `CN=` refused every Apple certificate on 3.0 (plugin #67).
-fn account_from_subject(subject: &str) -> String {
+/// The `commonName = value` line of `openssl x509 -subject -nameopt
+/// multiline` output (the last, as the plugin's contacts.py reads it). The
+/// one-line default is `CN = value` on OpenSSL 3.0 (Debian 12, Ubuntu 22.04
+/// and 24.04) and `CN=value` later, so searching it for `CN=` refused every
+/// Apple certificate on 3.0 (plugin #67).
+fn common_name(subject: &str) -> &str {
     let mut cn = "";
     for line in subject.lines() {
         if let Some((key, value)) = line.split_once('=')
@@ -147,7 +195,16 @@ fn account_from_subject(subject: &str) -> String {
             cn = value.trim();
         }
     }
-    cn.strip_prefix(CN_PREFIX).unwrap_or("").to_owned()
+    cn
+}
+
+/// The account a certificate subject names, if its common name carries
+/// Apple's AirDrop prefix.
+fn account_from_subject(subject: &str) -> String {
+    common_name(subject)
+        .strip_prefix(CN_PREFIX)
+        .unwrap_or("")
+        .to_owned()
 }
 
 /// The Apple account a DER client certificate belongs to, or `""`.
@@ -238,7 +295,8 @@ pub(crate) mod tests {
     }
 
     /// A synthetic CA hierarchy standing in for Apple's: root -> intermediate
-    /// -> leaf `CN=com.apple.idms.appleid.prd.<account>`, plus a record signer.
+    /// -> leaf `CN=com.apple.idms.appleid.prd.<account>`, plus a record signer
+    /// `CN=AppleIDValidationRecordSigning05` under the same intermediate.
     pub(crate) struct FakeApple {
         pub dir: tempfile::TempDir,
     }
@@ -274,63 +332,18 @@ pub(crate) mod tests {
                     "root.pem",
                 ],
             );
-            run(
-                d,
-                &[
-                    "req",
-                    "-newkey",
-                    "rsa:2048",
-                    "-nodes",
-                    "-subj",
-                    "/CN=Fake Intermediate",
-                    "-keyout",
-                    "int.key",
-                    "-out",
-                    "int.csr",
-                ],
-            );
-            run(
-                d,
-                &[
-                    "x509",
-                    "-req",
-                    "-in",
-                    "int.csr",
-                    "-CA",
-                    "root.pem",
-                    "-CAkey",
-                    "root.key",
-                    "-CAcreateserial",
-                    "-days",
-                    "2",
-                    "-extfile",
-                    "ca.ext",
-                    "-out",
-                    "int.pem",
-                ],
-            );
-            FakeApple { dir }
+            let apple = FakeApple { dir };
+            apple.intermediate_named("int", "Fake Intermediate");
+            apple
         }
 
-        pub(crate) fn path(&self, name: &str) -> std::path::PathBuf {
-            self.dir.path().join(name)
-        }
-
-        pub(crate) fn root(&self) -> Vec<u8> {
-            fs::read(self.path("root.pem")).expect("root")
-        }
-
-        pub(crate) fn intermediate(&self) -> Vec<u8> {
-            fs::read(self.path("int.pem")).expect("int")
-        }
-
-        /// A leaf issued by the intermediate: (certificate PEM, key PEM).
-        pub(crate) fn leaf(&self, name: &str, cn: &str) -> (Vec<u8>, Vec<u8>) {
+        /// Another intermediate `stem` under the same root.
+        pub(crate) fn intermediate_named(&self, stem: &str, cn: &str) -> Vec<u8> {
             let d = self.dir.path();
             let (key, csr, pem) = (
-                format!("{name}.key"),
-                format!("{name}.csr"),
-                format!("{name}.pem"),
+                format!("{stem}.key"),
+                format!("{stem}.csr"),
+                format!("{stem}.pem"),
             );
             run(
                 d,
@@ -355,9 +368,73 @@ pub(crate) mod tests {
                     "-in",
                     &csr,
                     "-CA",
-                    "int.pem",
+                    "root.pem",
                     "-CAkey",
-                    "int.key",
+                    "root.key",
+                    "-CAcreateserial",
+                    "-days",
+                    "2",
+                    "-extfile",
+                    "ca.ext",
+                    "-out",
+                    &pem,
+                ],
+            );
+            fs::read(d.join(&pem)).expect("intermediate")
+        }
+
+        pub(crate) fn path(&self, name: &str) -> std::path::PathBuf {
+            self.dir.path().join(name)
+        }
+
+        pub(crate) fn root(&self) -> Vec<u8> {
+            fs::read(self.path("root.pem")).expect("root")
+        }
+
+        pub(crate) fn intermediate(&self) -> Vec<u8> {
+            fs::read(self.path("int.pem")).expect("int")
+        }
+
+        /// A leaf issued by the intermediate: (certificate PEM, key PEM).
+        pub(crate) fn leaf(&self, name: &str, cn: &str) -> (Vec<u8>, Vec<u8>) {
+            self.leaf_of("int", name, cn)
+        }
+
+        /// A leaf issued by intermediate `issuer`.
+        pub(crate) fn leaf_of(&self, issuer: &str, name: &str, cn: &str) -> (Vec<u8>, Vec<u8>) {
+            let d = self.dir.path();
+            let (key, csr, pem) = (
+                format!("{name}.key"),
+                format!("{name}.csr"),
+                format!("{name}.pem"),
+            );
+            let (ca, ca_key) = (format!("{issuer}.pem"), format!("{issuer}.key"));
+            run(
+                d,
+                &[
+                    "req",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-subj",
+                    &format!("/CN={cn}"),
+                    "-keyout",
+                    &key,
+                    "-out",
+                    &csr,
+                ],
+            );
+            run(
+                d,
+                &[
+                    "x509",
+                    "-req",
+                    "-in",
+                    &csr,
+                    "-CA",
+                    &ca,
+                    "-CAkey",
+                    &ca_key,
                     "-CAcreateserial",
                     "-days",
                     "2",
@@ -371,12 +448,34 @@ pub(crate) mod tests {
             )
         }
 
-        /// A DER CMS record over `plist`, signed by a leaf of this hierarchy.
+        /// A DER CMS record over `plist`, signed as Apple signs one: by
+        /// `CN=AppleIDValidationRecordSigning05`, issued by the intermediate,
+        /// with the intermediate and root in the record's certificates.
         pub(crate) fn record(&self, plist_xml: &str) -> Vec<u8> {
+            self.record_signed_by(
+                "int",
+                "signer",
+                "AppleIDValidationRecordSigning05",
+                plist_xml,
+            )
+        }
+
+        /// A DER CMS record over `plist`, signed by leaf `name` (made once,
+        /// named `cn`) of intermediate `issuer`.
+        pub(crate) fn record_signed_by(
+            &self,
+            issuer: &str,
+            name: &str,
+            cn: &str,
+            plist_xml: &str,
+        ) -> Vec<u8> {
             let d = self.dir.path();
-            if !d.join("signer.pem").exists() {
-                self.leaf("signer", "Fake Record Signer");
+            if !d.join(format!("{name}.pem")).exists() {
+                self.leaf_of(issuer, name, cn);
             }
+            let mut chain = fs::read(d.join(format!("{issuer}.pem"))).expect("issuer");
+            chain.extend(self.root());
+            fs::write(d.join("chain.pem"), chain).expect("chain");
             fs::write(d.join("record.plist"), plist_xml).expect("plist");
             run(
                 d,
@@ -390,11 +489,11 @@ pub(crate) mod tests {
                     "-in",
                     "record.plist",
                     "-signer",
-                    "signer.pem",
+                    &format!("{name}.pem"),
                     "-inkey",
-                    "signer.key",
+                    &format!("{name}.key"),
                     "-certfile",
-                    "int.pem",
+                    "chain.pem",
                     "-out",
                     "record.cms",
                 ],
@@ -467,7 +566,7 @@ pub(crate) mod tests {
     fn a_signed_record_is_read_and_a_foreign_one_refused() {
         let apple = FakeApple::new();
         let record = apple.record(&plist("ACCOUNT-1", "2026-01-01T00:00:00Z", 3600, &["AbCd"]));
-        let r = verify_record_with(&record, &apple.root()).expect("verifies");
+        let r = verify_record_with(&record, &apple.intermediate()).expect("verifies");
         assert_eq!(r.account, "ACCOUNT-1");
         assert_eq!(
             r.hashes,
@@ -477,11 +576,75 @@ pub(crate) mod tests {
         );
         assert_eq!(r.expires, Some(1_767_225_600.0 + 3600.0));
         assert!(r.expired);
-        // Another hierarchy's root does not verify it.
+        // Another hierarchy's intermediate does not verify it.
         let other = FakeApple::new();
-        assert!(verify_record_with(&record, &other.root()).is_none());
-        assert!(verify_record_with(b"", &apple.root()).is_none());
-        assert!(verify_record_with(b"\x30\x82junk", &apple.root()).is_none());
+        assert!(verify_record_with(&record, &other.intermediate()).is_none());
+        assert!(verify_record_with(b"", &apple.intermediate()).is_none());
+        assert!(verify_record_with(b"\x30\x82junk", &apple.intermediate()).is_none());
+    }
+
+    /// Anchored at Apple's root, any certificate Apple issues could sign a
+    /// record, including the AirDrop certificate of any Apple ID: its holder
+    /// could claim anyone's email and phone hashes and pass Contacts Only.
+    #[test]
+    fn only_the_record_signer_under_the_record_ca_is_trusted() {
+        let apple = FakeApple::new();
+        let forged = plist("EVIL", "2026-01-01T00:00:00Z", 3600, &["AbCd"]);
+        let anchor = apple.intermediate();
+        // An AirDrop identity's leaf, from the record CA itself.
+        let by_peer =
+            apple.record_signed_by("int", "peer", "com.apple.idms.appleid.prd.EVIL", &forged);
+        assert!(verify_record_with(&by_peer, &anchor).is_none());
+        // The right name, from another CA under the same root.
+        apple.intermediate_named("sibling", "Fake Sibling Intermediate");
+        let by_sibling = apple.record_signed_by(
+            "sibling",
+            "sibling-signer",
+            "AppleIDValidationRecordSigning05",
+            &forged,
+        );
+        assert!(verify_record_with(&by_sibling, &anchor).is_none());
+        // The name is a prefix match: Apple numbers its signers.
+        let by_next = apple.record_signed_by(
+            "int",
+            "next-signer",
+            "AppleIDValidationRecordSigning06",
+            &forged,
+        );
+        assert_eq!(
+            verify_record_with(&by_next, &anchor).map(|r| r.account),
+            Some("EVIL".to_owned())
+        );
+        // A genuine signer alongside another: openssl verifies both, and
+        // the record is refused for not having exactly one.
+        let d = apple.dir.path();
+        run(
+            d,
+            &[
+                "cms",
+                "-sign",
+                "-binary",
+                "-nodetach",
+                "-outform",
+                "DER",
+                "-in",
+                "record.plist",
+                "-signer",
+                "next-signer.pem",
+                "-inkey",
+                "next-signer.key",
+                "-signer",
+                "peer.pem",
+                "-inkey",
+                "peer.key",
+                "-certfile",
+                "int.pem",
+                "-out",
+                "two.cms",
+            ],
+        );
+        let two = fs::read(d.join("two.cms")).expect("record");
+        assert!(verify_record_with(&two, &anchor).is_none());
     }
 
     #[test]
