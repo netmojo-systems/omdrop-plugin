@@ -9,7 +9,8 @@
 //! - [`contacts`]: the Contacts Only policy.
 //! - [`http`]: the receiver's HTTP/1.1 framing, limits and read deadlines.
 //! - [`safeplist`]: property lists from peers, parsed under size and depth
-//!   limits (never `plist::Value::from_reader` on untrusted bytes).
+//!   limits (never `plist::Value::from_reader` on untrusted bytes). Defined
+//!   in omdrop-identity, which every crate reading one depends on.
 //! - [`tls`]: rustls configurations built from an [`omdrop_identity::Identity`].
 //! - [`debugdump`]: opt-in, redacted protocol dumps (`OMDROP_DEBUG`).
 //! - [`net`]: interface addresses, EUI-64 link-local addresses, scoped sockets.
@@ -19,5 +20,5 @@ pub mod contacts;
 pub mod debugdump;
 pub mod http;
 pub mod net;
-pub mod safeplist;
+pub use omdrop_identity::safeplist;
 pub mod tls;

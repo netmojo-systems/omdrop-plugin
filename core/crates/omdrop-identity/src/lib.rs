@@ -9,6 +9,11 @@
 //! The types and functions re-exported here are the stable surface other
 //! crates build against. Their signatures are a contract between crates:
 //! change one only together with every caller.
+//!
+//! [`safeplist`] lives here, not in omdrop-proto, because every crate that
+//! reads a property list it did not write depends on this one: validation
+//! records (here and in omdrop-adv), received `.webloc` files (omdrop-cli),
+//! and the AirDrop protocol (omdrop-proto re-exports it).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -28,6 +33,8 @@ mod resolver;
 mod selfsigned;
 mod sys;
 mod user;
+
+pub mod safeplist;
 
 /// Which identity selection chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
