@@ -213,6 +213,8 @@ pub struct Server {
     live: Mutex<HashMap<u64, Live>>,
     next_id: AtomicU64,
     uploads: AtomicUsize,
+    /// Held by a links Ask from its budget check through its last write.
+    links: Mutex<()>,
 }
 
 /// The peer's address as Python printed it: link-local with its zone.
@@ -576,6 +578,7 @@ impl Server {
             live: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             uploads: AtomicUsize::new(0),
+            links: Mutex::new(()),
         }
     }
 
@@ -1201,7 +1204,12 @@ impl Conn<'_> {
                 urls.push(url);
             }
             // The links are the whole transfer, so they get the budget an
-            // upload would: nothing is stored unless all of them fit.
+            // upload would: nothing is stored unless all of them fit. The
+            // check and the writes are one step across connections: two
+            // Asks checked against the same free bytes could together write
+            // past MIN_FREE_BYTES. Writing a few small files is quick.
+            let _reserving = (!urls.is_empty())
+                .then(|| self.server.links.lock().unwrap_or_else(|e| e.into_inner()));
             if !urls.is_empty() {
                 let s = self.settings();
                 let cost = links_cost(&urls);

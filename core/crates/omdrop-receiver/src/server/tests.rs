@@ -917,6 +917,66 @@ fn links_past_the_receive_budget_are_refused_and_none_stored() {
     );
 }
 
+/// Two links Asks that each fit the budget alone, but not together, sent
+/// at once: one is stored whole, the other refused with nothing stored.
+/// Checked against the same free bytes without the links lock, both passed.
+#[test]
+fn concurrent_links_asks_cannot_share_the_same_free_bytes() {
+    // Links of the longest URL: each file then takes about what it is
+    // charged (12 KiB) on tmpfs and 4 KiB-block filesystems, so after one
+    // Ask is written the other no longer fits.
+    let base = "https://example.com/";
+    let ask_of = |tag: &str| -> Vec<String> {
+        (0..120)
+            .map(|i| {
+                let head = format!("{base}{tag}{i:03}-");
+                format!("{head}{}", "a".repeat(MAX_LINK_URL_BYTES - head.len()))
+            })
+            .collect()
+    };
+    let (a, b) = (ask_of("a"), ask_of("b"));
+    let a: Vec<&str> = a.iter().map(String::as_str).collect();
+    let b: Vec<&str> = b.iter().map(String::as_str).collect();
+    let cost = links_cost(&a);
+    assert_eq!(cost, links_cost(&b));
+    // Room for one and a half Asks.
+    let free = ReceiveBudget::of(&std::env::temp_dir(), 100, 0)
+        .unwrap()
+        .unwrap()
+        .free_bytes;
+    let fx = start(false, |s| {
+        s.max_receive_percent = 100;
+        s.min_free_bytes = free - cost * 3 / 2;
+    });
+    let (body_a, body_b) = (links_ask(&a), links_ask(&b));
+    // Both wait at the lock, so both are in flight when it opens.
+    let held = fx.server.links.lock().unwrap();
+    let statuses = std::thread::scope(|s| {
+        let asks: Vec<_> = [&body_a, &body_b]
+            .into_iter()
+            .map(|body| {
+                let mut c = connect(&fx, false);
+                s.spawn(move || post(&mut c, "/Ask", body).0)
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(held);
+        let mut statuses: Vec<u16> = asks.into_iter().map(|h| h.join().unwrap()).collect();
+        statuses.sort_unstable();
+        statuses
+    });
+    assert_eq!(statuses, [200, 507]);
+    let files = fx.files();
+    assert_eq!(files.len(), 120, "{} files", files.len());
+    // Which Ask each stored link came from: its URL's tag.
+    let tag_at = "[InternetShortcut]\nURL=https://example.com/".len();
+    let stored: std::collections::BTreeSet<u8> = files
+        .iter()
+        .map(|f| std::fs::read(fx.dest().join(f)).unwrap()[tag_at])
+        .collect();
+    assert_eq!(stored.len(), 1, "both Asks stored links");
+}
+
 #[test]
 fn links_longer_than_8192_bytes_are_not_stored() {
     let fx = start(false, |_| {});
