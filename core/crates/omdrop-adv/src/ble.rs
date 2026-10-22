@@ -177,8 +177,8 @@ fn falsy(v: &plist::Value) -> bool {
 /// a phone number by brute force, and a prefix narrows one.
 pub fn hashes_from_plist(data: &[u8]) -> Result<(String, usize), String> {
     let bad = |why: String| format!("cannot read validation record: {why}");
-    let value =
-        plist::Value::from_reader(std::io::Cursor::new(data)).map_err(|e| bad(e.to_string()))?;
+    // Bounded: `--hashes-from-record PATH` reads any file it is given.
+    let value = omdrop_identity::safeplist::parse(data).map_err(|e| bad(e.to_string()))?;
     let dict = value
         .as_dictionary()
         .ok_or_else(|| bad("not a dictionary".into()))?;
@@ -730,6 +730,27 @@ mod tests {
                 .unwrap_err()
                 .starts_with("cannot read validation record")
         );
+    }
+
+    #[test]
+    fn a_record_that_expands_past_its_size_is_refused() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "ValidatedEmailHashes".into(),
+            plist::Value::Array(vec!["abcd".into()]),
+        );
+        dict.insert(
+            "Pad".into(),
+            plist::Value::Array(vec![plist::Value::Data(vec![0x41; 30_000]); 1_000]),
+        );
+        let mut bomb = Vec::new();
+        plist::Value::Dictionary(dict)
+            .to_writer_binary(&mut bomb)
+            .unwrap();
+        // About 32 KB, decoding to 30 MB.
+        assert!(bomb.len() < 64 << 10);
+        let err = hashes_from_plist(&bomb).unwrap_err();
+        assert!(err.starts_with("cannot read validation record: "), "{err}");
     }
 
     #[test]

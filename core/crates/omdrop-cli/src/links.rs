@@ -79,8 +79,11 @@ fn url_file_target(data: &[u8]) -> String {
 }
 
 /// .webloc: the URL key of a property list, XML or binary -- macOS writes both.
+/// Parsed under safeplist's limits: the file came from whoever is nearby, and
+/// 64 KB of binary plist can reference one object until it decodes to more
+/// memory than the machine has.
 fn webloc_target(data: &[u8]) -> Option<String> {
-    let value = plist::Value::from_reader(std::io::Cursor::new(data)).ok()?;
+    let value = omdrop_identity::safeplist::parse(data).ok()?;
     let dict = value.as_dictionary()?;
     Some(match dict.get("URL") {
         Some(plist::Value::String(s)) => s.trim().to_string(),
@@ -1212,6 +1215,30 @@ mod tests {
             Some("https://example.com/?a=1&b=2")
         );
         assert_eq!(webloc_target(b"not a property list"), None);
+    }
+
+    /// `root` plus a binary plist's one data object referenced 1 000 times:
+    /// the plist writer stores equal data once. 30 KB on disk, 30 MB decoded.
+    fn shared_reference_bomb(mut root: plist::Dictionary) -> Vec<u8> {
+        let pad = plist::Value::Data(vec![0x41; 30_000]);
+        root.insert("Pad".into(), plist::Value::Array(vec![pad; 1_000]));
+        let mut out = Vec::new();
+        plist::Value::Dictionary(root)
+            .to_writer_binary(&mut out)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_webloc_that_expands_past_its_size_is_not_a_link() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("URL".into(), "https://example.com/".into());
+        let bomb = shared_reference_bomb(dict);
+        assert!(bomb.len() as u64 <= LINK_MAX);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.webloc");
+        std::fs::write(&f, &bomb).unwrap();
+        assert_eq!(link_url(&f), None);
     }
 
     const TS: &str = "2026-10-10 16:14:20,098";

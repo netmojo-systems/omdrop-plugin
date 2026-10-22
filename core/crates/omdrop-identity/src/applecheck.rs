@@ -46,8 +46,10 @@ fn now_secs() -> f64 {
 }
 
 /// Read a validation record's property list, once its signature verified.
+/// Parsed under safeplist's limits all the same: a sender chooses the record
+/// it presents, and the signature only says which certificate signed it.
 pub(crate) fn record_from_plist(payload: &[u8], now: f64) -> Option<Record> {
-    let value = plist::Value::from_reader(std::io::Cursor::new(payload)).ok()?;
+    let value = crate::safeplist::parse(payload).ok()?;
     let dict = value.as_dictionary()?;
     let valid_as_of = dict.get("ValidAsOf").and_then(|v| v.as_date());
     // Python's isinstance(duration, (int, float)) also admits booleans.
@@ -480,6 +482,23 @@ pub(crate) mod tests {
         assert!(verify_record_with(&record, &other.root()).is_none());
         assert!(verify_record_with(b"", &apple.root()).is_none());
         assert!(verify_record_with(b"\x30\x82junk", &apple.root()).is_none());
+    }
+
+    #[test]
+    fn a_record_that_expands_past_its_size_is_refused() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("altDsID".into(), "A".into());
+        dict.insert(
+            "Pad".into(),
+            plist::Value::Array(vec![plist::Value::Data(vec![0x41; 30_000]); 1_000]),
+        );
+        let mut bomb = Vec::new();
+        plist::Value::Dictionary(dict)
+            .to_writer_binary(&mut bomb)
+            .unwrap();
+        // About 32 KB, decoding to 30 MB.
+        assert!(bomb.len() < 64 << 10);
+        assert_eq!(record_from_plist(&bomb, 0.0), None);
     }
 
     #[test]
