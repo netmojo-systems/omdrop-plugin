@@ -851,6 +851,33 @@ fn log_labels_leave_no_room_for_forgery() {
     );
 }
 
+/// 200 names of about 200 bytes (40 KiB) once went out as several plain
+/// `stored` records, each read as a whole transfer by `omdrop watch --once`.
+#[test]
+fn a_long_list_of_stored_names_is_numbered_across_records() {
+    let names: Vec<String> = (0..200)
+        .map(|i| format!("{i:03}-{}.jpg", "n".repeat(196)))
+        .collect();
+    let records = stored_records("T-1", &names);
+    let n = records.len();
+    assert!(n > 1);
+    let mut rejoined = Vec::new();
+    for (k, record) in records.iter().enumerate() {
+        let prefix = format!("upload T-1 ({}/{n}): stored ", k + 1);
+        let list = record.strip_prefix(&prefix).expect(record);
+        assert!(list.len() <= MAX_STORED_LINE_BYTES);
+        // Under the log's own cap, so no record is cut.
+        assert_eq!(crate::log::escape(record), *record);
+        rejoined.extend(list.split(", ").map(str::to_string));
+    }
+    assert_eq!(rejoined, names);
+    // A list that fits one record is written as it always was.
+    assert_eq!(
+        stored_records("T-1", &["a.txt".into(), "b, c.txt".into()]),
+        ["upload T-1: stored a.txt, b, c.txt"]
+    );
+}
+
 #[test]
 fn links_with_spaces_are_not_stored() {
     let fx = start(false, |_| {});

@@ -688,6 +688,8 @@ pub fn cmd_watch(args: &[String]) -> i32 {
     };
     let mut reader = crate::proc::LineReader::new(read);
     let mut handlers: Vec<Child> = Vec::new();
+    // Transfers with an announced file, for --once.
+    let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         // Woken every second even without a record, so finished `handle`
         // children are reaped promptly rather than at the next arrival.
@@ -737,7 +739,20 @@ pub fn cmd_watch(args: &[String]) -> i32 {
                 Err(e) => errln!("omdrop: {}: {e}", ctx().command_path().display()),
             }
         }
-        if once && !found.is_empty() {
+        // A one-file window closes once the first transfer is complete: a
+        // link, or an upload's last record (`(N/N)`, or its only one), once
+        // some record of that transfer has announced a file. An earlier
+        // record of a long list does not close it.
+        let complete = match &names {
+            ArrivalNames::Link(_) => !found.is_empty(),
+            ArrivalNames::Stored { tid, last, .. } => {
+                if once && !found.is_empty() {
+                    announced.insert(tid.clone());
+                }
+                *last && announced.contains(tid)
+            }
+        };
+        if once && complete {
             for mut handler in handlers.drain(..) {
                 let _ = handler.wait();
             }
@@ -786,16 +801,32 @@ fn receiver_info(line: &str) -> Option<&str> {
 
 /// The names one of the receiver's records says it stored:
 /// `upload TID: stored NAME, NAME` (names still joined, since a name may
-/// itself hold ", ") or `link stored as NAME.url -> http(s)://...`.
+/// itself hold ", "), `upload TID (K/N): stored NAME, ...` when a long list
+/// is spread over N records, or `link stored as NAME.url -> http(s)://...`.
 pub fn arrivals(line: &str) -> Option<ArrivalNames> {
     let msg = receiver_info(line)?;
     if let Some(rest) = msg.strip_prefix("upload ") {
-        let (tid, names) = rest.split_once(": stored ")?;
+        let (head, names) = rest.split_once(": stored ")?;
+        let (tid, last) = match head.split_once(' ') {
+            None => (head, true),
+            Some((tid, part)) => {
+                let (k, n) = part.strip_prefix('(')?.strip_suffix(')')?.split_once('/')?;
+                let (k, n) = (record_number(k)?, record_number(n)?);
+                if k > n {
+                    return None;
+                }
+                (tid, k == n)
+            }
+        };
         let tid_ok = (1..=64).contains(&tid.len())
             && tid
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'));
-        return (tid_ok && !names.is_empty()).then(|| ArrivalNames::Stored(names.to_string()));
+        return (tid_ok && !names.is_empty()).then(|| ArrivalNames::Stored {
+            tid: tid.to_string(),
+            names: names.to_string(),
+            last,
+        });
     }
     let rest = msg.strip_prefix("link stored as ")?;
     let (name, url) = rest.split_once(" -> ")?;
@@ -807,11 +838,33 @@ pub fn arrivals(line: &str) -> Option<ArrivalNames> {
     (name_ok && url_ok).then(|| ArrivalNames::Link(name.to_string()))
 }
 
+/// K or N of a `(K/N)` record number: 1 to 512 (an upload's member limit),
+/// decimal digits only, no leading zero.
+fn record_number(text: &str) -> Option<u16> {
+    let ok = !text.is_empty()
+        && text.len() <= 3
+        && !text.starts_with('0')
+        && text.bytes().all(|c| c.is_ascii_digit());
+    ok.then(|| text.parse().ok())
+        .flatten()
+        .filter(|n| *n <= 512)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArrivalNames {
-    Stored(String),
+    /// An upload's record: its transfer, the names, and whether it is the
+    /// transfer's last record.
+    Stored {
+        tid: String,
+        names: String,
+        last: bool,
+    },
     Link(String),
 }
+
+/// The longest file name, in bytes (NAME_MAX): a join of pieces longer than
+/// this names nothing.
+const MAX_NAME_BYTES: usize = 255;
 
 /// A name is acted on only if it is a plain file name -- no slash, no
 /// leading dot, no control characters -- naming a regular file directly in
@@ -833,7 +886,8 @@ fn arrived_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 /// The files that arrived, and the names that matched none. `, ` both
 /// separates names and may occur inside one, so a piece that is not a file
-/// is joined with the pieces after it until one is.
+/// is joined with the pieces after it until one is, or until the join is
+/// longer than any file name can be.
 pub fn resolve_arrivals(dir: &Path, names: &ArrivalNames) -> (Vec<PathBuf>, Vec<String>) {
     let (mut found, mut missing) = (Vec::new(), Vec::new());
     match names {
@@ -841,14 +895,14 @@ pub fn resolve_arrivals(dir: &Path, names: &ArrivalNames) -> (Vec<PathBuf>, Vec<
             Some(p) => found.push(p),
             None => missing.push(name.clone()),
         },
-        ArrivalNames::Stored(joined) => {
+        ArrivalNames::Stored { names: joined, .. } => {
             let pieces: Vec<&str> = joined.split(", ").collect();
             let mut i = 0;
             while i < pieces.len() {
-                let hit = (i..pieces.len()).find_map(|j| {
-                    let name = pieces[i..=j].join(", ");
-                    arrived_file(dir, &name).map(|p| (j, p))
-                });
+                let hit = (i..pieces.len())
+                    .map(|j| (j, pieces[i..=j].join(", ")))
+                    .take_while(|(_, name)| name.len() <= MAX_NAME_BYTES)
+                    .find_map(|(j, name)| arrived_file(dir, &name).map(|p| (j, p)));
                 match hit {
                     Some((j, p)) => {
                         found.push(p);
@@ -1294,13 +1348,35 @@ mod tests {
 
     const TS: &str = "2026-10-10 16:14:20,098";
 
+    fn stored(tid: &str, names: &str, last: bool) -> ArrivalNames {
+        ArrivalNames::Stored {
+            tid: tid.into(),
+            names: names.into(),
+            last,
+        }
+    }
+
     #[test]
     fn only_the_receivers_own_records_name_arrivals() {
-        let stored = format!("{TS} INFO root: upload 1A2B-3c_d.e: stored a.jpg, b c.png");
+        let stored_line = format!("{TS} INFO root: upload 1A2B-3c_d.e: stored a.jpg, b c.png");
         assert_eq!(
-            arrivals(&stored),
-            Some(ArrivalNames::Stored("a.jpg, b c.png".into()))
+            arrivals(&stored_line),
+            Some(stored("1A2B-3c_d.e", "a.jpg, b c.png", true))
         );
+        // A long list, spread over numbered records: only the last completes.
+        for (part, last) in [
+            ("1/3", false),
+            ("2/3", false),
+            ("3/3", true),
+            ("512/512", true),
+        ] {
+            let line = format!("{TS} INFO root: upload T-1 ({part}): stored a.jpg, b (1/2): c");
+            assert_eq!(
+                arrivals(&line),
+                Some(stored("T-1", "a.jpg, b (1/2): c", last)),
+                "{line}"
+            );
+        }
         let link = format!("{TS} INFO root: link stored as Example.url -> https://example.com/");
         assert_eq!(
             arrivals(&link),
@@ -1313,6 +1389,16 @@ mod tests {
             format!("x{TS} INFO root: upload X: stored a.jpg"),
             format!("{TS} INFO root: upload X Y: stored a.jpg"),
             format!("{TS} INFO root: upload {}: stored a.jpg", "x".repeat(65)),
+            format!("{TS} INFO root: GET / from M upload X (1/1): stored /etc/passwd"),
+            format!("{TS} INFO root: upload X (0/1): stored a.jpg"),
+            format!("{TS} INFO root: upload X (2/1): stored a.jpg"),
+            format!("{TS} INFO root: upload X (1/513): stored a.jpg"),
+            format!("{TS} INFO root: upload X (01/2): stored a.jpg"),
+            format!("{TS} INFO root: upload X ( 1/2): stored a.jpg"),
+            format!("{TS} INFO root: upload X (1/2) : stored a.jpg"),
+            format!("{TS} INFO root: upload X  (1/2): stored a.jpg"),
+            format!("{TS} INFO root: upload X (+1/2): stored a.jpg"),
+            format!("{TS} INFO root: upload X (1/2: stored a.jpg"),
             format!("{TS} INFO root: link stored as ../a.url -> https://e.x/"),
             format!("{TS} INFO root: link stored as a.url -> file:///etc/passwd"),
             format!("{TS} INFO root: link stored as a.webloc -> https://e.x/"),
@@ -1335,7 +1421,7 @@ mod tests {
         std::fs::create_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/c.png"), "x").unwrap();
 
-        let names = ArrivalNames::Stored("a.jpg, two, parts.txt, b.png".into());
+        let names = stored("T", "a.jpg, two, parts.txt, b.png", true);
         let (found, missing) = resolve_arrivals(&dir, &names);
         assert_eq!(
             found,
@@ -1347,10 +1433,14 @@ mod tests {
         );
         assert!(missing.is_empty(), "{missing:?}");
 
-        let forged = ArrivalNames::Stored(format!(
-            "{}, link.png, .hidden, sub/c.png, sub, gone.jpg",
-            outside.display()
-        ));
+        let forged = stored(
+            "T",
+            &format!(
+                "{}, link.png, .hidden, sub/c.png, sub, gone.jpg",
+                outside.display()
+            ),
+            true,
+        );
         let (found, missing) = resolve_arrivals(&dir, &forged);
         assert!(found.is_empty(), "{found:?}");
         assert_eq!(missing.len(), 6, "{missing:?}");

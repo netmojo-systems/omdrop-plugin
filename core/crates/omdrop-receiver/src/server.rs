@@ -398,12 +398,13 @@ pub fn transfer_label(header: &str) -> String {
 }
 
 /// Longest list of stored names on one log line. 512 names of 255 bytes
-/// would pass journald's 48 KiB `LineMax`, which splits a line; the watcher
-/// takes each `stored` line on its own, so the list is spread over several.
+/// would pass journald's 48 KiB `LineMax`, which splits a line, and the log's
+/// own 32 KiB cap, which cuts it; the watcher takes each `stored` record on
+/// its own, so the list is spread over several.
 const MAX_STORED_LINE_BYTES: usize = 16 * 1024;
 
-/// The stored names, joined with `, ` into lines of at most
-/// [`MAX_STORED_LINE_BYTES`].
+/// The stored names, joined with `, ` in order into lines of at most
+/// [`MAX_STORED_LINE_BYTES`], each filled before the next is started.
 pub fn stored_lines(names: &[String]) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
@@ -420,6 +421,26 @@ pub fn stored_lines(names: &[String]) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+/// The records naming what an upload stored, as `omdrop watch` reads them:
+/// `upload TID: stored NAMES` when the names fit one line, else one
+/// `upload TID (K/N): stored NAMES` per line, K = 1..N, in order. The
+/// `(K/N)` sits where no file name can, between the TID (no spaces) and the
+/// colon, and tells the watcher which record completes the transfer: a
+/// `--once` window closes only after the last. The Python receiver writes
+/// the same records.
+pub fn stored_records(tid: &str, names: &[String]) -> Vec<String> {
+    let lines = stored_lines(names);
+    let n = lines.len();
+    if n == 1 {
+        return vec![format!("upload {tid}: stored {}", lines[0])];
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(k, names)| format!("upload {tid} ({}/{n}): stored {names}", k + 1))
+        .collect()
 }
 
 /// `str()` of a plist value, as the Python receiver's f-strings printed it.
@@ -1347,8 +1368,8 @@ impl Conn<'_> {
                     done.decoded_bytes,
                     py_bytes_repr(&done.magic)
                 );
-                for names in stored_lines(&done.names) {
-                    info!("upload {tid}: stored {names}");
+                for record in stored_records(&tid, &done.names) {
+                    info!("{record}");
                 }
                 // A finished transfer ends its connection (plugin #69): an
                 // iPhone stays on "Sending" while the connection is open, so
