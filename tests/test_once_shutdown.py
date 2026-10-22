@@ -23,9 +23,11 @@ TS = "2026-10-10 16:14:20,098 INFO root: "
 
 
 class OneFileShutdownTests(unittest.TestCase):
-    def run_watch(self, once=True, systemd_run=True, journal=None):
+    def run_watch(self, once=True, systemd_run=True, journal=None, slow=None):
         """`omdrop watch` over a stubbed journal. `journal` makes the log from
-        (root, downloads); by default the receiver's record of one file."""
+        (root, downloads); by default the receiver's record of one file.
+        With `slow`, only the handler of a file whose name holds it takes a
+        moment; the rest are immediate."""
         source = OMDROP.read_text()
         start = source.index("cmd_watch() {")
         fragment = source[start:source.index("\n# The URL inside", start)]
@@ -56,8 +58,10 @@ cmd_watch {"--once" if once else ""}
             self_stub = root / "omdrop"
             # `handle` takes a moment, so a close that does not wait for it
             # is logged first.
+            delay = ('[ "$1" = handle ] && sleep 1\n' if slow is None else
+                     f'case "$1 $2" in "handle "*{slow}*) sleep 2 ;; esac\n')
             self_stub.write_text(
-                '#!/bin/sh\n[ "$1" = handle ] && sleep 1\n'
+                '#!/bin/sh\n' + delay +
                 'printf \'self %s\\n\' "$*" >> "$CAPTURE"\n')
             self_stub.chmod(0o755)
             env = os.environ.copy()
@@ -134,6 +138,27 @@ cmd_watch {"--once" if once else ""}
         lines = events.splitlines()
         self.assertTrue(lines[-1].endswith(" off --force"), events[-500:])
         self.assertEqual(sum(line.endswith(" off --force") for line in lines), 1)
+
+    def test_without_systemd_run_the_close_waits_for_every_records_notifications(self):
+        # The first record's handlers run inside the watcher too, and the
+        # close after the last record must not cut the first record's photo
+        # off mid-decode.
+        records = []
+
+        def journal(root, downloads):
+            _, lines = self.split_upload(downloads, count=120)
+            records.extend(lines)
+            return "".join(line + "\n" for line in lines)
+        result, events = self.run_watch(once=True, systemd_run=False, journal=journal,
+                                        slow="000-")
+
+        self.assertGreater(len(records), 1)
+        lines = events.splitlines()
+        slow = [n for n, line in enumerate(lines) if line.startswith("self handle") and "/000-" in line]
+        closed = [n for n, line in enumerate(lines) if line.startswith("self off")]
+        self.assertTrue(slow and closed, result.stdout + result.stderr + events[-500:])
+        self.assertLess(slow[0], closed[0], "closed before the first record's notification")
+        self.assertEqual(sum(line.startswith("self handle") for line in lines), 120)
 
     def test_a_one_file_window_stays_open_until_the_last_record(self):
         def journal(root, downloads):

@@ -2611,10 +2611,13 @@ cmd_watch() {
     esac
   done
   local dir; dir=$(effective_dir)
+  # Handlers run here when systemd-run fails, across every record of an
+  # upload the receiver split: a one-file window waits for all of them.
+  local inline=()
   echo "omdrop watch: following $UNIT, saving into $dir"
   journalctl --user -u "$UNIT" -f -n 0 -o cat 2>/dev/null | arrival_names "$dir" \
     | while IFS=/ read -r -a fields; do
-    local state=${fields[0]-} names=("${fields[@]:1}") inline=() name f
+    local state=${fields[0]-} names=("${fields[@]:1}") name f
     for name in "${names[@]}"; do
       f="${dir%/}/$name"
       echo "omdrop watch: announcing $f"
@@ -2626,7 +2629,7 @@ cmd_watch() {
       # bounds what decoding a sender's photo for its preview can take.
       if ! systemd-run --user --quiet --collect -p MemoryMax=512M "$SELF" handle "$f" >/dev/null 2>&1; then
         "$SELF" handle "$f" &
-        inline+=("$!")
+        (( once )) && inline+=("$!")
       fi
     done
     if (( once )) && [[ "$state" == done ]]; then
