@@ -6,7 +6,10 @@
 //! updates are ignored, and an instance that does not resolve within 3 s
 //! (zeroconf's `get_service_info` default) is dropped. Packets are accepted
 //! only from link-local sources on the browsed interface, and every name and
-//! record is bounds-checked: this is untrusted network input.
+//! record is bounds-checked: this is untrusted network input. So are the
+//! tables: at most 256 instances resolve at once, an address is
+//! kept only for a host an unresolved instance names, and a finished
+//! instance is reduced to its name.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -24,6 +27,12 @@ const T_PTR: u16 = 12;
 const T_TXT: u16 = 16;
 const T_AAAA: u16 = 28;
 const T_SRV: u16 = 33;
+/// Instances resolving at once. A room holds a handful of AirDrop devices;
+/// past this, a flood of made-up instance names is ignored rather than held.
+const MAX_INSTANCES: usize = 256;
+/// Finished instance names remembered, so one is handed to the caller once.
+/// Once this many have finished, no new instance is taken on.
+const MAX_FINISHED: usize = 1024;
 
 /// A resolved `_airdrop._tcp` instance.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +56,36 @@ struct Instance {
     first_seen: Option<Instant>,
     last_query: Option<Instant>,
     done: bool,
+}
+
+/// What a browse has heard: instances still resolving, the addresses of the
+/// hosts they name, and the names of those finished.
+#[derive(Default)]
+struct Tables {
+    instances: HashMap<String, Instance>,
+    hosts: HashMap<String, Vec<Ipv6Addr>>,
+    finished: HashSet<String>,
+}
+
+impl Tables {
+    /// Drop the instances that resolved or gave up, keeping their names, and
+    /// the addresses no unresolved instance needs.
+    fn retire(&mut self) {
+        let finished = &mut self.finished;
+        self.instances.retain(|key, inst| {
+            if inst.done && finished.len() < MAX_FINISHED {
+                finished.insert(key.clone());
+            }
+            !inst.done
+        });
+        let wanted: HashSet<String> = self
+            .instances
+            .values()
+            .filter_map(|i| i.srv.as_ref())
+            .map(|(_, target)| target.to_ascii_lowercase())
+            .collect();
+        self.hosts.retain(|host, _| wanted.contains(host));
+    }
 }
 
 /// The browsing socket on one interface.
@@ -103,8 +142,7 @@ impl Browser {
         deadline: Instant,
         mut on_found: impl FnMut(Found) -> bool,
     ) -> io::Result<()> {
-        let mut instances: HashMap<String, Instance> = HashMap::new();
-        let mut hosts: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
+        let mut tables = Tables::default();
         let mut next_browse = Instant::now();
         let mut interval = Duration::from_secs(1);
         let mut buf = vec![0u8; 9000];
@@ -121,7 +159,7 @@ impl Browser {
             // Ask for what an instance still lacks, once a second, until it
             // resolves or gives up.
             let mut wake = next_browse.min(deadline);
-            for inst in instances.values_mut().filter(|i| !i.done) {
+            for inst in tables.instances.values_mut().filter(|i| !i.done) {
                 let first = *inst.first_seen.get_or_insert(now);
                 if now.duration_since(first) >= RESOLVE_TIMEOUT {
                     inst.done = true;
@@ -139,7 +177,7 @@ impl Browser {
                         qs.push((&inst.display, T_TXT));
                     }
                     if let Some((_, target)) = &inst.srv
-                        && !hosts.contains_key(&target.to_ascii_lowercase())
+                        && !tables.hosts.contains_key(&target.to_ascii_lowercase())
                     {
                         qs.push((target, T_AAAA));
                     }
@@ -163,7 +201,7 @@ impl Browser {
                         && src.scope_id() == self.ifindex
                         && let Some(records) = buf.get(..n).and_then(parse_message)
                     {
-                        absorb(records, &mut instances, &mut hosts);
+                        absorb(records, &mut tables);
                     }
                 }
                 Ok(_) => {}
@@ -176,11 +214,12 @@ impl Browser {
                     ) => {}
                 Err(e) => return Err(e),
             }
-            for inst in instances.values_mut().filter(|i| !i.done) {
+            for inst in tables.instances.values_mut().filter(|i| !i.done) {
                 let (Some((port, server)), Some(txt)) = (&inst.srv, &inst.txt) else {
                     continue;
                 };
-                let Some(addrs) = hosts
+                let Some(addrs) = tables
+                    .hosts
                     .get(&server.to_ascii_lowercase())
                     .filter(|a| !a.is_empty())
                 else {
@@ -201,30 +240,37 @@ impl Browser {
                     return Ok(());
                 }
             }
+            tables.retire();
         }
     }
 }
 
-fn absorb(
-    records: Vec<Rr>,
-    instances: &mut HashMap<String, Instance>,
-    hosts: &mut HashMap<String, Vec<Ipv6Addr>>,
-) {
+fn absorb(records: Vec<Rr>, tables: &mut Tables) {
     // PTRs first so an answer carrying PTR, SRV and TXT together resolves at once.
     for rr in &records {
         if let RData::Ptr(target) = &rr.data
             && rr.ttl > 0
             && rr.name.eq_ignore_ascii_case(SERVICE)
         {
-            instances
-                .entry(target.to_ascii_lowercase())
-                .or_insert_with(|| Instance {
+            let key = target.to_ascii_lowercase();
+            if tables.instances.contains_key(&key)
+                || tables.finished.contains(&key)
+                || tables.instances.len() >= MAX_INSTANCES
+                || tables.finished.len() >= MAX_FINISHED
+            {
+                continue;
+            }
+            tables.instances.insert(
+                key,
+                Instance {
                     display: target.clone(),
                     ..Instance::default()
-                });
+                },
+            );
         }
     }
-    let mut seen_aaaa: HashSet<String> = HashSet::new();
+    // Then SRV and TXT, so an AAAA in the same answer finds the host named.
+    let mut addresses = Vec::new();
     for rr in records {
         if rr.ttl == 0 {
             continue;
@@ -232,26 +278,40 @@ fn absorb(
         let key = rr.name.to_ascii_lowercase();
         match rr.data {
             RData::Srv(port, target) => {
-                if let Some(inst) = instances.get_mut(&key) {
+                if let Some(inst) = tables.instances.get_mut(&key) {
                     inst.srv = Some((port, target));
                 }
             }
             RData::Txt(entries) => {
-                if let Some(inst) = instances.get_mut(&key) {
+                if let Some(inst) = tables.instances.get_mut(&key) {
                     inst.txt = Some(entries);
                 }
             }
-            RData::Aaaa(addr) => {
-                let list = hosts.entry(key.clone()).or_default();
-                // A fresh answer replaces the cached set rather than growing it forever.
-                if seen_aaaa.insert(key) {
-                    list.clear();
-                }
-                if !list.contains(&addr) && list.len() < 16 {
-                    list.push(addr);
-                }
-            }
+            RData::Aaaa(addr) => addresses.push((key, addr)),
             RData::Ptr(_) | RData::Other => {}
+        }
+    }
+    // Only for a host an unresolved instance names: anything else is noise,
+    // and an instance still lacking its address asks for it.
+    let wanted: HashSet<String> = tables
+        .instances
+        .values()
+        .filter(|i| !i.done)
+        .filter_map(|i| i.srv.as_ref())
+        .map(|(_, target)| target.to_ascii_lowercase())
+        .collect();
+    let mut seen_aaaa: HashSet<String> = HashSet::new();
+    for (key, addr) in addresses {
+        if !wanted.contains(&key) {
+            continue;
+        }
+        let list = tables.hosts.entry(key.clone()).or_default();
+        // A fresh answer replaces the cached set rather than growing it forever.
+        if seen_aaaa.insert(key) {
+            list.clear();
+        }
+        if !list.contains(&addr) && list.len() < 16 {
+            list.push(addr);
         }
     }
 }
@@ -432,16 +492,87 @@ mod tests {
     #[test]
     fn an_answer_resolves_an_instance() {
         let records = parse_message(&answer()).unwrap();
-        let mut instances = HashMap::new();
-        let mut hosts = HashMap::new();
-        absorb(records, &mut instances, &mut hosts);
-        let inst = &instances["0e9d036c5823._airdrop._tcp.local"];
+        let mut tables = Tables::default();
+        absorb(records, &mut tables);
+        let inst = &tables.instances["0e9d036c5823._airdrop._tcp.local"];
         assert_eq!(inst.srv, Some((8770, "hume.local".to_owned())));
         assert_eq!(inst.txt, Some(vec![("flags".to_owned(), "987".to_owned())]));
         assert_eq!(
-            hosts["hume.local"],
+            tables.hosts["hume.local"],
             vec!["fe80::e09d:3ff:fe6c:5823".parse::<Ipv6Addr>().unwrap()]
         );
+    }
+
+    fn record(name: &str, data: RData) -> Rr {
+        Rr {
+            name: name.to_owned(),
+            ttl: 120,
+            data,
+        }
+    }
+
+    fn ptrs(names: impl Iterator<Item = String>) -> Vec<Rr> {
+        names.map(|n| record(SERVICE, RData::Ptr(n))).collect()
+    }
+
+    /// Anything on the link can answer with made-up instances and hosts, a
+    /// few hundred per packet, for as long as the browse lasts.
+    #[test]
+    fn a_flood_of_names_is_bounded_and_finished_instances_are_dropped() {
+        let ip: Ipv6Addr = "fe80::1".parse().unwrap();
+        let mut tables = Tables::default();
+        for batch in 0..10 {
+            absorb(
+                ptrs((0..100).map(|i| format!("fake{batch}-{i}._airdrop._tcp.local"))),
+                &mut tables,
+            );
+            absorb(
+                (0..100)
+                    .map(|i| record(&format!("host{batch}-{i}.local"), RData::Aaaa(ip)))
+                    .collect(),
+                &mut tables,
+            );
+        }
+        assert_eq!(tables.instances.len(), MAX_INSTANCES);
+        // No instance names those hosts.
+        assert!(tables.hosts.is_empty());
+        // An address in the same answer as the SRV naming it is kept, in
+        // whatever order the records come.
+        let inst = tables.instances.keys().next().unwrap().clone();
+        absorb(
+            vec![
+                record("a.local", RData::Aaaa(ip)),
+                record(&inst, RData::Srv(8770, "A.local".into())),
+            ],
+            &mut tables,
+        );
+        assert_eq!(tables.hosts["a.local"], vec![ip]);
+        // Finished instances keep only their names, and are not taken on again.
+        let names: Vec<String> = tables.instances.keys().cloned().collect();
+        for i in tables.instances.values_mut() {
+            i.done = true;
+        }
+        tables.retire();
+        assert!(tables.instances.is_empty());
+        assert!(tables.hosts.is_empty());
+        assert_eq!(tables.finished.len(), MAX_INSTANCES);
+        absorb(ptrs(names.into_iter()), &mut tables);
+        assert!(tables.instances.is_empty());
+        absorb(
+            ptrs(std::iter::once("new._airdrop._tcp.local".into())),
+            &mut tables,
+        );
+        assert_eq!(tables.instances.len(), 1);
+        // Once the finished names fill their table, nothing new is taken on:
+        // forgetting one could hand it to the caller twice.
+        tables
+            .finished
+            .extend((0..MAX_FINISHED).map(|i| format!("old{i}._airdrop._tcp.local")));
+        absorb(
+            ptrs(std::iter::once("newer._airdrop._tcp.local".into())),
+            &mut tables,
+        );
+        assert_eq!(tables.instances.len(), 1);
     }
 
     #[test]
