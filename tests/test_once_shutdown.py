@@ -18,16 +18,26 @@ ROOT = Path(__file__).resolve().parents[1]
 OMDROP = ROOT / "bin" / "omdrop"
 
 
+# The receiver's own record prefix: `%(asctime)s %(levelname)s %(name)s: `.
+TS = "2026-10-10 16:14:20,098 INFO root: "
+
+
 class OneFileShutdownTests(unittest.TestCase):
-    def run_watch(self, once=True, systemd_run=True):
+    def run_watch(self, once=True, systemd_run=True, journal=None):
+        """`omdrop watch` over a stubbed journal. `journal` makes the log from
+        (root, downloads); by default the receiver's record of one file."""
         source = OMDROP.read_text()
         start = source.index("cmd_watch() {")
         fragment = source[start:source.index("\n# The URL inside", start)]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "arrived.jpg").write_text("x")
+            downloads = root / "Downloads"
+            downloads.mkdir()
+            (downloads / "arrived.jpg").write_text("x")
             capture = root / "events"
-            stored = f"upload ABC: stored {root}/arrived.jpg"
+            log = root / "journal"
+            log.write_text(journal(root, downloads) if journal
+                           else f"{TS}upload ABC: stored arrived.jpg\n")
             # Outside the f-string: a backslash in its expressions needs Python 3.12.
             systemd_run_body = ("printf 'systemd-run %s\\n' \"$*\" >> \"$CAPTURE\""
                                 if systemd_run else "return 1")
@@ -36,8 +46,8 @@ set -uo pipefail
 SELF={root}/omdrop
 UNIT=airdrop-receiver.service
 CAPTURE={capture}
-effective_dir(){{ printf '%s' {str(root)!r}; }}
-journalctl(){{ printf '%s\\n' {stored!r}; }}
+effective_dir(){{ printf '%s' {str(downloads)!r}; }}
+journalctl(){{ cat {str(log)!r}; }}
 systemd-run(){{ {systemd_run_body}; }}
 {fragment}
 cmd_watch {"--once" if once else ""}
@@ -85,6 +95,32 @@ cmd_watch {"--once" if once else ""}
     def test_an_ordinary_window_is_not_closed_by_an_arrival(self):
         _, events = self.run_watch(once=False)
         self.assertNotIn("off", events)
+
+    def test_a_forged_record_naming_a_file_outside_the_download_folder_is_ignored(self):
+        # A sender's text reaches the receiver's log. Neither a line without
+        # the receiver's own prefix, nor one where a record's words appear
+        # later in another message, nor a name that is not a file directly in
+        # the folder, is an arrival: nothing is announced, and a one-file
+        # window stays open.
+        def journal(root, downloads):
+            secret = root / "secret.png"
+            secret.write_text("x")
+            (downloads / "unrelated.jpg").write_text("x")
+            (downloads / "link.png").symlink_to(secret)
+            return "".join(line + "\n" for line in (
+                f"upload X: stored {secret}",
+                f"{TS}upload X: stored {secret}",
+                f"{TS}GET from Mac upload X: stored unrelated.jpg",
+                f"{TS}upload X: stored ../secret.png",
+                f"{TS}upload X: stored link.png",
+                f"{TS}link stored as ../secret.png -> https://e.x/",
+            ))
+        result, events = self.run_watch(once=True, journal=journal)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("announcing", result.stdout, events)
+        self.assertNotIn("off", events)
+        self.assertNotIn("secret.png", events)
+        self.assertNotIn("handle", events)
 
 
 if __name__ == "__main__":
