@@ -7,11 +7,12 @@
 //! (zeroconf's `get_service_info` default) is dropped. Packets are accepted
 //! only from link-local sources on the browsed interface, and every name and
 //! record is bounds-checked: this is untrusted network input. So are the
-//! tables: at most 256 instances resolve at once, an address is
-//! kept only for a host an unresolved instance names, and a finished
-//! instance is reduced to its name.
+//! tables: at most 256 instances resolve at once, the oldest giving way to a
+//! newcomer, an address is kept only for a host an unresolved instance
+//! names, and of a finished instance only the name of one handed to the
+//! caller is kept, so it is not handed over twice.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::time::{Duration, Instant};
@@ -28,11 +29,15 @@ const T_TXT: u16 = 16;
 const T_AAAA: u16 = 28;
 const T_SRV: u16 = 33;
 /// Instances resolving at once. A room holds a handful of AirDrop devices;
-/// past this, a flood of made-up instance names is ignored rather than held.
+/// past this, the oldest unresolved instance makes way for a new one, so a
+/// flood of made-up names costs memory for 256 and never shuts a real
+/// receiver out: one answers PTR, SRV, TXT and AAAA together and resolves
+/// as soon as it is taken on.
 const MAX_INSTANCES: usize = 256;
-/// Finished instance names remembered, so one is handed to the caller once.
-/// Once this many have finished, no new instance is taken on.
-const MAX_FINISHED: usize = 1024;
+/// Names of instances already handed to the caller, so one is not handed
+/// over again when it answers the next browse query. The oldest are
+/// forgotten past this; at worst one is then handed over twice.
+const MAX_HANDED: usize = 1024;
 
 /// A resolved `_airdrop._tcp` instance.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,28 +61,89 @@ struct Instance {
     first_seen: Option<Instant>,
     last_query: Option<Instant>,
     done: bool,
+    /// Order taken on, for making way for a newcomer.
+    seq: u64,
 }
 
 /// What a browse has heard: instances still resolving, the addresses of the
-/// hosts they name, and the names of those finished.
+/// hosts they name, and the names of those handed to the caller. An instance
+/// that gave up is forgotten, and taken on again if it answers again.
 #[derive(Default)]
 struct Tables {
     instances: HashMap<String, Instance>,
     hosts: HashMap<String, Vec<Ipv6Addr>>,
-    finished: HashSet<String>,
+    handed: HashSet<String>,
+    handed_order: VecDeque<String>,
+    next_seq: u64,
 }
 
 impl Tables {
-    /// Drop the instances that resolved or gave up, keeping their names, and
-    /// the addresses no unresolved instance needs.
-    fn retire(&mut self) {
-        let finished = &mut self.finished;
-        self.instances.retain(|key, inst| {
-            if inst.done && finished.len() < MAX_FINISHED {
-                finished.insert(key.clone());
+    /// Take on the instance a PTR names, unless it is already resolving or
+    /// was handed to the caller, making way if the table is full.
+    fn admit(&mut self, target: &str) {
+        let key = target.to_ascii_lowercase();
+        if self.instances.contains_key(&key) || self.handed.contains(&key) {
+            return;
+        }
+        if self.instances.len() >= MAX_INSTANCES
+            && let Some(oldest) = self
+                .instances
+                .iter()
+                .min_by_key(|(_, i)| i.seq)
+                .map(|(k, _)| k.clone())
+        {
+            self.instances.remove(&oldest);
+        }
+        self.next_seq += 1;
+        self.instances.insert(
+            key,
+            Instance {
+                display: target.to_owned(),
+                seq: self.next_seq,
+                ..Instance::default()
+            },
+        );
+    }
+
+    /// Each unresolved instance that now has its SRV, TXT and an address,
+    /// marked done and remembered as handed over.
+    fn take_resolved(&mut self) -> Vec<Found> {
+        let mut found = Vec::new();
+        for (key, inst) in self.instances.iter_mut().filter(|(_, i)| !i.done) {
+            let (Some((port, server)), Some(txt)) = (&inst.srv, &inst.txt) else {
+                continue;
+            };
+            let Some(addrs) = self
+                .hosts
+                .get(&server.to_ascii_lowercase())
+                .filter(|a| !a.is_empty())
+            else {
+                continue;
+            };
+            inst.done = true;
+            if self.handed.insert(key.clone()) {
+                self.handed_order.push_back(key.clone());
+                if self.handed_order.len() > MAX_HANDED
+                    && let Some(old) = self.handed_order.pop_front()
+                {
+                    self.handed.remove(&old);
+                }
             }
-            !inst.done
-        });
+            found.push(Found {
+                name: format!("{}.", inst.display),
+                server: format!("{server}."),
+                port: *port,
+                addrs: addrs.clone(),
+                props: txt.clone(),
+            });
+        }
+        found
+    }
+
+    /// Drop the instances that resolved or gave up, and the addresses no
+    /// unresolved instance needs.
+    fn retire(&mut self) {
+        self.instances.retain(|_, inst| !inst.done);
         let wanted: HashSet<String> = self
             .instances
             .values()
@@ -214,25 +280,7 @@ impl Browser {
                     ) => {}
                 Err(e) => return Err(e),
             }
-            for inst in tables.instances.values_mut().filter(|i| !i.done) {
-                let (Some((port, server)), Some(txt)) = (&inst.srv, &inst.txt) else {
-                    continue;
-                };
-                let Some(addrs) = tables
-                    .hosts
-                    .get(&server.to_ascii_lowercase())
-                    .filter(|a| !a.is_empty())
-                else {
-                    continue;
-                };
-                inst.done = true;
-                let found = Found {
-                    name: format!("{}.", inst.display),
-                    server: format!("{server}."),
-                    port: *port,
-                    addrs: addrs.clone(),
-                    props: txt.clone(),
-                };
+            for found in tables.take_resolved() {
                 if on_found(found) {
                     return Ok(());
                 }
@@ -252,21 +300,7 @@ fn absorb(records: Vec<Rr>, tables: &mut Tables) {
             && rr.ttl > 0
             && rr.name.eq_ignore_ascii_case(SERVICE)
         {
-            let key = target.to_ascii_lowercase();
-            if tables.instances.contains_key(&key)
-                || tables.finished.contains(&key)
-                || tables.instances.len() >= MAX_INSTANCES
-                || tables.finished.len() >= MAX_FINISHED
-            {
-                continue;
-            }
-            tables.instances.insert(
-                key,
-                Instance {
-                    display: target.clone(),
-                    ..Instance::default()
-                },
-            );
+            tables.admit(target);
         }
     }
     // Then SRV and TXT, so an AAAA in the same answer finds the host named.
@@ -515,25 +549,36 @@ mod tests {
         names.map(|n| record(SERVICE, RData::Ptr(n))).collect()
     }
 
+    fn fakes(batch: usize) -> Vec<Rr> {
+        ptrs((0..MAX_INSTANCES).map(|i| format!("fake{batch}-{i}._airdrop._tcp.local")))
+    }
+
+    /// What the browse loop does after each packet: hand over what resolved,
+    /// then retire what is done.
+    fn after_packet(tables: &mut Tables) -> Vec<String> {
+        let found = tables.take_resolved().into_iter().map(|f| f.name).collect();
+        tables.retire();
+        found
+    }
+
     /// Anything on the link can answer with made-up instances and hosts, a
     /// few hundred per packet, for as long as the browse lasts.
     #[test]
-    fn a_flood_of_names_is_bounded_and_finished_instances_are_dropped() {
+    fn a_flood_of_names_is_bounded() {
         let ip: Ipv6Addr = "fe80::1".parse().unwrap();
         let mut tables = Tables::default();
-        for batch in 0..10 {
+        for batch in 0..4 {
+            absorb(fakes(batch), &mut tables);
             absorb(
-                ptrs((0..100).map(|i| format!("fake{batch}-{i}._airdrop._tcp.local"))),
-                &mut tables,
-            );
-            absorb(
-                (0..100)
+                (0..MAX_INSTANCES)
                     .map(|i| record(&format!("host{batch}-{i}.local"), RData::Aaaa(ip)))
                     .collect(),
                 &mut tables,
             );
         }
         assert_eq!(tables.instances.len(), MAX_INSTANCES);
+        // The newest stay.
+        assert!(tables.instances.contains_key("fake3-0._airdrop._tcp.local"));
         // No instance names those hosts.
         assert!(tables.hosts.is_empty());
         // An address in the same answer as the SRV naming it is kept, in
@@ -547,32 +592,56 @@ mod tests {
             &mut tables,
         );
         assert_eq!(tables.hosts["a.local"], vec![ip]);
-        // Finished instances keep only their names, and are not taken on again.
-        let names: Vec<String> = tables.instances.keys().cloned().collect();
+        // Instances that gave up are forgotten, with their addresses.
         for i in tables.instances.values_mut() {
             i.done = true;
         }
         tables.retire();
         assert!(tables.instances.is_empty());
         assert!(tables.hosts.is_empty());
-        assert_eq!(tables.finished.len(), MAX_INSTANCES);
-        absorb(ptrs(names.into_iter()), &mut tables);
-        assert!(tables.instances.is_empty());
-        absorb(
-            ptrs(std::iter::once("new._airdrop._tcp.local".into())),
-            &mut tables,
-        );
-        assert_eq!(tables.instances.len(), 1);
-        // Once the finished names fill their table, nothing new is taken on:
-        // forgetting one could hand it to the caller twice.
-        tables
-            .finished
-            .extend((0..MAX_FINISHED).map(|i| format!("old{i}._airdrop._tcp.local")));
-        absorb(
-            ptrs(std::iter::once("newer._airdrop._tcp.local".into())),
-            &mut tables,
-        );
-        assert_eq!(tables.instances.len(), 1);
+        assert!(tables.handed.is_empty());
+    }
+
+    /// A flood of names that never resolve, timing out batch after batch or
+    /// still resolving, must not keep a real receiver from being found.
+    #[test]
+    fn a_real_receiver_is_found_through_a_flood_of_names() {
+        let real = "0e9d036c5823._airdrop._tcp.local.";
+        let mut tables = Tables::default();
+        // Over 1024 names, each batch timing out.
+        for batch in 0..5 {
+            absorb(fakes(batch), &mut tables);
+            assert!(after_packet(&mut tables).is_empty());
+            for i in tables.instances.values_mut() {
+                i.done = true;
+            }
+            tables.retire();
+        }
+        // And a table full of names still resolving.
+        absorb(fakes(5), &mut tables);
+        assert_eq!(tables.instances.len(), MAX_INSTANCES);
+        absorb(parse_message(&answer()).unwrap(), &mut tables);
+        assert_eq!(after_packet(&mut tables), [real]);
+        assert!(tables.instances.len() < MAX_INSTANCES);
+        // Handed over once: its answer to the next browse query is ignored.
+        absorb(parse_message(&answer()).unwrap(), &mut tables);
+        assert!(after_packet(&mut tables).is_empty());
+        // Only so many handed-over names are kept: the oldest go first.
+        for batch in 0..5 {
+            for name in (0..MAX_INSTANCES).map(|i| format!("r{batch}-{i}._airdrop._tcp.local")) {
+                tables.admit(&name);
+                let inst = tables.instances.get_mut(&name).unwrap();
+                inst.srv = Some((8770, "h.local".into()));
+                inst.txt = Some(Vec::new());
+            }
+            tables
+                .hosts
+                .insert("h.local".into(), vec!["fe80::1".parse().unwrap()]);
+            assert_eq!(after_packet(&mut tables).len(), MAX_INSTANCES);
+        }
+        assert_eq!(tables.handed.len(), MAX_HANDED);
+        assert_eq!(tables.handed_order.len(), MAX_HANDED);
+        assert!(!tables.handed.contains("0e9d036c5823._airdrop._tcp.local"));
     }
 
     #[test]
