@@ -8,6 +8,7 @@ before anything is written.
 """
 
 import logging
+import os
 import plistlib
 import re
 import sys
@@ -190,6 +191,84 @@ class LinkTests(ReceiverFixture):
         self.assertEqual(self.links([url]), 200)
         self.assertRegex(self.stored_as(url), r"^link(-\d+)?\.url$")
         self.assertEqual([p.name for p in self.out.iterdir() if p.name.startswith(".")], [])
+
+
+GIB = 1 << 30
+
+# Runs the receiver with os.statvfs reporting FREE bytes free in its download
+# folder, so a test can put the disk near Omdrop's 1 GiB reserve without
+# filling one. argv: download folder, FREE, then the receiver's own argv.
+LOW_DISK = """
+import os, runpy, sys
+out, free = sys.argv[1], int(sys.argv[2])
+real = os.statvfs
+def statvfs(path):
+    st = real(path)
+    if os.path.realpath(path) != out:
+        return st
+    return os.statvfs_result((4096, 4096, st.f_blocks, free // 4096, free // 4096,
+                              st.f_files, st.f_ffree, st.f_favail, st.f_flag, st.f_namemax))
+os.statvfs = statvfs
+sys.argv = sys.argv[3:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+class LowDiskFixture(ReceiverFixture):
+    free_bytes = None
+
+    @classmethod
+    def receiver_command(cls, *argv):
+        return [sys.executable, "-c", LOW_DISK, os.path.realpath(cls.out),
+                str(cls.free_bytes), str(SERVE), *argv]
+
+    def links(self, items):
+        ask = plistlib.dumps({"SenderComputerName": "Phone", "SenderModelName": "iPhone17,1",
+                              "TransferType": {"links": 1}, "Items": items},
+                             fmt=plistlib.FMT_BINARY)
+        before = sorted(p.name for p in self.out.iterdir())
+        status, _ = self.post(self.connection(), "/Ask", ask)
+        return status, sorted(set(p.name for p in self.out.iterdir()) - set(before))
+
+
+class LinkBudgetTests(LowDiskFixture):
+    # 8 KiB above the reserve: the budget is min(30 % of free, free - 1 GiB).
+    free_bytes = GIB + 8192
+
+    def url(self, shortcut_bytes):
+        """A URL whose .url file is shortcut_bytes long."""
+        prefix = "https://budget.example/a."
+        overhead = len("[InternetShortcut]\nURL=\n")
+        return prefix + "x" * (shortcut_bytes - overhead - len(prefix))
+
+    def test_a_link_is_charged_its_bytes_and_4096_more(self):
+        status, new = self.links([self.url(4097)])
+        self.assertEqual((status, new), (507, []))
+        self.assertIn("/Ask rejected: links need 8193 bytes; 30% of 1073750016 free bytes "
+                      "allows 8192", self.log.read_text())
+        status, new = self.links([self.url(4096)])
+        self.assertEqual(status, 200)
+        self.assertEqual(len(new), 1)
+
+    def test_links_past_the_budget_are_refused_and_none_stored(self):
+        # Each fits alone; together they do not, and nothing is written.
+        status, new = self.links([self.url(1000), self.url(1000)])
+        self.assertEqual((status, new), (507, []))
+        self.assertIn("/Ask rejected: links need 10192 bytes", self.log.read_text())
+
+    def test_a_links_ask_with_nothing_to_store_is_answered(self):
+        status, new = self.links(["ftp://budget.example/a", "https://budget.example/a b"])
+        self.assertEqual((status, new), (200, []))
+
+
+class LinkReserveTests(LowDiskFixture):
+    free_bytes = GIB - 4096
+
+    def test_no_link_is_stored_inside_the_1_gib_reserve(self):
+        status, new = self.links(["https://reserve.example/a"])
+        self.assertEqual((status, new), (507, []))
+        self.assertIn("/Ask rejected: not enough free space while preserving 1073741824 bytes",
+                      self.log.read_text())
 
 
 if __name__ == "__main__":

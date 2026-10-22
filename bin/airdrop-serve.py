@@ -802,6 +802,14 @@ def store_upload(raw, dest, tid, receive_budget):
 
 # Longest URL a links Ask may store, in UTF-8 bytes, as in omdrop-core.
 MAX_LINK_BYTES = 8192
+# Charged per stored link on top of its bytes, against the same budget an
+# upload gets: a file costs an inode and at least a block, however short.
+LINK_FILE_ALLOWANCE = 4096
+
+
+def link_shortcut(url):
+    """The bytes store_link writes for url."""
+    return f'[InternetShortcut]\nURL={url}\n'.encode('utf-8')
 
 
 def store_link(url, dest):
@@ -822,7 +830,7 @@ def store_link(url, dest):
         base = base[:-1]
     name, f = open_new(dest, base + '.url')
     with f:
-        f.write(f'[InternetShortcut]\nURL={url}\n'.encode('utf-8'))
+        f.write(link_shortcut(url))
     return name
 
 
@@ -1076,6 +1084,7 @@ class Handler(BaseHTTPRequestHandler):
         # make this machine visit an arbitrary URL. A file the user clicks is
         # the whole interaction we are willing to offer.
         if 'links' in (ask.get('TransferType') or {}):
+            urls = []
             for item in items:
                 if not isinstance(item, str) or not item.startswith(('http://', 'https://')):
                     logging.warning('ask: ignoring non-http item %.80r', item)
@@ -1092,8 +1101,32 @@ class Handler(BaseHTTPRequestHandler):
                     logging.warning('ask: ignoring item longer than %d bytes %.80r',
                                     MAX_LINK_BYTES, item)
                     continue
-                stored = store_link(item, DEST)
-                logging.info('link stored as %s -> %s', stored, item)
+                urls.append(item)
+            # Checked as a whole before the first is written: a refused Ask
+            # stores nothing. The budget is the one an upload gets, so links
+            # cannot fill the disk past what a file transfer may.
+            if urls:
+                need = sum(len(link_shortcut(url)) + LINK_FILE_ALLOWANCE for url in urls)
+                try:
+                    budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
+                except UploadLimitError as e:
+                    self.reject(507, str(e))
+                    return
+                except OSError as e:
+                    self.reject(507, f'storage failed: {e}')
+                    return
+                if need > budget.byte_limit:
+                    self.reject(507, f'links need {need} bytes; {budget.percent}% of '
+                                     f'{budget.free_bytes} free bytes allows {budget.byte_limit}')
+                    return
+            for url in urls:
+                try:
+                    stored = store_link(url, DEST)
+                except OSError as e:
+                    # Answering 200 would tell the sender a lost link arrived.
+                    self.reject(507, f'storage failed: {e}')
+                    return
+                logging.info('link stored as %s -> %s', stored, url)
         resp = plistlib.dumps({
             'ReceiverModelName': MODEL,
             'ReceiverComputerName': NAME,
