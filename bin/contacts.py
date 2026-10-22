@@ -214,9 +214,10 @@ def apple_intermediates():
 def certificate_account(der, ca_file=None, untrusted=None):
     """The Apple ID a client certificate belongs to, or "" if it is not one.
 
-    The certificate must actually verify to Apple's root. An earlier version of
-    this checked only that the issuer *name* said Apple, which is worth naming
-    as a mistake: a name is a string an attacker writes into their own
+    The certificate must actually verify to Apple's root, and to nothing
+    else: not to a CA in the system's store. An earlier version of this
+    checked only that the issuer *name* said Apple, which is worth naming as
+    a mistake: a name is a string an attacker writes into their own
     self-signed certificate. Everyone-mode peers legitimately present an
     ephemeral self-signed certificate with CN=airdrop, and those yield "" here.
     """
@@ -232,7 +233,7 @@ def certificate_account(der, ca_file=None, untrusted=None):
                              input=der, capture_output=True)
         if pem.returncode != 0:
             return ""
-        args = ["openssl", "verify", "-CAfile", ca, "-purpose", "any"]
+        args = ["openssl", "verify", "-CAfile", ca, *NO_SYSTEM_CAS, "-purpose", "any"]
         if chain:
             bundle = Path(tmp) / "chain.pem"
             bundle.write_bytes(b"".join(Path(c).read_bytes() for c in chain))
@@ -240,18 +241,7 @@ def certificate_account(der, ca_file=None, untrusted=None):
         verified = subprocess.run([*args, str(leaf)], capture_output=True)
         if verified.returncode != 0:
             return ""
-        # One attribute per line, "commonName = value". The default one-line
-        # subject is "CN = value" on OpenSSL 3.0 (Debian 12, Ubuntu 22.04 and
-        # 24.04) and "CN=value" on later releases, so searching it for "CN="
-        # refused every Apple certificate on 3.0.
-        subject = subprocess.run(["openssl", "x509", "-in", str(leaf), "-noout", "-subject",
-                                  "-nameopt", "multiline"],
-                                 capture_output=True).stdout.decode(errors="replace")
-    cn = ""
-    for line in subject.splitlines():
-        key, sep, value = line.partition("=")
-        if sep and key.strip() == "commonName":
-            cn = value.strip()
+        cn = _subject_cn(leaf.read_bytes())
     return cn[len(CN_PREFIX):] if cn.startswith(CN_PREFIX) else ""
 
 

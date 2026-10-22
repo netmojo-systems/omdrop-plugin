@@ -213,6 +213,23 @@ class ContactsPolicyTests(unittest.TestCase):
         known = {contacts.hash_identifier("friend@example.com")}
         self.assertEqual(contacts.REJECT_UNBOUND, self.decide(record, ephemeral, known))
 
+    def test_a_certificate_trusted_only_by_the_system_store_carries_no_account(self):
+        """openssl verify -CAfile also trusts the system's CA directory unless
+        told not to: a public CA must not be able to issue an Apple account."""
+        tmp = Path(self._tmp.name)
+        sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+           "-keyout", str(tmp / "public.key"), "-out", str(tmp / "public.pem"), "-days", "2",
+           "-subj", "/O=Public/CN=Some Public CA")
+        crt, _ = self.fx.issue("public-leaf", f"{contacts.CN_PREFIX}{self.ACCOUNT}",
+                               (tmp / "public.pem", tmp / "public.key"))
+        der = sh("openssl", "x509", "-in", str(crt), "-outform", "DER").stdout
+        with tempfile.TemporaryDirectory() as system:
+            shutil.copy(tmp / "public.pem", system)
+            sh("openssl", "rehash", system)
+            env = {"SSL_CERT_DIR": system, "SSL_CERT_FILE": str(tmp / "public.pem")}
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual("", contacts.certificate_account(der, self.ca, self.mid))
+
     def test_unsigned_claims_are_refused(self):
         """A plist someone wrote themselves, with the right shape and no signature."""
         forged = plistlib.dumps({"altDsID": self.ACCOUNT,
