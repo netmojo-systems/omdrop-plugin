@@ -99,6 +99,35 @@ class PinnedDependencyTests(unittest.TestCase):
         for line in builds:
             self.assertRegex(line, r"checkout --detach [0-9a-f]{40} && makepkg")
 
+    def repository_carries(self, version):
+        # `pacman -Si` answers from the sync databases on disk, which can be
+        # older than this plugin's pin.
+        self.command("pacman", f"""#!/bin/sh
+[ "$1" = -Si ] && [ "$2" = brcmfmac-awdl-dkms ] || exit 1
+printf 'Repository      : extra\\nName            : brcmfmac-awdl-dkms\\nVersion         : {version}\\n'
+""")
+
+    def test_a_repository_driver_at_the_pin_or_newer_is_installed_from_it(self):
+        source = OMDROP.read_text()
+        pin = re.search(r"(?m)^DRIVER_VERSION=(\S+)$", source).group(1)
+        for version in (f"{pin}-1", f"{pin}-2", "99.0.0-1"):
+            with self.subTest(version=version):
+                self.repository_carries(version)
+                _, script = self.build_script()
+                self.assertRegex(script, r"(?m)^sudo pacman -S --needed --noconfirm brcmfmac-awdl-dkms$")
+                self.assertNotIn("makepkg", script)
+
+    def test_a_repository_driver_older_than_the_pin_is_never_installed(self):
+        # The regression: any package by that name was taken, so a stale
+        # database installed a driver older than the pinned one, without the
+        # fixes the pin was raised for.
+        for version in ("0.9.9-1", "0.1.0-3"):
+            with self.subTest(version=version):
+                self.repository_carries(version)
+                _, script = self.build_script()
+                self.assertNotIn("brcmfmac-awdl-dkms", script)
+                self.assertRegex(script, r"checkout --detach [0-9a-f]{40} && makepkg")
+
 
 if __name__ == "__main__":
     unittest.main()

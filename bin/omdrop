@@ -1242,10 +1242,15 @@ sudo pacman -S --needed --asdeps $RECEIVER_PKGS"
   # not refresh them: -Sy on its own is how partial upgrades happen, and a user
   # who asked to install AirDrop did not ask to move their system's package
   # state. A database that predates the package simply takes the build path.
+  # So does one whose package is older than DRIVER_VERSION: a stale database
+  # must not install a driver older than the pin, which may lack a fix the pin
+  # carries, so only a version pacman reports as at least the pin is used.
   # An installed driver older than this plugin needs is rebuilt from the pin
   # too: that is the upgrade the "needs a newer driver" messages point at.
   if [[ ! -x "$DISCOVERABLE" ]] || ! driver_current; then
-    if pacman -Si "$DRIVER_PKG" >/dev/null 2>&1; then
+    local repo
+    repo=$(LC_ALL=C pacman -Si "$DRIVER_PKG" 2>/dev/null | sed -n 's/^Version *: *//p' | head -n 1)
+    if [[ -n "$repo" ]] && version_ge "$repo" "$DRIVER_VERSION"; then
       build="$build
 sudo pacman -S --needed --noconfirm $DRIVER_PKG"
     else
