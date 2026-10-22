@@ -543,11 +543,18 @@ Panel {
   // per peer the moment it answers, so a name appears seconds after it
   // arrives rather than when the slowest peer gives up half a minute later,
   // and closing the panel mid-lookup keeps every name already reported.
+  // A name is whatever a nearby device calls itself: one is kept only for an
+  // address the current listing holds, so a lookup cannot fill peerNames
+  // with addresses nobody is listing, and only its first 255 characters.
   function learnName(p) {
-    if (!p || !p.mac || !p.name) return
-    if (peerNames[p.mac] !== p.name) {
+    if (!p || !p.mac || typeof p.name !== "string" || p.name === "") return
+    if (!peers.some(function(q) { return q.mac === p.mac })) return
+    var name = p.name.slice(0, 255)
+    // A cut inside a surrogate pair would leave half a character.
+    if (/[\uD800-\uDBFF]$/.test(name)) name = name.slice(0, -1)
+    if (peerNames[p.mac] !== name) {
       var known = Object.assign({}, peerNames)
-      known[p.mac] = p.name
+      known[p.mac] = name
       peerNames = known
       namesProc.learnt = true
       mergePeers(peers)
