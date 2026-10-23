@@ -47,11 +47,14 @@ import safeplist  # noqa: E402
 identity.not_dumpable()
 
 
-# Path separators, NUL, control characters (Cc) and format characters (Cf:
-# bidi overrides, zero-width joiners) -- the last because a name like
-# "gpj.<U+202E>exe" renders as "exe.jpg" in a file manager. Used for received
-# file names and for the receiver name we advertise.
-UNSAFE_CHAR = re.compile(r'[/\\\x00]|[\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]|[\x01-\x1f\x7f-\x9f]')
+# Path separators, NUL, control characters (Cc), line and paragraph
+# separators, and format characters (Cf: bidi overrides, zero-width joiners)
+# -- the last because a name like "gpj.<U+202E>exe" renders as "exe.jpg" in a
+# file manager. Every character here is one the log escapes, so a stored name
+# is logged exactly as it is on disk and `omdrop watch` finds the file. Used
+# for received file names and for the receiver name we advertise.
+UNSAFE_CHAR = re.compile(r'[/\\\x00]|[\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]'
+                         r'|[\x01-\x1f\x7f-\x9f]')
 # The config file is the source of truth: ~/.config/airdrop/config.toml,
 # written by `omdrop setup` and the configuration commands in `omdrop`.
 # CLI flags override individual keys, so the file can be absent entirely.
@@ -162,8 +165,53 @@ MAX_RECEIVE_PERCENT = validate_receive_percent(
     args.max_receive_percent if args.max_receive_percent is not None
     else _cfg.get('max_receive_percent', DEFAULT_MAX_RECEIVE_PERCENT))
 
-logging.basicConfig(level=logging.DEBUG, stream=sys.stdout,
-                    format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+# Longest log message, in bytes, as in omdrop-core (log::MAX_MESSAGE_BYTES).
+# journald splits a stdout line longer than its LineMax (48 KiB by default)
+# into several entries, and with `-o cat` a fragment would read as a line of
+# its own, starting with whatever text a peer placed at the cut.
+MAX_LOG_MESSAGE_BYTES = 32 * 1024
+# What omdrop-core's log::escape() escapes: C0 and C1 controls (newlines
+# included) as \xNN; line and paragraph separators, zero-width characters,
+# bidi controls and the BOM as \uNNNN. Lone surrogates, which only a Python
+# string can hold (a name decoded with surrogateescape), go as \uNNNN too
+# rather than failing the write.
+LOG_ESCAPE = re.compile('[\x00-\x1f\x7f-\x9f]|'
+                        '[\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\ud800-\udfff]')
+
+
+def escape_log(message):
+    """message as one bounded log line, the way omdrop-core writes it."""
+    out = LOG_ESCAPE.sub(lambda m: f'\\x{ord(m[0]):02x}' if ord(m[0]) < 0xa0
+                         else f'\\u{ord(m[0]):04x}', message)
+    data = out.encode('utf-8')
+    if len(data) <= MAX_LOG_MESSAGE_BYTES:
+        return out
+    cut = MAX_LOG_MESSAGE_BYTES
+    while (data[cut] & 0xc0) == 0x80:     # back to a character boundary
+        cut -= 1
+    return f'{data[:cut].decode("utf-8")} [... {len(data) - cut} more bytes]'
+
+
+class EscapingFormatter(logging.Formatter):
+    """Every record as one escaped, bounded line. Peers write into this log
+    (names, file names, headers, request lines), and `omdrop watch` acts on
+    what it reads here, so no peer text may start a line of its own. A
+    traceback belongs to its record and is escaped with it."""
+
+    def format(self, record):
+        text = record.getMessage()
+        if record.exc_info:
+            text += '\n' + self.formatException(record.exc_info)
+        if record.stack_info:
+            text += '\n' + self.formatStack(record.stack_info)
+        record.message = escape_log(text)
+        record.asctime = self.formatTime(record, self.datefmt)
+        return self.formatMessage(record)
+
+
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(EscapingFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+logging.basicConfig(level=logging.DEBUG, handlers=[_log_handler])
 
 with open(f'/sys/class/net/{args.iface}/address') as f:
     sid = f.read().strip().replace(':', '')
@@ -209,7 +257,11 @@ class ThreadingHTTPServerV6(ThreadingHTTPServer):
         # readline is the normal end of a session, not a fault.
         if isinstance(sys.exc_info()[1], (ConnectionResetError, HandshakeFailed)):
             return
-        super().handle_error(request, client_address)
+        # Into the log rather than socketserver's traceback on stderr: an
+        # exception's text can carry what a peer sent, and only the log
+        # escapes it.
+        logging.error('exception while serving [%s]:%s', client_address[0],
+                      client_address[1], exc_info=True)
 
 
 # Raised by Handler.setup once a failed handshake is logged, so handle_error
@@ -644,14 +696,36 @@ def safe_name(name, fallback):
     stem, ext = os.path.splitext(name)
     while len((stem + ext).encode('utf-8')) > 255 and stem:
         stem = stem[:-1]
-    return (stem + ext) or fallback
+    # An extension that alone is too long leaves no stem: "a.<300 x>" would
+    # come back as ".xxx..", hidden and still too long. Core's fallback.
+    out = stem + ext
+    if not stem or len(out.encode('utf-8')) > 255 or out.startswith('.'):
+        return fallback
+    return out
+
+
+def transfer_label(header):
+    """The TransferID as logged: ASCII letters, digits, '-', '_' and '.',
+    at most 64, no leading dot; 'upload' when nothing is left. The same as
+    core's transfer_label, and what `omdrop watch` accepts as an ID, so no
+    ID can carry the ': stored ' that starts an arrival record."""
+    label = ''.join(c for c in header if c.isascii() and (c.isalnum() or c in '-_.'))[:64]
+    return label.lstrip('.') or 'upload'
 
 
 def open_new(dest, name):
-    """Create dest/name atomically without clobbering an existing file."""
+    """Create dest/name atomically without clobbering an existing file:
+    name, then stem-1.ext, stem-2.ext, ..., the stem shortened so each still
+    fits 255 bytes."""
     stem, ext = os.path.splitext(name)
     for i in range(10000):
-        cand = name if i == 0 else f'{stem}-{i}{ext}'
+        if i == 0:
+            cand = name
+        else:
+            suffix, short = f'-{i}{ext}', stem
+            while len((short + suffix).encode('utf-8')) > 255 and short:
+                short = short[:-1]
+            cand = short + suffix
         try:
             fd = os.open(os.path.join(dest, cand),
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -738,6 +812,34 @@ def store_upload(raw, dest, tid, receive_budget):
     return written
 
 
+def arrival_records(tid, names):
+    """The `stored` log records for one upload, as in omdrop-core. One name
+    per record, so a name containing ", " can't be read as two: `upload TID:
+    stored NAME` for a single file (or none), and `upload TID (k/n): stored
+    NAME` for k = 1..n otherwise. A name is at most 255 bytes, so every
+    record fits the log cap."""
+    if len(names) <= 1:
+        return [f'upload {tid}: stored {names[0] if names else ""}']
+    return [f'upload {tid} ({k}/{len(names)}): stored {name}'
+            for k, name in enumerate(names, 1)]
+
+
+# Longest URL a links Ask may store, in UTF-8 bytes, as in omdrop-core.
+MAX_LINK_BYTES = 8192
+# Charged per stored link on top of its bytes, against the same budget an
+# upload gets: a file costs an inode and at least a block, however short.
+LINK_FILE_ALLOWANCE = 4096
+# Held by a links Ask from its budget check through its last write, so two
+# Asks cannot both be checked against the same free bytes and together
+# write past the reserve. Short: at most 512 small files under it.
+LINKS_LOCK = threading.Lock()
+
+
+def link_shortcut(url):
+    """The bytes store_link writes for url."""
+    return f'[InternetShortcut]\nURL={url}\n'.encode('utf-8')
+
+
 def store_link(url, dest):
     """Write a received URL into dest as an inert .url shortcut and return the
     stored name. INI form ([InternetShortcut]) because it is plain text, needs
@@ -751,9 +853,12 @@ def store_link(url, dest):
     from urllib.parse import urlsplit
     parts = urlsplit(url)
     stem = '-'.join(p for p in (parts.netloc, parts.path.rstrip('/').rsplit('/', 1)[-1]) if p)
-    name, f = open_new(dest, safe_name(stem, 'link') + '.url')
+    base = safe_name(stem, 'link')
+    while len(base.encode('utf-8')) > 255 - len('.url'):   # room for ".url"
+        base = base[:-1]
+    name, f = open_new(dest, base + '.url')
     with f:
-        f.write(f'[InternetShortcut]\nURL={url}\n'.encode('utf-8'))
+        f.write(link_shortcut(url))
     return name
 
 
@@ -954,16 +1059,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             logging.error('ask: undecodable %d-byte body: %r', len(body), e)
             ask = {}
-        files = ask.get('Files') or []
-        logging.info('ask from %s (%s): type %s, %d item(s): %s',
-                     ask.get('SenderComputerName'), ask.get('SenderModelName'),
-                     ','.join(ask.get('TransferType') or {}) or '?', len(files),
-                     '; '.join(f"{f.get('FileName')} {f.get('FileType')} {f.get('FileSize')}B"
-                               for f in files) or (ask.get('Items') or '-'))
-        items = ask.get('Items') or []
+        if not isinstance(ask, dict):
+            ask = {}
+        files = ask.get('Files')
+        files = files if isinstance(files, list) else []
+        items = ask.get('Items')
+        items = items if isinstance(items, list) else []
+        # Before anything is built from them: the log line below grows with
+        # the item count.
         if len(items) > MAX_ARCHIVE_MEMBERS:
             self.reject(413, f'Ask exceeds {MAX_ARCHIVE_MEMBERS}-item limit')
             return
+        listing = '; '.join(
+            f"{d.get('FileName')} {d.get('FileType')} {d.get('FileSize')}B"
+            for d in (f if isinstance(f, dict) else {} for f in files[:MAX_ARCHIVE_MEMBERS]))
+        logging.info('ask from %s (%s): type %s, %d item(s): %s',
+                     ask.get('SenderComputerName'), ask.get('SenderModelName'),
+                     ','.join(ask.get('TransferType') or {}) or '?', len(files),
+                     listing or items or '-')
         # Contacts Only is enforced here rather than at /Discover, for two
         # reasons measured on 2026-09-18: a sender presents its Apple-issued
         # client certificate on /Ask and never on /Discover, and /Ask is the
@@ -999,12 +1112,33 @@ class Handler(BaseHTTPRequestHandler):
         # make this machine visit an arbitrary URL. A file the user clicks is
         # the whole interaction we are willing to offer.
         if 'links' in (ask.get('TransferType') or {}):
+            urls = []
             for item in items:
                 if not isinstance(item, str) or not item.startswith(('http://', 'https://')):
                     logging.warning('ask: ignoring non-http item %.80r', item)
                     continue
-                stored = store_link(item, DEST)
-                logging.info('link stored as %s -> %s', stored, item)
+                # A line break would end the shortcut's URL= line early and
+                # start another, and whitespace would make the `link stored
+                # as NAME -> URL` log line ambiguous to `omdrop watch`: such
+                # a URL is malformed (a real one is percent-encoded), not a
+                # link. isspace() is Unicode's White_Space, as in core.
+                if any(c.isspace() or unicodedata.category(c) == 'Cc' for c in item):
+                    logging.warning('ask: ignoring item with control characters or spaces %.80r', item)
+                    continue
+                if len(item.encode('utf-8')) > MAX_LINK_BYTES:
+                    logging.warning('ask: ignoring item longer than %d bytes %.80r',
+                                    MAX_LINK_BYTES, item)
+                    continue
+                urls.append(item)
+            # Checked as a whole before the first is written, and under
+            # LINKS_LOCK: a refused Ask stores nothing. The answer is sent
+            # after the lock is released, so a slow peer cannot hold it.
+            if urls:
+                with LINKS_LOCK:
+                    refused = self.store_links(urls)
+                if refused:
+                    self.reject(507, refused)
+                    return
         resp = plistlib.dumps({
             'ReceiverModelName': MODEL,
             'ReceiverComputerName': NAME,
@@ -1019,6 +1153,30 @@ class Handler(BaseHTTPRequestHandler):
             self.awaiting_upload = True
             self.request.settimeout(UPLOAD_WAIT_SECONDS)
 
+    @staticmethod
+    def store_links(urls):
+        """Store urls if they fit the receive budget an upload gets, so links
+        cannot fill the disk past what a file transfer may. Returns None, or
+        why the Ask is refused (507). Call with LINKS_LOCK held."""
+        need = sum(len(link_shortcut(url)) + LINK_FILE_ALLOWANCE for url in urls)
+        try:
+            budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
+        except UploadLimitError as e:
+            return str(e)
+        except OSError as e:
+            return f'storage failed: {e}'
+        if need > budget.byte_limit:
+            return (f'links need {need} bytes; {budget.percent}% of '
+                    f'{budget.free_bytes} free bytes allows {budget.byte_limit}')
+        for url in urls:
+            try:
+                stored = store_link(url, DEST)
+            except OSError as e:
+                # Answering 200 would tell the sender a lost link arrived.
+                return f'storage failed: {e}'
+            logging.info('link stored as %s -> %s', stored, url)
+        return None
+
     def handle_upload(self):
         # An Upload that never passed an Ask has nothing vouching for it, and
         # the Upload itself carries no validation record to judge.
@@ -1032,7 +1190,7 @@ class Handler(BaseHTTPRequestHandler):
         if not UPLOAD_SLOTS.acquire(blocking=False):
             self.reject(503, 'too many uploads in progress')
             return
-        tid = safe_name(self.headers.get('TransferID', ''), 'upload')
+        tid = transfer_label(self.headers.get('TransferID', ''))
         deadline = ReadDeadline()
         plan = None
         ended_early = False
@@ -1067,7 +1225,8 @@ class Handler(BaseHTTPRequestHandler):
                 logging.info('upload %s: %d bytes dvzip (TotalBytes %s)',
                              tid, wire_bytes, self.headers.get('TotalBytes'))
                 written = store_upload(raw, DEST, tid, receive_budget)
-            logging.info('upload %s: stored %s', tid, ', '.join(written))
+            for record in arrival_records(tid, written):
+                logging.info('%s', record)
         except socket.timeout as e:
             # Chunked framing announces no length, so there is none to name.
             expected = plan[1] if plan else None
@@ -1160,6 +1319,8 @@ def write_debug(data, name):
 APPLE_ROOT = contacts.apple_root_ca()
 if APPLE_ROOT is None:
     raise SystemExit(f'Apple root CA certificate missing: {contacts.APPLE_ROOT_CA}')
+if contacts.record_ca() is None:
+    raise SystemExit(f'Apple validation-record CA certificate missing: {contacts.RECORD_CA}')
 
 # ----------------------------------------------------------------------- TLS
 #
