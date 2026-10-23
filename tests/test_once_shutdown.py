@@ -109,20 +109,14 @@ cmd_watch {"--once" if once else ""}
 
     def split_upload(self, downloads, count=200):
         """The receiver's records for one upload of `count` files with names of
-        about 200 bytes: past 16 KiB of names, so `upload TID (K/N): ...`."""
+        about 200 bytes: one `upload TID (K/N): stored NAME` per file."""
         names = [f"{n:03d}-" + "x" * 190 + ".jpg" for n in range(count)]
-        parts, part = [], []
         for name in names:
-            if part and len(", ".join(part + [name]).encode()) > 16384:
-                parts.append(part)
-                part = []
-            part.append(name)
             (downloads / name).write_text("x")
-        parts.append(part)
-        return names, [f"{TS}upload ABC ({k}/{len(parts)}): stored {', '.join(p)}"
-                       for k, p in enumerate(parts, 1)]
+        return names, [f"{TS}upload ABC ({k}/{count}): stored {name}"
+                       for k, name in enumerate(names, 1)]
 
-    def test_a_one_file_window_closes_after_the_last_record_of_a_split_upload(self):
+    def test_a_one_file_window_closes_after_the_last_record_of_an_upload(self):
         records = []
 
         def journal(root, downloads):
@@ -131,7 +125,7 @@ cmd_watch {"--once" if once else ""}
             return "".join(line + "\n" for line in lines)
         result, events = self.run_watch(once=True, journal=journal)
 
-        self.assertGreater(len(records), 1)
+        self.assertEqual(len(records), 200)
         handled = [line for line in events.splitlines() if " handle " in line]
         self.assertEqual(len(handled), 200, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count("announcing"), 200)
@@ -152,13 +146,27 @@ cmd_watch {"--once" if once else ""}
         result, events = self.run_watch(once=True, systemd_run=False, journal=journal,
                                         slow="000-")
 
-        self.assertGreater(len(records), 1)
+        self.assertEqual(len(records), 120)
         lines = events.splitlines()
         slow = [n for n, line in enumerate(lines) if line.startswith("self handle") and "/000-" in line]
         closed = [n for n, line in enumerate(lines) if line.startswith("self off")]
         self.assertTrue(slow and closed, result.stdout + result.stderr + events[-500:])
         self.assertLess(slow[0], closed[0], "closed before the first record's notification")
         self.assertEqual(sum(line.startswith("self handle") for line in lines), 120)
+
+    def test_a_name_holding_a_comma_announces_that_file_and_no_other(self):
+        # hume, on #107: "private.png, sent.txt" arrived next to an existing
+        # private.png, and the watcher announced private.png.
+        def journal(root, downloads):
+            (downloads / "private.png").write_text("x")
+            (downloads / "private.png, sent.txt").write_text("x")
+            return f"{TS}upload ABC: stored private.png, sent.txt\n"
+        result, events = self.run_watch(once=True, journal=journal)
+
+        handled = [line for line in events.splitlines() if " handle " in line]
+        self.assertEqual(len(handled), 1, events)
+        self.assertTrue(handled[0].endswith("/private.png, sent.txt"), handled)
+        self.assertTrue(events.splitlines()[-1].endswith(" off --force"), events)
 
     def test_a_one_file_window_stays_open_until_the_last_record(self):
         def journal(root, downloads):

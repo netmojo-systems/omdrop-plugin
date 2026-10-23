@@ -5,8 +5,14 @@ a device name, a file name, a URL. The watcher used to take any line holding
 `upload ...: stored ` and announce whatever followed, an absolute path
 included, so a forged record could hand any of the user's files to the
 clipboard and a notification. These tests hold bin/omdrop's arrival_names to
-the rules of omdrop-core's links.rs (arrivals, resolve_arrivals,
-arrived_file), whose own tests they mirror.
+the rules of omdrop-core's links.rs (arrivals, arrived_file), whose own tests
+they mirror.
+
+A record names one file: `upload TID: stored NAME` for an upload of one,
+`upload TID (K/N): stored NAME` for file K of N. The receiver used to join an
+upload's names with ", ", which a name may hold too, and the watcher rejoined
+pieces until one existed: "private.png, sent.txt" next to an existing
+"private.png" announced private.png.
 """
 
 import os
@@ -60,10 +66,11 @@ class ArrivalNamesTests(unittest.TestCase):
     def test_only_the_receivers_own_records_name_arrivals(self):
         for name in ("a.jpg", "b c.png", "Example.url"):
             self.file(name)
-        journal = (f"{TS}upload 1A2B-3c_d.e: stored a.jpg, b c.png\n"
+        journal = (f"{TS}upload 1A2B-3c_d.e (1/2): stored a.jpg\n"
+                   f"{TS}upload 1A2B-3c_d.e (2/2): stored b c.png\n"
                    f"{TS}link stored as Example.url -> https://example.com/\n")
         self.assertEqual(self.names(journal.encode())[0],
-                         [["a.jpg", "b c.png"], ["Example.url"]])
+                         [["a.jpg"], ["b c.png"], ["Example.url"]])
 
         self.file("a.webloc")
         for forged in (
@@ -75,7 +82,6 @@ class ArrivalNamesTests(unittest.TestCase):
             f"{TS}upload X Y: stored a.jpg",
             f"{TS}upload {'x' * 65}: stored a.jpg",
             f"{TS}upload : stored a.jpg",
-            f"{TS}upload X: stored ",
             f"{TS}link stored as ../a.url -> https://e.x/",
             f"{TS}link stored as Example.url -> file:///etc/passwd",
             f"{TS}link stored as Example.url -> https://",
@@ -94,11 +100,13 @@ class ArrivalNamesTests(unittest.TestCase):
         (self.dir / "sub").mkdir()
         (self.dir / "sub" / "c.png").write_text("x")
 
-        records, _ = self.names(f"{TS}upload X: stored a.jpg, two, parts.txt, b.png, -rf.txt\n".encode())
-        self.assertEqual(records, [["a.jpg", "two, parts.txt", "b.png", "-rf.txt"]])
+        good = ["a.jpg", "two, parts.txt", "b.png", "-rf.txt"]
+        records, _ = self.names(per_file("X", good).encode())
+        self.assertEqual(records, [[name] for name in good])
 
-        forged = f"{self.outside}, link.png, .hidden, sub/c.png, sub, gone.jpg, ../Downloads/a.jpg"
-        records, warnings = self.names(f"{TS}upload X: stored {forged}\n".encode())
+        forged = [str(self.outside), "link.png", ".hidden", "sub/c.png", "sub", "gone.jpg",
+                  "../Downloads/a.jpg"]
+        records, warnings = self.names(per_file("X", forged).encode())
         self.assertEqual(records, [])
         self.assertEqual(warnings.count("which is not a file in"), 7, warnings)
 
@@ -114,26 +122,45 @@ class ArrivalNamesTests(unittest.TestCase):
 
     def test_a_line_that_is_not_utf8_is_not_a_record(self):
         self.file("a.jpg")
-        self.assertEqual(self.names(TS.encode() + b"upload X: stored a.jpg, \xff\n")[0], [])
+        self.assertEqual(self.names(TS.encode() + b"upload X: stored a.jpg\xff\n")[0], [])
 
     def test_the_last_line_counts_without_its_newline(self):
         self.file("a.jpg")
         self.assertEqual(self.names(f"{TS}upload X: stored a.jpg".encode())[0], [["a.jpg"]])
 
-    def test_an_upload_split_across_records_is_announced_whole(self):
-        # 200 names of about 200 bytes: 40 KiB of names, past the receiver's
-        # 32 KiB log cap, so the receiver logs them as several records.
+    def test_a_name_holding_a_comma_is_one_name(self):
+        # The regression: the name was split on ", " and its first piece,
+        # an unrelated file that exists, was announced instead.
+        self.file("private.png")
+        self.file("private.png, sent.txt")
+        records, warnings = self.records(f"{TS}upload X: stored private.png, sent.txt\n".encode())
+        self.assertEqual(records, [("done", ["private.png, sent.txt"])])
+        self.assertEqual(warnings, "")
+
+        (self.dir / "private.png, sent.txt").unlink()
+        records, warnings = self.records(f"{TS}upload X: stored private.png, sent.txt\n".encode())
+        self.assertEqual(records, [])
+        self.assertIn("private.png, sent.txt", warnings)
+
+    def test_an_upload_of_two_files_is_two_records(self):
+        for name in ("a.jpg", "b, c.png"):
+            self.file(name)
+        records, _ = self.records(per_file("X", ["a.jpg", "b, c.png"]).encode())
+        self.assertEqual(records, [("more", ["a.jpg"]), ("done", ["b, c.png"])])
+
+    def test_an_upload_of_200_files_is_announced_whole(self):
         names = [f"{n:03d}-" + "x" * 190 + ".jpg" for n in range(200)]
         for name in names:
             self.file(name)
-        lines = split_records("ABC", names)
-        self.assertGreater(len(lines), 1)
 
-        records, warnings = self.records("".join(line + "\n" for line in lines).encode())
+        records, warnings = self.records(per_file("ABC", names).encode())
 
         self.assertEqual(warnings, "")
-        self.assertEqual([state for state, _ in records], ["more"] * (len(lines) - 1) + ["done"])
+        self.assertEqual([state for state, _ in records], ["more"] * 199 + ["done"])
         self.assertEqual([n for _, names in records for n in names], names)
+
+    def test_an_upload_of_no_files_names_none(self):
+        self.assertEqual(self.records(f"{TS}upload X: stored \n".encode()), ([], ""))
 
     def test_a_transfer_is_done_at_its_last_record_even_if_that_names_no_file(self):
         self.file("a.jpg")
@@ -177,21 +204,13 @@ class ArrivalNamesTests(unittest.TestCase):
                 self.assertEqual(self.records((forged + "\n").encode())[0], [])
 
 
-def split_records(tid, names, limit=16384):
-    """The receiver's records for one upload: the plain form when the joined
-    names fit `limit` bytes, otherwise `upload TID (K/N): stored ...` records
-    of whole names, each names part at most `limit` bytes."""
-    if len(", ".join(names).encode()) <= limit:
-        return [f"{TS}upload {tid}: stored {', '.join(names)}"]
-    parts, part = [], []
-    for name in names:
-        if part and len(", ".join(part + [name]).encode()) > limit:
-            parts.append(part)
-            part = []
-        part.append(name)
-    parts.append(part)
-    return [f"{TS}upload {tid} ({k}/{len(parts)}): stored {', '.join(p)}"
-            for k, p in enumerate(parts, 1)]
+def per_file(tid, names):
+    """The receiver's records for an upload of `names`: the plain form for
+    one file, otherwise `upload TID (K/N): stored NAME` per file."""
+    if len(names) == 1:
+        return f"{TS}upload {tid}: stored {names[0]}\n"
+    return "".join(f"{TS}upload {tid} ({k}/{len(names)}): stored {name}\n"
+                   for k, name in enumerate(names, 1))
 
 
 if __name__ == "__main__":
