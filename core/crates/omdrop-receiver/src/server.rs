@@ -397,49 +397,27 @@ pub fn transfer_label(header: &str) -> String {
     }
 }
 
-/// Longest list of stored names on one log line. 512 names of 255 bytes
-/// would pass journald's 48 KiB `LineMax`, which splits a line, and the log's
-/// own 32 KiB cap, which cuts it; the watcher takes each `stored` record on
-/// its own, so the list is spread over several.
-const MAX_STORED_LINE_BYTES: usize = 16 * 1024;
-
-/// The stored names, joined with `, ` in order into lines of at most
-/// [`MAX_STORED_LINE_BYTES`], each filled before the next is started.
-pub fn stored_lines(names: &[String]) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for name in names {
-        if !line.is_empty() && line.len() + 2 + name.len() > MAX_STORED_LINE_BYTES {
-            lines.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push_str(", ");
-        }
-        line.push_str(name);
-    }
-    if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
-    }
-    lines
-}
-
 /// The records naming what an upload stored, as `omdrop watch` reads them:
-/// `upload TID: stored NAMES` when the names fit one line, else one
-/// `upload TID (K/N): stored NAMES` per line, K = 1..N, in order. The
-/// `(K/N)` sits where no file name can, between the TID (no spaces) and the
-/// colon, and tells the watcher which record completes the transfer: a
-/// `--once` window closes only after the last. The Python receiver writes
-/// the same records.
+/// `upload TID: stored ` for none, `upload TID: stored NAME` for one, and
+/// one `upload TID (K/N): stored NAME` per file, K = 1..N, in order, for
+/// more. One name per record: names joined with `, ` were ambiguous, since a
+/// name may hold `, ` itself, and a file named `a.png, b.txt` beside an
+/// `a.png` had the watcher announce `a.png`. `(K/N)` sits where no file name
+/// can, between the TID (no spaces) and the colon, and tells the watcher
+/// which record completes the transfer: a `--once` window closes only after
+/// the last. A record is at most a 255-byte name (log-escaped) and its
+/// prefix, well under the log's cap. The Python receiver writes the same
+/// records.
 pub fn stored_records(tid: &str, names: &[String]) -> Vec<String> {
-    let lines = stored_lines(names);
-    let n = lines.len();
-    if n == 1 {
-        return vec![format!("upload {tid}: stored {}", lines[0])];
+    let n = names.len();
+    if n <= 1 {
+        let name = names.first().map_or("", String::as_str);
+        return vec![format!("upload {tid}: stored {name}")];
     }
-    lines
+    names
         .iter()
         .enumerate()
-        .map(|(k, names)| format!("upload {tid} ({}/{n}): stored {names}", k + 1))
+        .map(|(k, name)| format!("upload {tid} ({}/{n}): stored {name}", k + 1))
         .collect()
 }
 

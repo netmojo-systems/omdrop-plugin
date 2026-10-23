@@ -390,73 +390,84 @@ fn arrival(f: &Fixture, name: &str) -> PathBuf {
 
 const TS: &str = "2026-10-10 16:14:20,098 INFO root: ";
 
-/// The receiver's records for one upload of `names`, as it writes them:
-/// whole names joined with ", " into lists of at most 16 KiB, numbered
-/// `(K/N)` when there is more than one.
+/// The receiver's records for one upload of `names`, as it writes them: the
+/// one name plain, else one `(K/N)` record per name.
 fn stored_records(tid: &str, names: &[String]) -> Vec<String> {
-    let mut lists: Vec<String> = vec![String::new()];
-    for name in names {
-        let list = lists.last_mut().unwrap();
-        if !list.is_empty() && list.len() + 2 + name.len() > 16 * 1024 {
-            lists.push(name.clone());
-        } else {
-            if !list.is_empty() {
-                list.push_str(", ");
-            }
-            list.push_str(name);
-        }
-    }
-    let n = lists.len();
+    let n = names.len();
     if n == 1 {
-        return vec![format!("{TS}upload {tid}: stored {}", lists[0])];
+        return vec![format!("{TS}upload {tid}: stored {}", names[0])];
     }
-    lists
+    names
         .iter()
         .enumerate()
-        .map(|(k, l)| format!("{TS}upload {tid} ({}/{n}): stored {l}", k + 1))
+        .map(|(k, name)| format!("{TS}upload {tid} ({}/{n}): stored {name}", k + 1))
         .collect()
 }
 
-/// 200 names of about 200 bytes do not fit one record. Every name is
-/// announced, and a one-file window closes only after the last record.
-#[test]
-fn a_transfer_spread_over_numbered_records_is_announced_whole() {
-    let f = Fixture::new();
-    let names: Vec<String> = (0..200)
-        .map(|i| format!("{i:03}, {}.jpg", "n".repeat(192)))
-        .collect();
-    let files: Vec<PathBuf> = names.iter().map(|n| arrival(&f, n)).collect();
-    let late = arrival(&f, "late.jpg");
-    let mut records = stored_records("T-1", &names);
-    assert!(records.len() > 1);
-    records.push(format!("{TS}upload T-2: stored late.jpg"));
+/// `watch --once` over `records`: (stdout, events).
+fn watch_once(f: &Fixture, records: &[String]) -> (String, String) {
     let (out, ev) = f.run(&["watch", "--once"], &[("JOURNAL", &records.join("\n"))]);
     assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for file in &files {
-        assert!(
-            stdout.contains(&format!("omdrop watch: announcing {}\n", file.display())),
-            "{} not announced",
-            file.display()
-        );
-    }
-    assert!(!stdout.contains(&late.display().to_string()), "{stdout}");
-    let handles = ev.lines().filter(|l| l.contains(" handle ")).count();
-    assert_eq!(handles, 200);
-    let off = last(&ev, " off --force");
-    assert!(last(&ev, " handle ") < off, "closed before the last record");
-    assert_eq!(ev.matches(" off --force").count(), 1, "{ev}");
+    (String::from_utf8_lossy(&out.stdout).into_owned(), ev)
+}
 
-    // Without the last record, the window stays open.
-    let f = Fixture::new();
-    for name in &names {
-        arrival(&f, name);
+/// Every name of a 2-file and a 200-file upload is announced, and a
+/// one-file window closes once, only after the last record.
+#[test]
+fn every_file_of_a_transfer_is_announced_before_the_window_closes() {
+    for count in [2, 200] {
+        let f = Fixture::new();
+        let names: Vec<String> = (0..count)
+            .map(|i| format!("{i:03}, {}.jpg", "n".repeat(192)))
+            .collect();
+        let files: Vec<PathBuf> = names.iter().map(|n| arrival(&f, n)).collect();
+        let late = arrival(&f, "late.jpg");
+        let mut records = stored_records("T-1", &names);
+        assert_eq!(records.len(), count);
+        records.push(format!("{TS}upload T-2: stored late.jpg"));
+        let (stdout, ev) = watch_once(&f, &records);
+        for file in &files {
+            assert!(
+                stdout.contains(&format!("omdrop watch: announcing {}\n", file.display())),
+                "{} not announced",
+                file.display()
+            );
+        }
+        assert!(!stdout.contains(&late.display().to_string()), "{stdout}");
+        assert_eq!(ev.lines().filter(|l| l.contains(" handle ")).count(), count);
+        assert!(last(&ev, " handle ") < last(&ev, " off --force"));
+        assert_eq!(ev.matches(" off --force").count(), 1, "{ev}");
+
+        // Without the last record, the window stays open.
+        let f = Fixture::new();
+        for name in &names {
+            arrival(&f, name);
+        }
+        let mut records = stored_records("T-1", &names);
+        records.pop();
+        let (_, ev) = watch_once(&f, &records);
+        assert!(ev.contains(" handle "), "{ev}");
+        assert!(!ev.contains(" off --force"), "{ev}");
     }
-    let first = stored_records("T-1", &names).remove(0);
-    let (out, ev) = f.run(&["watch", "--once"], &[("JOURNAL", &first)]);
-    assert!(out.status.success());
-    assert!(ev.contains(" handle "), "{ev}");
-    assert!(!ev.contains(" off --force"), "{ev}");
+}
+
+/// A record's whole remainder is one name: a file named like the first
+/// piece of a name holding ", " is not announced (hume, on plugin #106).
+#[test]
+fn a_name_holding_a_comma_announces_that_file_and_nothing_else() {
+    let f = Fixture::new();
+    let real = arrival(&f, "private.png, sent.txt");
+    let decoy = arrival(&f, "private.png");
+    let (stdout, ev) = watch_once(&f, &[format!("{TS}upload T: stored private.png, sent.txt")]);
+    assert!(
+        stdout.contains(&format!("omdrop watch: announcing {}\n", real.display())),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("announcing {}\n", decoy.display())),
+        "{stdout}"
+    );
+    assert_eq!(ev.lines().filter(|l| l.contains(" handle ")).count(), 1);
 }
 
 #[test]

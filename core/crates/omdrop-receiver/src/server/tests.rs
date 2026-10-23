@@ -834,48 +834,51 @@ fn log_labels_leave_no_room_for_forgery() {
     assert_eq!(transfer_label("x: stored /etc/passwd"), "xstoredetcpasswd");
     assert_eq!(transfer_label("..."), "upload");
     assert_eq!(transfer_label(&"a".repeat(100)).len(), 64);
-    let names: Vec<String> = (0..512)
-        .map(|i| format!("{i:03}{}", "n".repeat(250)))
-        .collect();
-    let lines = stored_lines(&names);
-    assert!(lines.len() > 1);
-    assert!(lines.iter().all(|l| l.len() <= MAX_STORED_LINE_BYTES));
-    let rejoined: Vec<String> = lines
-        .iter()
-        .flat_map(|l| l.split(", ").map(str::to_string))
-        .collect();
-    assert_eq!(rejoined, names);
-    assert_eq!(
-        stored_lines(&["a.txt".into(), "b.txt".into()]),
-        ["a.txt, b.txt"]
-    );
 }
 
-/// 200 names of about 200 bytes (40 KiB) once went out as several plain
-/// `stored` records, each read as a whole transfer by `omdrop watch --once`.
+/// One record per stored name: a name holding `, ` is never split, and 200
+/// names of about 200 bytes are all named, each under the log's cap.
 #[test]
-fn a_long_list_of_stored_names_is_numbered_across_records() {
-    let names: Vec<String> = (0..200)
-        .map(|i| format!("{i:03}-{}.jpg", "n".repeat(196)))
-        .collect();
-    let records = stored_records("T-1", &names);
-    let n = records.len();
-    assert!(n > 1);
-    let mut rejoined = Vec::new();
-    for (k, record) in records.iter().enumerate() {
-        let prefix = format!("upload T-1 ({}/{n}): stored ", k + 1);
-        let list = record.strip_prefix(&prefix).expect(record);
-        assert!(list.len() <= MAX_STORED_LINE_BYTES);
-        // Under the log's own cap, so no record is cut.
-        assert_eq!(crate::log::escape(record), *record);
-        rejoined.extend(list.split(", ").map(str::to_string));
-    }
-    assert_eq!(rejoined, names);
-    // A list that fits one record is written as it always was.
+fn each_stored_name_has_a_record_of_its_own() {
+    assert_eq!(stored_records("T-1", &[]), ["upload T-1: stored "]);
+    assert_eq!(
+        stored_records("T-1", &["private.png, sent.txt".into()]),
+        ["upload T-1: stored private.png, sent.txt"]
+    );
     assert_eq!(
         stored_records("T-1", &["a.txt".into(), "b, c.txt".into()]),
-        ["upload T-1: stored a.txt, b, c.txt"]
+        [
+            "upload T-1 (1/2): stored a.txt",
+            "upload T-1 (2/2): stored b, c.txt"
+        ]
     );
+    let names: Vec<String> = (0..200)
+        .map(|i| format!("{i:03}, {}.jpg", "n".repeat(196)))
+        .collect();
+    let records = stored_records("T-1", &names);
+    assert_eq!(records.len(), 200);
+    for (k, (record, name)) in records.iter().zip(&names).enumerate() {
+        assert_eq!(
+            *record,
+            format!("upload T-1 ({}/200): stored {name}", k + 1)
+        );
+        assert_eq!(crate::log::escape(record), *record);
+    }
+}
+
+/// A line separator in a received name would be escaped in the log, which
+/// would then name a file that does not exist: it is dropped when stored.
+#[test]
+fn a_name_with_a_line_separator_is_stored_and_logged_without_it() {
+    let fx = start(false, |_| {});
+    let mut c = connect(&fx, false);
+    assert_eq!(
+        upload(&mut c, &dvzip(&[("a\u{2028}b\u{2029}.txt", b"x")])),
+        200
+    );
+    assert_eq!(fx.files(), ["ab.txt"]);
+    let record = &stored_records("T", &fx.files())[0];
+    assert_eq!(crate::log::escape(record), "upload T: stored ab.txt");
 }
 
 #[test]

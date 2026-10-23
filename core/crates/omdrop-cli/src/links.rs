@@ -799,14 +799,14 @@ fn receiver_info(line: &str) -> Option<&str> {
     line[23..].strip_prefix(" INFO root: ")
 }
 
-/// The names one of the receiver's records says it stored:
-/// `upload TID: stored NAME, NAME` (names still joined, since a name may
-/// itself hold ", "), `upload TID (K/N): stored NAME, ...` when a long list
-/// is spread over N records, or `link stored as NAME.url -> http(s)://...`.
+/// What one of the receiver's records says it stored:
+/// `upload TID: stored NAME` (the whole remainder is the one name, `, ` and
+/// all, or empty when nothing was stored), `upload TID (K/N): stored NAME`
+/// for file K of N, or `link stored as NAME.url -> http(s)://...`.
 pub fn arrivals(line: &str) -> Option<ArrivalNames> {
     let msg = receiver_info(line)?;
     if let Some(rest) = msg.strip_prefix("upload ") {
-        let (head, names) = rest.split_once(": stored ")?;
+        let (head, name) = rest.split_once(": stored ")?;
         let (tid, last) = match head.split_once(' ') {
             None => (head, true),
             Some((tid, part)) => {
@@ -822,9 +822,9 @@ pub fn arrivals(line: &str) -> Option<ArrivalNames> {
             && tid
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'));
-        return (tid_ok && !names.is_empty()).then(|| ArrivalNames::Stored {
+        return tid_ok.then(|| ArrivalNames::Stored {
             tid: tid.to_string(),
-            names: names.to_string(),
+            name: name.to_string(),
             last,
         });
     }
@@ -852,19 +852,15 @@ fn record_number(text: &str) -> Option<u16> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArrivalNames {
-    /// An upload's record: its transfer, the names, and whether it is the
-    /// transfer's last record.
+    /// An upload's record: its transfer, the one name (empty: none), and
+    /// whether it is the transfer's last record.
     Stored {
         tid: String,
-        names: String,
+        name: String,
         last: bool,
     },
     Link(String),
 }
-
-/// The longest file name, in bytes (NAME_MAX): a join of pieces longer than
-/// this names nothing.
-const MAX_NAME_BYTES: usize = 255;
 
 /// A name is acted on only if it is a plain file name -- no slash, no
 /// leading dot, no control characters -- naming a regular file directly in
@@ -884,39 +880,20 @@ fn arrived_file(dir: &Path, name: &str) -> Option<PathBuf> {
         .map(|_| path)
 }
 
-/// The files that arrived, and the names that matched none. `, ` both
-/// separates names and may occur inside one, so a piece that is not a file
-/// is joined with the pieces after it until one is, or until the join is
-/// longer than any file name can be.
+/// The file a record names, or the name that matched none. A record with no
+/// name names nothing and is not a missing file.
 pub fn resolve_arrivals(dir: &Path, names: &ArrivalNames) -> (Vec<PathBuf>, Vec<String>) {
-    let (mut found, mut missing) = (Vec::new(), Vec::new());
-    match names {
-        ArrivalNames::Link(name) => match arrived_file(dir, name) {
-            Some(p) => found.push(p),
-            None => missing.push(name.clone()),
-        },
-        ArrivalNames::Stored { names: joined, .. } => {
-            let pieces: Vec<&str> = joined.split(", ").collect();
-            let mut i = 0;
-            while i < pieces.len() {
-                let hit = (i..pieces.len())
-                    .map(|j| (j, pieces[i..=j].join(", ")))
-                    .take_while(|(_, name)| name.len() <= MAX_NAME_BYTES)
-                    .find_map(|(j, name)| arrived_file(dir, &name).map(|p| (j, p)));
-                match hit {
-                    Some((j, p)) => {
-                        found.push(p);
-                        i = j + 1;
-                    }
-                    None => {
-                        missing.push(pieces[i].to_string());
-                        i += 1;
-                    }
-                }
-            }
+    let name = match names {
+        ArrivalNames::Link(name) => name,
+        ArrivalNames::Stored { name, .. } if name.is_empty() => {
+            return (Vec::new(), Vec::new());
         }
+        ArrivalNames::Stored { name, .. } => name,
+    };
+    match arrived_file(dir, name) {
+        Some(p) => (vec![p], Vec::new()),
+        None => (Vec::new(), vec![name.clone()]),
     }
-    (found, missing)
 }
 
 // ------------------------------------------------------------ link handler
@@ -1348,10 +1325,10 @@ mod tests {
 
     const TS: &str = "2026-10-10 16:14:20,098";
 
-    fn stored(tid: &str, names: &str, last: bool) -> ArrivalNames {
+    fn stored(tid: &str, name: &str, last: bool) -> ArrivalNames {
         ArrivalNames::Stored {
             tid: tid.into(),
-            names: names.into(),
+            name: name.into(),
             last,
         }
     }
@@ -1363,7 +1340,12 @@ mod tests {
             arrivals(&stored_line),
             Some(stored("1A2B-3c_d.e", "a.jpg, b c.png", true))
         );
-        // A long list, spread over numbered records: only the last completes.
+        // Nothing stored: a record naming no file.
+        assert_eq!(
+            arrivals(&format!("{TS} INFO root: upload X: stored ")),
+            Some(stored("X", "", true))
+        );
+        // File K of N, one record each: only the last completes.
         for (part, last) in [
             ("1/3", false),
             ("2/3", false),
@@ -1421,29 +1403,40 @@ mod tests {
         std::fs::create_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/c.png"), "x").unwrap();
 
-        let names = stored("T", "a.jpg, two, parts.txt, b.png", true);
-        let (found, missing) = resolve_arrivals(&dir, &names);
-        assert_eq!(
-            found,
-            vec![
-                dir.join("a.jpg"),
-                dir.join("two, parts.txt"),
-                dir.join("b.png")
-            ]
-        );
-        assert!(missing.is_empty(), "{missing:?}");
-
-        let forged = stored(
-            "T",
-            &format!(
-                "{}, link.png, .hidden, sub/c.png, sub, gone.jpg",
-                outside.display()
-            ),
-            true,
-        );
-        let (found, missing) = resolve_arrivals(&dir, &forged);
+        for name in ["a.jpg", "two, parts.txt", "b.png"] {
+            let (found, missing) = resolve_arrivals(&dir, &stored("T", name, true));
+            assert_eq!(found, [dir.join(name)]);
+            assert!(missing.is_empty(), "{missing:?}");
+        }
+        // The remainder is one name, never split on ", ": a file named like
+        // its first piece is not what arrived (hume, on plugin #106).
+        std::fs::write(dir.join("private.png, sent.txt"), "x").unwrap();
+        std::fs::write(dir.join("private.png"), "x").unwrap();
+        let (found, missing) = resolve_arrivals(&dir, &stored("T", "private.png, sent.txt", true));
+        assert_eq!(found, [dir.join("private.png, sent.txt")]);
+        assert!(missing.is_empty());
+        let (found, missing) = resolve_arrivals(&dir, &stored("T", "a.jpg, b.png", true));
         assert!(found.is_empty(), "{found:?}");
-        assert_eq!(missing.len(), 6, "{missing:?}");
+        assert_eq!(missing, ["a.jpg, b.png"]);
+        // No name: nothing found, nothing missing.
+        assert_eq!(
+            resolve_arrivals(&dir, &stored("T", "", true)),
+            (Vec::new(), Vec::new())
+        );
+
+        let outside = outside.display().to_string();
+        for name in [
+            outside.as_str(),
+            "link.png",
+            ".hidden",
+            "sub/c.png",
+            "sub",
+            "gone.jpg",
+        ] {
+            let (found, missing) = resolve_arrivals(&dir, &stored("T", name, true));
+            assert!(found.is_empty(), "{found:?}");
+            assert_eq!(missing, [name]);
+        }
 
         let (found, _) = resolve_arrivals(&dir, &ArrivalNames::Link("link.png".into()));
         assert!(found.is_empty());
