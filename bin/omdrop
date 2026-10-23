@@ -94,10 +94,12 @@ version_ge() {
 # core's pkgver with it, when the plugin starts relying on something newer:
 # 0.1.3 pins omdrop-awdl 0.10.0 (install-driver goes to core, so an older core
 # would build the older driver), 0.1.4 has #57's HEIC previews and Files
-# fallback, which an older core would silently lack, and 0.1.7 has Apple's
+# fallback, which an older core would silently lack, 0.1.7 has Apple's
 # renewed Application Integration CA: an older core trusts the copy that
 # expired on 2026-10-21 and refuses Contacts Only senders it issued (#75),
-# while the Python receiver beside this script has the renewed one.
+# while the Python receiver beside this script has the renewed one, and 0.1.8
+# pins omdrop-awdl 0.10.1 and writes one arrival record per file, which this
+# plugin's `omdrop watch` and panel expect (#106-#108).
 #
 # Core also needs a radio backend that ships its hooks (core's
 # docs/backend-contract.md): omdrop-awdl from 0.10.0 does, and so does
@@ -106,7 +108,7 @@ version_ge() {
 # core_supported decides where it is offered, and that is only where it has
 # been tested: omdrop-awdl so far. The check is one file test. OMDROP_HOOKS
 # moves it for tests.
-CORE_MIN=0.1.7
+CORE_MIN=0.1.8
 CORE_TOO_OLD=
 CORE_NO_HOOKS=
 core_version() {
@@ -159,7 +161,7 @@ esac
 # A fallback that silently substitutes for the real value is the same class of
 # defect as a status line reporting a state that was never entered, so this one
 # says when it is guessing, and says when the two disagree.
-VERSION_FALLBACK=0.18.3
+VERSION_FALLBACK=0.18.4
 omdrop_version() {
   local dir manifest version= real
   real=$(readlink -f "$0" 2>/dev/null) || real="$0"
@@ -1206,12 +1208,12 @@ DRIVER_PKG=brcmfmac-awdl-dkms
 # checkout below is detached at this SHA and the build only runs if it
 # succeeded. Bump it, in the same commit, whenever the plugin needs a newer
 # driver: the full 40 characters, because a short SHA is not a pin.
-DRIVER_COMMIT=e7891ab56957dde46f134c1991e4e4717f94d2e4
+DRIVER_COMMIT=0fcecbd62638bf29ca86bea1d4329558fb1d54ed
 # The package version that commit builds, with its pkgrel. install-driver
 # rebuilds any older installed driver: a fix inside the helper, such as 0.5.1's,
 # changes nothing a feature probe could see, and a packaging fix such as
 # 0.6.3-2's (the kernel headers became a dependency) changes only the pkgrel.
-DRIVER_VERSION=0.10.0
+DRIVER_VERSION=0.10.1
 # The first driver whose sender, send-to-peer and advertiser follow
 # docs/identity-contract.md. Moving the identity into 1Password needs it.
 DRIVER_IDENTITY_VERSION=0.7.0
@@ -1282,7 +1284,7 @@ else
   git clone --quiet $DRIVER_REPO '$src'
 fi
 echo 'Building driver commit $DRIVER_COMMIT'
-git -C '$src' checkout --detach e7891ab56957dde46f134c1991e4e4717f94d2e4 && makepkg --dir '$src' -si"
+git -C '$src' checkout --detach 0fcecbd62638bf29ca86bea1d4329558fb1d54ed && makepkg --dir '$src' -si"
     fi
   fi
 
