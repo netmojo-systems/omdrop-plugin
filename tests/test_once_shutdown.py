@@ -18,16 +18,28 @@ ROOT = Path(__file__).resolve().parents[1]
 OMDROP = ROOT / "bin" / "omdrop"
 
 
+# The receiver's own record prefix: `%(asctime)s %(levelname)s %(name)s: `.
+TS = "2026-10-10 16:14:20,098 INFO root: "
+
+
 class OneFileShutdownTests(unittest.TestCase):
-    def run_watch(self, once=True, systemd_run=True):
+    def run_watch(self, once=True, systemd_run=True, journal=None, slow=None):
+        """`omdrop watch` over a stubbed journal. `journal` makes the log from
+        (root, downloads); by default the receiver's record of one file.
+        With `slow`, only the handler of a file whose name holds it takes a
+        moment; the rest are immediate."""
         source = OMDROP.read_text()
         start = source.index("cmd_watch() {")
         fragment = source[start:source.index("\n# The URL inside", start)]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "arrived.jpg").write_text("x")
+            downloads = root / "Downloads"
+            downloads.mkdir()
+            (downloads / "arrived.jpg").write_text("x")
             capture = root / "events"
-            stored = f"upload ABC: stored {root}/arrived.jpg"
+            log = root / "journal"
+            log.write_text(journal(root, downloads) if journal
+                           else f"{TS}upload ABC: stored arrived.jpg\n")
             # Outside the f-string: a backslash in its expressions needs Python 3.12.
             systemd_run_body = ("printf 'systemd-run %s\\n' \"$*\" >> \"$CAPTURE\""
                                 if systemd_run else "return 1")
@@ -36,8 +48,8 @@ set -uo pipefail
 SELF={root}/omdrop
 UNIT=airdrop-receiver.service
 CAPTURE={capture}
-effective_dir(){{ printf '%s' {str(root)!r}; }}
-journalctl(){{ printf '%s\\n' {stored!r}; }}
+effective_dir(){{ printf '%s' {str(downloads)!r}; }}
+journalctl(){{ cat {str(log)!r}; }}
 systemd-run(){{ {systemd_run_body}; }}
 {fragment}
 cmd_watch {"--once" if once else ""}
@@ -46,8 +58,10 @@ cmd_watch {"--once" if once else ""}
             self_stub = root / "omdrop"
             # `handle` takes a moment, so a close that does not wait for it
             # is logged first.
+            delay = ('[ "$1" = handle ] && sleep 1\n' if slow is None else
+                     f'case "$1 $2" in "handle "*{slow}*) sleep 2 ;; esac\n')
             self_stub.write_text(
-                '#!/bin/sh\n[ "$1" = handle ] && sleep 1\n'
+                '#!/bin/sh\n' + delay +
                 'printf \'self %s\\n\' "$*" >> "$CAPTURE"\n')
             self_stub.chmod(0o755)
             env = os.environ.copy()
@@ -85,6 +99,109 @@ cmd_watch {"--once" if once else ""}
     def test_an_ordinary_window_is_not_closed_by_an_arrival(self):
         _, events = self.run_watch(once=False)
         self.assertNotIn("off", events)
+
+    def test_the_notification_unit_has_a_memory_ceiling(self):
+        # handle decodes a sender's HEIC for its preview, and in Everyone mode
+        # anyone nearby chooses that file.
+        result, events = self.run_watch(once=False)
+        self.assertRegex(events, r"systemd-run .*-p MemoryMax=512M .*\bhandle\b",
+                         result.stdout + result.stderr)
+
+    def split_upload(self, downloads, count=200):
+        """The receiver's records for one upload of `count` files with names of
+        about 200 bytes: one `upload TID (K/N): stored NAME` per file."""
+        names = [f"{n:03d}-" + "x" * 190 + ".jpg" for n in range(count)]
+        for name in names:
+            (downloads / name).write_text("x")
+        return names, [f"{TS}upload ABC ({k}/{count}): stored {name}"
+                       for k, name in enumerate(names, 1)]
+
+    def test_a_one_file_window_closes_after_the_last_record_of_an_upload(self):
+        records = []
+
+        def journal(root, downloads):
+            names, lines = self.split_upload(downloads)
+            records.extend(lines)
+            return "".join(line + "\n" for line in lines)
+        result, events = self.run_watch(once=True, journal=journal)
+
+        self.assertEqual(len(records), 200)
+        handled = [line for line in events.splitlines() if " handle " in line]
+        self.assertEqual(len(handled), 200, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("announcing"), 200)
+        lines = events.splitlines()
+        self.assertTrue(lines[-1].endswith(" off --force"), events[-500:])
+        self.assertEqual(sum(line.endswith(" off --force") for line in lines), 1)
+
+    def test_without_systemd_run_the_close_waits_for_every_records_notifications(self):
+        # The first record's handlers run inside the watcher too, and the
+        # close after the last record must not cut the first record's photo
+        # off mid-decode.
+        records = []
+
+        def journal(root, downloads):
+            _, lines = self.split_upload(downloads, count=120)
+            records.extend(lines)
+            return "".join(line + "\n" for line in lines)
+        result, events = self.run_watch(once=True, systemd_run=False, journal=journal,
+                                        slow="000-")
+
+        self.assertEqual(len(records), 120)
+        lines = events.splitlines()
+        slow = [n for n, line in enumerate(lines) if line.startswith("self handle") and "/000-" in line]
+        closed = [n for n, line in enumerate(lines) if line.startswith("self off")]
+        self.assertTrue(slow and closed, result.stdout + result.stderr + events[-500:])
+        self.assertLess(slow[0], closed[0], "closed before the first record's notification")
+        self.assertEqual(sum(line.startswith("self handle") for line in lines), 120)
+
+    def test_a_name_holding_a_comma_announces_that_file_and_no_other(self):
+        # hume, on #107: "private.png, sent.txt" arrived next to an existing
+        # private.png, and the watcher announced private.png.
+        def journal(root, downloads):
+            (downloads / "private.png").write_text("x")
+            (downloads / "private.png, sent.txt").write_text("x")
+            return f"{TS}upload ABC: stored private.png, sent.txt\n"
+        result, events = self.run_watch(once=True, journal=journal)
+
+        handled = [line for line in events.splitlines() if " handle " in line]
+        self.assertEqual(len(handled), 1, events)
+        self.assertTrue(handled[0].endswith("/private.png, sent.txt"), handled)
+        self.assertTrue(events.splitlines()[-1].endswith(" off --force"), events)
+
+    def test_a_one_file_window_stays_open_until_the_last_record(self):
+        def journal(root, downloads):
+            _, lines = self.split_upload(downloads)
+            return "".join(line + "\n" for line in lines[:-1])
+        result, events = self.run_watch(once=True, journal=journal)
+
+        self.assertIn(" handle ", events, result.stdout + result.stderr)
+        self.assertNotIn("off", events)
+
+    def test_a_forged_record_naming_a_file_outside_the_download_folder_is_ignored(self):
+        # A sender's text reaches the receiver's log. Neither a line without
+        # the receiver's own prefix, nor one where a record's words appear
+        # later in another message, nor a name that is not a file directly in
+        # the folder, is an arrival: nothing is announced, and a one-file
+        # window stays open.
+        def journal(root, downloads):
+            secret = root / "secret.png"
+            secret.write_text("x")
+            (downloads / "unrelated.jpg").write_text("x")
+            (downloads / "link.png").symlink_to(secret)
+            return "".join(line + "\n" for line in (
+                f"upload X: stored {secret}",
+                f"{TS}upload X: stored {secret}",
+                f"{TS}GET from Mac upload X: stored unrelated.jpg",
+                f"{TS}upload X: stored ../secret.png",
+                f"{TS}upload X: stored link.png",
+                f"{TS}link stored as ../secret.png -> https://e.x/",
+            ))
+        result, events = self.run_watch(once=True, journal=journal)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("announcing", result.stdout, events)
+        self.assertNotIn("off", events)
+        self.assertNotIn("secret.png", events)
+        self.assertNotIn("handle", events)
 
 
 if __name__ == "__main__":

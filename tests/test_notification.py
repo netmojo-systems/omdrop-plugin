@@ -6,6 +6,7 @@ click opens the file with its app, and shows it in the file manager only when
 no app is registered for its type -- otherwise xdg-open picks the browser.
 """
 
+import fcntl
 import os
 import subprocess
 import tempfile
@@ -176,19 +177,24 @@ class PreviewTests(NotificationFixture):
     def test_a_preview_whose_shrink_timed_out_survives_newer_previews(self):
         # A shrink that times out leaves the decode's older time on the
         # preview, and ten newer previews finish meanwhile; pruning must still
-        # keep the preview this toast is about to show.
+        # keep the preview this toast is about to show. Arrivals now decode
+        # one at a time, so the newer previews are written here directly.
         self.stub("heif-convert",
                   'printf "heif-convert|%s\\n" "$*" >> "$LOG"; for a; do d=$a; done\n'
                   'case "$*" in *SLOW*) printf slow > "$d" ;; *) printf jpeg > "$d" ;; esac')
-        self.stub("magick", 'case "$(cat "$1")" in slow) exec sleep 30 ;; esac\n' + MAGICK)
+        self.stub("magick", 'case "$(cat "$1")" in slow) printf "magick|slow\\n" >> "$LOG"; exec sleep 30 ;; esac\n'
+                  + MAGICK)
         slow = self.root / "SLOW.heic"
         slow.write_bytes(b"photo")
         decoding = subprocess.Popen([OMDROP, "handle", str(slow)],
-                                    env=dict(self.env, OMDROP_PREVIEW_TIMEOUT="5"),
+                                    env=dict(self.env, OMDROP_PREVIEW_TIMEOUT="3"),
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
+        deadline = time.monotonic() + 10
+        while "magick|" not in (self.log.read_text() if self.log.exists() else ""):
+            self.assertLess(time.monotonic(), deadline, "the slow shrink never started")
+            time.sleep(0.05)
         for n in range(10):
-            self.arrive(f"IMG_{n}.heic")
+            (self.previews / f"preview.Newer{n}.jpg").write_bytes(b"small")
             time.sleep(0.01)
         self.assertIsNone(decoding.poll(), "the slow shrink ended before the others finished")
         self.assertEqual(decoding.wait(timeout=30), 0)
@@ -238,6 +244,85 @@ class PreviewTests(NotificationFixture):
 
         self.assertEqual(self.notified_image(), photo)
         self.assertEqual(self.logged("heif-convert|"), [])
+
+
+class HeadlineTests(NotificationFixture):
+    """The toast's headline is the name a sender chose. omarchy-notification-send
+    reads options until its headline and has no `--`, so a name such as `-t`
+    would be read as an option, and the toast lost or changed."""
+
+    def argv(self):
+        # Each argument on its own line, so the headline can be told apart.
+        return self.logged("arg|")
+
+    def setUp(self):
+        super().setUp()
+        self.stub("omarchy-notification-send", 'for a; do printf "arg|%s\\n" "$a" >> "$LOG"; done')
+
+    def test_a_name_starting_with_a_dash_is_never_an_option(self):
+        for name in ("-t", "--app-name=Omarchy", "-p", "--exec"):
+            with self.subTest(name=name):
+                self.log.unlink(missing_ok=True)
+                self.arrive(name)
+                self.assertEqual(self.argv()[:3], ["arg|-t", "arg|8000", f"arg|./{name}"])
+
+    def test_other_names_are_shown_unchanged(self):
+        for name in ("notes.txt", "a -b.txt", "x--y.pdf"):
+            with self.subTest(name=name):
+                self.log.unlink(missing_ok=True)
+                self.arrive(name)
+                self.assertEqual(self.argv()[2], f"arg|{name}")
+
+
+class DecodeLockTests(NotificationFixture):
+    """A burst of HEIC photos from a nearby sender must not decode all at
+    once: every decode takes $XDG_RUNTIME_DIR/omdrop/decode.lock, the lock
+    omdrop-core takes too, so the two stacks serialize with each other."""
+
+    def test_a_decode_waits_for_the_lock_and_runs_once_it_is_free(self):
+        lock_path = self.runtime / "omdrop" / "decode.lock"
+        lock_path.parent.mkdir(mode=0o700)
+        with open(lock_path, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            (self.root / "IMG_1.heic").write_bytes(b"photo")
+            handling = subprocess.Popen([OMDROP, "handle", str(self.root / "IMG_1.heic")],
+                                        env=self.env, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, text=True)
+            time.sleep(1)
+            self.assertEqual(self.logged("heif-convert|"), [], "decoded while another held the lock")
+            self.assertIsNone(handling.poll())
+        _, err = handling.communicate(timeout=30)
+        self.assertEqual(handling.returncode, 0, err)
+        # The clipboard's JPEG and the preview: two decodes, one at a time.
+        self.assertEqual(len(self.logged("heif-convert|")), 2)
+        self.assertIsNotNone(self.notified_image())
+
+    def test_decodes_never_overlap(self):
+        # Each decode logs its start and end around a pause; with the lock,
+        # no start comes between another decode's start and end.
+        self.stub("heif-convert",
+                  'printf "start\\n" >> "$LOG"; sleep 0.2; for a; do d=$a; done\n'
+                  'printf jpeg > "$d"; printf "end\\n" >> "$LOG"')
+        photos = []
+        for n in range(3):
+            photo = self.root / f"IMG_{n}.heic"
+            photo.write_bytes(b"photo")
+            photos.append(photo)
+        handlers = [subprocess.Popen([OMDROP, "handle", str(p)], env=self.env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    for p in photos]
+        for handler in handlers:
+            self.assertEqual(handler.wait(timeout=60), 0)
+        events = self.logged("start") + self.logged("end")
+        self.assertEqual(len(events), 12)
+        order = [line for line in self.log.read_text().splitlines() if line in ("start", "end")]
+        self.assertEqual(order, ["start", "end"] * 6, order)
+
+    def test_the_lock_is_private_to_the_user(self):
+        self.arrive("IMG_1.heic")
+        lock_path = self.runtime / "omdrop" / "decode.lock"
+        self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(lock_path.parent.stat().st_mode & 0o777, 0o700)
 
 
 if __name__ == "__main__":

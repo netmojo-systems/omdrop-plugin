@@ -965,6 +965,12 @@ PROBE_TIMEOUT=${OMDROP_PROBE_TIMEOUT:-5}
 # advertiser follow docs/identity-contract.md. Features newer than this are
 # found by asking the sender (`--help`), not by version.
 BACKEND_CONTRACT_MIN=0.7.0
+# The first omdrop-awdl whose sender cleans peer names itself (clean_name in
+# airdrop-send.py: no controls, line or paragraph separators, bidi or
+# zero-width characters, at most 255 bytes). Its names cannot hold a line
+# break, so each line it prints is one peer, and `peers --stream` can pass a
+# row on as it arrives. Any other sender's rows wait for the whole lookup.
+NAMES_CLEAN_VERSION=0.10.1
 # Item IDs the plugin reports itself, and the panel acts on. A backend's own
 # item under one of these names is passed on as backend-<id>, so its sentence
 # still shows but no button offers a fix that cannot fix it.
@@ -1036,6 +1042,17 @@ backend_contract_say() {
   local contract
   contract=$(probe_field contract)
   printf '%s' "The installed radio backend ($(probe_field backend)) follows helper contract ${contract:-none}, older than the $BACKEND_CONTRACT_MIN this version of Omdrop needs. Update its package."
+}
+
+# Whether the sender keeps every peer on one line of its own: omdrop-awdl at
+# NAMES_CLEAN_VERSION or newer, by its probe. No probe, a hung one, another
+# backend, or an older version all count as no.
+sender_names_clean() {
+  radio_probe || return 1
+  [[ "$(probe_field backend)" == awdl ]] || return 1
+  local version
+  version=$(probe_field version)
+  [[ -n "$version" ]] && version_ge "$version" "$NAMES_CLEAN_VERSION"
 }
 
 # For messages that ask for a newer or missing radio helper: what provides
@@ -1245,10 +1262,15 @@ sudo pacman -S --needed --asdeps $RECEIVER_PKGS"
   # not refresh them: -Sy on its own is how partial upgrades happen, and a user
   # who asked to install AirDrop did not ask to move their system's package
   # state. A database that predates the package simply takes the build path.
+  # So does one whose package is older than DRIVER_VERSION: a stale database
+  # must not install a driver older than the pin, which may lack a fix the pin
+  # carries, so only a version pacman reports as at least the pin is used.
   # An installed driver older than this plugin needs is rebuilt from the pin
   # too: that is the upgrade the "needs a newer driver" messages point at.
   if [[ ! -x "$DISCOVERABLE" ]] || ! driver_current; then
-    if pacman -Si "$DRIVER_PKG" >/dev/null 2>&1; then
+    local repo
+    repo=$(LC_ALL=C pacman -Si "$DRIVER_PKG" 2>/dev/null | sed -n 's/^Version *: *//p' | head -n 1)
+    if [[ -n "$repo" ]] && version_ge "$repo" "$DRIVER_VERSION"; then
       build="$build
 sudo pacman -S --needed --noconfirm $DRIVER_PKG"
     else
@@ -1985,12 +2007,19 @@ find_by_name() {
     # child that closes its output but stays alive. Its session also contains
     # probes and Bluetooth advertising, so cancellation stops them together.
     # The two-second grace matches stop_group; neither wait can run forever.
+    # peer_rows cleans the names and refuses a forged row (exit 65), so every
+    # line read below, and every name printed from it, is already clean.
     exec {fd}< <(exec setsid timeout --kill-after=2 "$left" bash -c '
       sender=$1
       flags=()
       "$sender" --help 2>&1 | grep -- "--stream" >/dev/null && flags=(--stream)
-      exec "$sender" --list --names "${flags[@]}"
-    ' bash "$SENDER" 2>&1)
+      # Waits for the pipeline through a TERM, as the sender alone did when it
+      # was exec-ed here: timeout KILLs only while its child is alive, and a
+      # sender that outlives TERM must still get that KILL.
+      trap : TERM
+      set -o pipefail
+      "$sender" --list --names "${flags[@]}" 2>&1 | python3 -c "$2" --text
+    ' bash "$SENDER" "$PEER_ROWS_PY" 2>&1)
     pid=$!
     while :; do
       left=$(( deadline - SECONDS ))
@@ -2434,15 +2463,22 @@ cmd_peers() {
   if (( ${#names[@]} )) && ! "$SENDER" --help 2>&1 | grep -q -- '--names'; then
     die "Looking up peer names needs a newer $(radio_pkg). $(radio_update)"
   fi
-  # --stream: one JSON object per peer on its own line, written the moment
-  # that peer answers, so the panel shows a name seconds after it arrives
-  # rather than when the whole lookup ends. The lookup still runs as its own
-  # process group, so stopping this command stops the sender and its advert.
-  # A driver too old for --stream gives the same lines, all at the end.
+  # --stream: one JSON object per peer on its own line, so the panel shows a
+  # name seconds after it arrives rather than when the whole lookup ends. The
+  # lookup still runs as its own process group, so stopping this command
+  # stops the sender and its advert. A driver too old for --stream gives the
+  # same lines, all at the end.
+  #
+  # A row is written the moment that peer answers only when the sender keeps
+  # each peer on one line (sender_names_clean). From any other sender, a name
+  # with a line break in it can forge a row that is only found out when its
+  # address comes round again, and by then the panel would have shown it; so
+  # the rows are held until the sender exits and all of them have passed.
   if (( stream )); then
-    local sflag=()
+    local sflag=() early=()
     "$SENDER" --help 2>&1 | grep -q -- '--stream' && sflag=(--stream)
-    peers_stream() { "$SENDER" --list "${names[@]}" "${wake[@]}" "${sflag[@]}" | peers_json --lines; }
+    sender_names_clean && early=(--early)
+    peers_stream() { "$SENDER" --list "${names[@]}" "${wake[@]}" "${sflag[@]}" | peer_rows --lines "${early[@]}"; }
     run_cancellable peers_stream
     return
   fi
@@ -2482,10 +2518,12 @@ cmd_peers() {
     # An empty room is still an answer the panel can draw: `[]` on stdout, and
     # the same exit status and sentence as the text form on stderr.
     if (( rc == 1 )); then printf '[]\n'
-    elif (( rc == 0 )); then printf '%s\n' "$out" | peers_json; return
-    else die "$out"
+    elif (( rc == 0 )); then printf '%s\n' "$out" | peer_rows --json || exit 1; return 0
+    else die "$(printf '%s\n' "$out" | peer_rows --text)"
     fi
   fi
+  # Whole, before any of it is printed: a forged row refuses the listing.
+  out=$(printf '%s\n' "$out" | peer_rows --text) || exit 1
   if (( rc == 1 )); then
     # The RADIO, not the receiver: the receiver can be up with no window open,
     # and it is the window that runs the peer watcher which fills this table.
@@ -2501,42 +2539,99 @@ cmd_peers() {
   return "$rc"
 }
 
-# The sender's listing as one JSON array, for the panel. Same pattern as
-# choose_peer: address, signal (or `?`), endpoint, then a name column that -n
-# fills. The placeholders a lookup prints for a peer that did not answer are
-# not names, so they become null rather than labels on the radar.
-peers_json() {
-  python3 -c '
+# The sender's listing, read the way choose_peer reads it: address, signal (or
+# `?`), endpoint, then a name column that -n fills. A name is whatever a
+# nearby device chose to call itself, so it is cleaned before anything prints
+# or matches it, by the rule omdrop-core's sender applies: no C0 or C1
+# controls, DEL, line or paragraph separators, bidi controls or zero-width
+# characters, at most 255 UTF-8 bytes, no surrounding whitespace. Lines end at
+# \n only, never at a \r, so the rows bash sees are the rows parsed here.
+#
+# Each whole line is cleaned before its shape is judged: a forged row behind
+# an escape or an invisible character would otherwise pass here as some other
+# line, and become a row once cleaned. A line that still is not a row but
+# holds " dBm" is printed indented, so nothing reading the output further on
+# can take it for one.
+#
+# One lookup lists each address once. An address listed twice means a name
+# held a line break that the sender passed on, and the text after it posed as
+# a row of its own: possibly another device's address with a name of the
+# sender's choosing. There is no telling the forged row from the real one, so
+# the listing is refused: a message on stderr and exit 65, with nothing
+# further printed.
+#
+#   --text   the listing, cleaned; other lines kept, cleaned the same way
+#   --json   one JSON array, for `peers --json`
+#   --lines  one JSON object per row, for the panel's stream: all of them once
+#            the lookup has ended and none was forged, or, with --early, each
+#            as it arrives (for a sender that keeps each peer on one line)
+# The placeholders a lookup prints for a peer that did not answer are not
+# names, so they become null rather than labels on the radar.
+PEER_ROWS_PY='
 import json, re, sys
-row = re.compile(r"^((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\s+(-?\d+|\?) dBm\s+\S+\s*(.*)$")
-lines = sys.argv[1:] == ["--lines"]
-peers = []
+mode = sys.argv[1]
+early = sys.argv[2:] == ["--early"]
+row = re.compile(r"((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\s+(-?[0-9]+|\?) dBm\s+\S+\s*")
+unsafe = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]")
+# Unicode White_Space, as omdrop-core trims it.
+space = "\t\n\x0b\x0c\r \x85\xa0\u1680\u2028\u2029\u202f\u205f\u3000" + "".join(map(chr, range(0x2000, 0x200B)))
+
+def clean(name):
+    name = unsafe.sub("", name).encode()[:255].decode("utf-8", "ignore")
+    return name.strip(space)
+
+seen, peers, forged = set(), [], False
 # readline, not iteration: each line is passed on as soon as it arrives.
-for line in iter(sys.stdin.readline, ""):
-    m = row.match(line.rstrip("\n"))
-    if not m:
+for raw in iter(sys.stdin.buffer.readline, b""):
+    if forged:
         continue
-    name = m.group(3).strip()
+    line = unsafe.sub("", (raw[:-1] if raw.endswith(b"\n") else raw).decode("utf-8", "replace"))
+    m = row.match(line)
+    if not m:
+        if mode == "--text":
+            print("  " + line if " dBm" in line else line, flush=True)
+        continue
+    if m.group(1) in seen:
+        # Read to the end, so the lookup finishes as it would have.
+        print(f"{m.group(1)} was listed twice in one lookup: a nearby device sent a name with a "
+              "line break in it, which can pass one device off as another. Nothing from this "
+              "lookup was used. Look again in a moment.", file=sys.stderr, flush=True)
+        forged = True
+        continue
+    seen.add(m.group(1))
+    name = clean(line[m.end():])
+    if mode == "--text":
+        head = line[:m.end()]
+        print(head + name if name else head.rstrip(space), flush=True)
+        continue
     peer = {
         "mac": m.group(1),
         "rssi": None if m.group(2) == "?" else int(m.group(2)),
         "name": None if name in ("", "(no response)", "(anonymous)") else name,
     }
-    if lines:
+    if mode == "--lines" and early:
         print(json.dumps(peer), flush=True)
     else:
         peers.append(peer)
-if not lines:
-    print(json.dumps(peers))' "$@"
-}
+if forged:
+    sys.exit(65)
+if mode == "--json":
+    print(json.dumps(peers))
+elif mode == "--lines":
+    for peer in peers:
+        print(json.dumps(peer), flush=True)
+'
+peer_rows() { python3 -c "$PEER_ROWS_PY" "$@"; }
 
 # The unit is hardened with ProtectHome=read-only, so the download folder has
 # to be named in ReadWritePaths or the receiver cannot write there. Rather than
 # drop the hardening, keep the unit honest and write a drop-in naming exactly
 # the folder in use -- the unit's own header asks for this.
 # Follow the receiver's own log rather than the folder: it names the files it
-# stored, which is the path we need, and it cannot be fooled by an
-# unrelated download landing in the same directory.
+# stored, and an unrelated download landing there cannot fool it. Only the
+# receiver's own two records count, matched whole, and only names that are
+# regular files directly inside the download folder are acted on: a sender's
+# text can reach the log, and must never point this at anything else.
 cmd_watch() {
   local once=0
   while (( $# )); do
@@ -2549,40 +2644,28 @@ cmd_watch() {
     esac
   done
   local dir; dir=$(effective_dir)
+  # Handlers run here when systemd-run fails, across every record of an
+  # upload the receiver split: a one-file window waits for all of them.
+  local inline=()
   echo "omdrop watch: following $UNIT, saving into $dir"
-  journalctl --user -u "$UNIT" -f -n 0 -o cat 2>/dev/null | while IFS= read -r line; do
-    local files=()
-    case "$line" in
-      *"upload "*": stored "*)
-        local rest=${line#*: stored }
-        IFS=',' read -ra files <<< "$rest" ;;
-      *"link stored as "*)
-        local rest=${line#*link stored as }
-        files=("${rest%% -> *}") ;;
-      *) continue ;;
-    esac
-    local inline=()
-    for f in "${files[@]}"; do
-      f="${f#"${f%%[![:space:]]*}"}"      # trim
-      f="${f%"${f##*[![:space:]]}"}"
-      [[ -n "$f" ]] || continue
-      [[ "$f" == /* ]] || f="$dir/$f"
-      if [[ ! -e "$f" ]]; then
-        echo "omdrop watch: receiver named '$f' but it is not there" >&2
-        continue
-      fi
+  journalctl --user -u "$UNIT" -f -n 0 -o cat 2>/dev/null | arrival_names "$dir" \
+    | while IFS=/ read -r -a fields; do
+    local state=${fields[0]-} names=("${fields[@]:1}") name f
+    for name in "${names[@]}"; do
+      f="${dir%/}/$name"
       echo "omdrop watch: announcing $f"
       # In its own transient unit, like `off` below: stopping this service
       # (`off`, or a one-file window closing right after this) kills its whole
       # cgroup, and a notification still decoding its preview would be lost.
       # systemd-run returns once the unit has started. Without it, handle runs
-      # here, and a one-file window waits for it before closing.
-      if ! systemd-run --user --quiet --collect "$SELF" handle "$f" >/dev/null 2>&1; then
+      # here, and a one-file window waits for it before closing. MemoryMax
+      # bounds what decoding a sender's photo for its preview can take.
+      if ! systemd-run --user --quiet --collect -p MemoryMax=512M "$SELF" handle "$f" >/dev/null 2>&1; then
         "$SELF" handle "$f" &
-        inline+=("$!")
+        (( once )) && inline+=("$!")
       fi
     done
-    if (( once )) && (( ${#files[@]} )); then
+    if (( once )) && [[ "$state" == done ]]; then
       (( ${#inline[@]} )) && wait "${inline[@]}"
       # In its OWN transient unit, not in this process. `off` calls
       # cancel_window, which stops omdrop-watch.service -- this service -- and
@@ -2596,6 +2679,104 @@ cmd_watch() {
       return 0
     fi
   done
+}
+
+# The files one of the receiver's records says it stored, read off its log on
+# stdin, by the rules omdrop-core's links.rs applies (arrivals, arrived_file).
+# A record is the receiver's own `%(asctime)s INFO root: ` prefix, then one of
+#   upload TID: stored NAME          an upload of one file (or none: no NAME)
+#   upload TID (K/N): stored NAME    file K of an upload of N, K = 1..N
+#   link stored as NAME.url -> http(s)://...
+# and anything else is not one, however much of it matches. Everything after
+# `: stored ` is one name, whatever it holds: names are never split, since a
+# name may itself hold ", ", and splitting one could name a different file
+# that happens to exist. ` (K/N)` sits where no file name can. A name counts
+# only if it is a plain file name -- no slash, no leading dot, no control
+# character -- naming a regular file directly in the download folder $1, by
+# lstat, so a symlink planted there is not followed.
+#
+# Prints a line per record that named a file or ended a transfer: `more` or
+# `done`, then the record's file name, if any, joined by `/`, which no name
+# can hold. `done` marks the last record of a transfer that named a file in
+# any of its records: the plain form, a link, or K = N. A name that is not a
+# file is reported on stderr.
+arrival_names() {
+  python3 -c '
+import os, re, signal, stat, sys
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+folder = sys.argv[1]
+prefix = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3} INFO root: ")
+upload = re.compile(r"([A-Za-z0-9._-]{1,64})(?: \(([1-9][0-9]*)/([1-9][0-9]*)\))?")
+# Unicode White_Space, which is what Rust calls whitespace.
+space = set("\t\n\x0b\x0c\r \x85\xa0\u1680\u2028\u2029\u202f\u205f\u3000")
+space.update(map(chr, range(0x2000, 0x200B)))
+
+def control(c):
+    return c < "\x20" or "\x7f" <= c <= "\x9f"
+
+def arrivals(line):
+    """(transfer, whether this record is its last, its name or ""), or None."""
+    m = prefix.match(line)
+    if not m:
+        return None
+    msg = line[m.end():]
+    if msg.startswith("upload "):
+        head, sep, name = msg[len("upload "):].partition(": stored ")
+        u = upload.fullmatch(head)
+        if not sep or not u:
+            return None
+        if u.group(2) is None:
+            return u.group(1), True, name
+        k, n = int(u.group(2)), int(u.group(3))
+        if k > n or n > 512:
+            return None
+        return u.group(1), k == n, name
+    if not msg.startswith("link stored as "):
+        return None
+    name, sep, url = msg[len("link stored as "):].partition(" -> ")
+    if not sep or len(name) <= 4 or not name.endswith(".url") or " " in name or "/" in name:
+        return None
+    for scheme in ("https://", "http://"):
+        if url.startswith(scheme):
+            rest = url[len(scheme):]
+            break
+    else:
+        return None
+    if not rest or any(c in space for c in rest):
+        return None
+    return None, True, name
+
+def arrived(name):
+    if not name or "/" in name or name.startswith(".") or any(map(control, name)):
+        return False
+    try:
+        return stat.S_ISREG(os.lstat(os.path.join(folder, name)).st_mode)
+    except OSError:
+        return False
+
+# Transfers whose earlier records named a file, until their last record.
+announced = set()
+for raw in iter(sys.stdin.buffer.readline, b""):
+    try:
+        line = raw[:-1].decode() if raw.endswith(b"\n") else raw.decode()
+    except UnicodeDecodeError:
+        continue
+    record = arrivals(line)
+    if record is None:
+        continue
+    tid, last, name = record
+    found = arrived(name)
+    if name and not found:
+        print(f"omdrop watch: receiver named \x27{name}\x27, which is not a file in {folder}; ignored",
+              file=sys.stderr, flush=True)
+    done = last and (found or tid in announced)
+    if tid is not None:
+        if last:
+            announced.discard(tid)
+        elif found:
+            announced.add(tid)
+    if found or done:
+        print("/".join(["done" if done else "more"] + ([name] if found else [])), flush=True)' "$1"
 }
 
 # The URL inside an Apple .webloc or a Windows .url shortcut, unchecked. Both
@@ -2710,6 +2891,30 @@ PREVIEW_KEEP=10
 PREVIEW_SIZE=512
 PREVIEW_TIMEOUT=${OMDROP_PREVIEW_TIMEOUT:-10}
 
+# Run "$@" holding the per-user decode lock. Every arrival gets its own
+# `handle`, so a burst of photos from a nearby sender would otherwise decode
+# all at once, each at full size in RAM. omdrop-core takes the same lock file,
+# so the two never decode together either. Each decode is bounded by its own
+# timeout, so waiting for the lock is bounded too.
+DECODE_LOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omdrop/decode.lock"
+with_decode_lock() {
+  (umask 077 && mkdir -p -- "$(dirname "$DECODE_LOCK")") || return 1
+  (
+    umask 077
+    exec 9>>"$DECODE_LOCK" && flock 9 || exit 1
+    "$@"
+  )
+}
+
+# Decode $1 into the preview $2 and shrink it: what heic_preview does under
+# the decode lock.
+decode_preview() {
+  timeout -k 1 "$PREVIEW_TIMEOUT" heif-convert -q 80 "$1" "$2" >/dev/null 2>&1 \
+    && [[ -s "$2" ]] || return 1
+  shrink_preview "$2"
+  return 0
+}
+
 # A small JPEG preview for formats the notification daemon cannot decode (HEIC
 # from an iPhone). Prints the path of the preview, or nothing when none is
 # possible; a failed or timed-out decode only costs the toast its thumbnail.
@@ -2723,9 +2928,7 @@ heic_preview() {
   # the only name pruning looks at -- once it is complete.
   work=$(mktemp --suffix=.jpg "$PREVIEW_DIR/working.XXXXXX") || return 0
   final="$PREVIEW_DIR/preview.${work#"$PREVIEW_DIR/working."}"
-  if timeout -k 1 "$PREVIEW_TIMEOUT" heif-convert -q 80 "$f" "$work" >/dev/null 2>&1 \
-     && [[ -s "$work" ]]; then
-    shrink_preview "$work"
+  if with_decode_lock decode_preview "$f" "$work"; then
     # Pruning goes by when a preview was finished. A shrink that failed or
     # timed out leaves the decode's older time, and the newer previews of a
     # burst would prune this one before its toast could show it.
@@ -2779,7 +2982,7 @@ cmd_open_link() {
   else
     why="There is no web link in it."
   fi
-  omarchy-notification-send "Can't open $(basename "$f")" "$why" >/dev/null 2>&1 \
+  omarchy-notification-send "Can't open $(basename -- "$f")" "$why" >/dev/null 2>&1 \
     || echo "omdrop: can't open $f: $why" >&2
   return 1
 }
@@ -3037,7 +3240,7 @@ copy_to_clipboard() {
 # The file came from whoever was nearby, so the decode is time-limited:
 # 10 s. A 48 MP iPhone photo decodes in a second or two even on modest
 # hardware, so this never cuts off a real photo, but it bounds a hostile file
-# built to stall the handler.
+# built to stall the handler. It runs under the decode lock, one at a time.
 HEIF_TIMEOUT=10
 heif_to_jpeg() {
   local src=$1 base tmp
@@ -3045,13 +3248,24 @@ heif_to_jpeg() {
   base="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omdrop"
   (umask 077 && mkdir -p -- "$base") || return 1
   tmp=$(mktemp -d "$base/clip.XXXXXX") || return 1
-  if timeout -k 2 "$HEIF_TIMEOUT" heif-convert -q 90 "$src" "$tmp/clip.jpg" </dev/null >/dev/null 2>&1 \
+  if with_decode_lock timeout -k 2 "$HEIF_TIMEOUT" heif-convert -q 90 "$src" "$tmp/clip.jpg" </dev/null >/dev/null 2>&1 \
      && [[ -s "$tmp/clip.jpg" ]]; then
     printf '%s' "$tmp"
     return 0
   fi
   rm -rf -- "$tmp"
   return 1
+}
+
+# A received file's name, for a toast. omarchy-notification-send reads options
+# up to its headline and takes no `--`, so a name a sender chose, such as `-t`
+# or `--app-name=Omarchy`, would be read as an option instead of shown. A name
+# that starts with a dash is shown as ./NAME; every other name is unchanged.
+toast_name() {
+  local name=${1%/}
+  name=${name##*/}
+  [[ "$name" == -* ]] && name="./$name"
+  printf '%s' "$name"
 }
 
 act_notify() {
@@ -3077,9 +3291,9 @@ act_notify() {
   # the name of what landed appears, and the only thing to click to open it,
   # so it gets 8 s -- what a normal-urgency toast would get -- without
   # claiming the urgency of one.
-  local what="Saved to $(tildify "$(dirname "$f")")/"
-  command -v wl-copy >/dev/null 2>&1 && what="Copied to clipboard, saved to $(tildify "$(dirname "$f")")/"
-  omarchy-notification-send -t 8000 "$(basename "$f")" "$what (or click this)" \
+  local what="Saved to $(tildify "$(dirname -- "$f")")/"
+  command -v wl-copy >/dev/null 2>&1 && what="Copied to clipboard, saved to $(tildify "$(dirname -- "$f")")/"
+  omarchy-notification-send -t 8000 "$(toast_name "$f")" "$what (or click this)" \
     "${args[@]}" --exec "$SELF" act open "$f" >/dev/null \
     || echo "omdrop: notification failed for $f" >&2
 }

@@ -89,6 +89,8 @@ if [ "$1" = --list ]; then
   fi
   if [ -n "$PEER_LIST_TAIL" ]; then
     sleep "${LIST_TAIL_DELAY:-0}"
+    # Marks that the lookup has reached its last row.
+    : > "$CAPTURE_LIST.tail"
     printf '%s\\n' "$PEER_LIST_TAIL"
   fi
   exit 0
@@ -112,9 +114,12 @@ echo "    inet6 fe80::1c9a:4bff:fe33:1/64 scope link"
         )
         # Whether a window is open is the radio helper's to say: awdl0 keeps
         # its address after `omdrop off`. WINDOW_JSON replaces the answer.
+        # PROBE_JSON, when set, is the backend's answer to `probe --json`;
+        # otherwise the helper has no probe the plugin can read.
         self.discoverable = self.command(
             "omdrop-discoverable",
             """#!/bin/sh
+[ "$1" = probe ] && [ -n "$PROBE_JSON" ] && { printf '%s\\n' "$PROBE_JSON"; exit 0; }
 [ -n "$WINDOW_JSON" ] && { printf '%s\\n' "$WINDOW_JSON"; exit 0; }
 if [ "${WINDOW:-${RADIO:-up}}" = up ]; then echo '{"visible":true}'; else echo '{"visible":false}'; fi
 """,
@@ -159,6 +164,7 @@ exit 1
             PEER_LIST_LATER="",
             PEER_LIST_TAIL="",
             LIST_TAIL_DELAY="",
+            PROBE_JSON="",
         )
 
     def command(self, name, body):
@@ -832,6 +838,236 @@ class NamedRecipientTests(SenderFixture):
 
         self.assertEqual(proc.returncode, 130)
         self.assertIn("Cancelled", err)
+        self.assertFalse(self.capture.exists())
+
+
+class PeerNameTests(SenderFixture):
+    """A device's name is whatever it chose to call itself. Until the sender
+    cleans it, a name can carry terminal escapes, bidi overrides, or a line
+    break followed by text shaped like another device's row. The command
+    line cleans every name it prints or matches, and refuses a lookup in which
+    one device was listed twice, since one of those rows was forged."""
+
+    A = "02:00:00:00:00:0a  -40 dBm  [fe80::a%awdl0]:8770"
+    B = "02:00:00:00:00:0b  -30 dBm  [fe80::b%awdl0]:8770"
+    UNSAFE = "\x1b\x07\x7f\x85\u2028\u2029\u202a\u202e\u2066\u2069\u200b\u200f\ufeff"
+
+    def assert_clean(self, text):
+        for c in self.UNSAFE:
+            self.assertNotIn(c, text, f"{ord(c):#x} printed")
+
+    def test_a_row_forged_inside_a_name_cannot_relabel_another_device(self):
+        # The attacker A calls itself "Brent's iPhone", and the line break in
+        # its name forges a row that renames the real Brent's iPhone, B.
+        # Before, the forged row replaced B's, and the send went to A.
+        self.env.update(OMDROP_NAME_WAIT="5", PEER_LIST="\n".join([
+            f"{self.B}  Brent's iPhone",
+            f"{self.A}  Brent's iPhone",
+            f"{self.B}  Mallory",
+        ]))
+
+        result = self.run_omdrop("send", "Brent's iPhone", str(self.file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("listed twice in one lookup", result.stderr)
+        self.assertFalse(self.capture.exists(), "sent despite a forged row")
+
+    # Characters the cleaning removes, which kept a forged row from looking
+    # like one until it was cleaned: ESC, a C1 CSI, NEL, bidi and zero-width.
+    HIDING = ["\x1b", "\x9b", "\x85", "\u202e", "\u2066", "\u200b", "\ufeff", "\x07\u200f"]
+
+    def test_a_forged_row_behind_a_removable_character_is_still_a_forged_row(self):
+        # Before, the forged line failed the row pattern, was printed with
+        # the character removed, and bash then read it as B's row.
+        for hide in self.HIDING:
+            with self.subTest(hide=repr(hide)):
+                self.capture.unlink(missing_ok=True)
+                self.env.update(OMDROP_NAME_WAIT="5", PEER_LIST="\n".join([
+                    f"{self.B}  Brent's iPhone",
+                    f"{self.A}  Brent's iPhone",
+                    f"{hide}{self.B}  Mallory",
+                ]))
+
+                result = self.run_omdrop("send", "Brent's iPhone", str(self.file))
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("listed twice in one lookup", result.stderr)
+                self.assertFalse(self.capture.exists(), "sent despite a forged row")
+
+    def test_a_line_that_is_not_a_row_never_reads_as_one(self):
+        # Whatever is left of a line that is not a row is printed so that
+        # nothing reading the listing afterwards can take it for one.
+        self.env["PEER_LIST"] = f"{self.A}  x\nnot a row {self.B}  -30 dBm  [fe80::b%awdl0]:8770"
+
+        result = self.run_omdrop("peers", "-n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in result.stdout.splitlines()[1:]:
+            self.assertTrue(line.startswith("  "), line)
+
+    # The panel's lookup, from senders that may pass a line break on inside a
+    # name: a helper with no probe, another backend, and omdrop-awdl before
+    # its sender cleaned names.
+    UNVETTED = {
+        "no probe": "",
+        "another backend": json.dumps({"backend": "owl", "version": "0.2.0", "contract": "0.7.0"}),
+        "omdrop-awdl 0.10.0": json.dumps({"backend": "awdl", "version": "0.10.0", "contract": "0.7.0"}),
+    }
+    # omdrop-awdl from 0.10.1, whose sender keeps each peer on one line.
+    CLEAN = json.dumps({"backend": "awdl", "version": "0.10.1", "contract": "0.7.0"})
+
+    def stream(self):
+        """Runs the panel's lookup and reads it as the panel does. Returns the
+        first line, whether the sender had reached its last row when that
+        line came, then all of stdout, stderr and the exit status."""
+        tail = Path(f"{self.capture_list}.tail")
+        tail.unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            [OMDROP, "peers", "--json", "-n", "--stream"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        first = proc.stdout.readline()
+        at_end = tail.exists()
+        # From the same buffered pipe: communicate() would skip whatever
+        # readline() has already buffered.
+        with proc:
+            rest, err = proc.stdout.read(), proc.stderr.read()
+        return first, at_end, first + rest, err, proc.returncode
+
+    def test_an_unvetted_senders_forged_row_is_never_shown(self):
+        # The row forged for B comes first and B's own row a second later.
+        # Before, the panel had the forged name to show, and to send to, for
+        # that second; now nothing from the lookup reaches it.
+        for backend, probe in self.UNVETTED.items():
+            with self.subTest(backend=backend):
+                self.env.update(PROBE_JSON=probe, LIST_TAIL_DELAY="1",
+                                PEER_LIST=f"{self.A}  x\n{self.B}  Mallory",
+                                PEER_LIST_TAIL=f"{self.B}  Brent's iPhone")
+
+                first, at_end, out, err, rc = self.stream()
+
+                self.assertTrue(at_end, f"printed before the lookup ended: {first!r}")
+                self.assertEqual(out, "")
+                self.assertEqual(rc, 65, err)
+                self.assertIn("listed twice in one lookup", err)
+
+    def test_an_unvetted_senders_rows_come_once_the_lookup_has_passed(self):
+        for backend, probe in self.UNVETTED.items():
+            with self.subTest(backend=backend):
+                self.env.update(PROBE_JSON=probe, LIST_TAIL_DELAY="1",
+                                PEER_LIST=f"{self.A}  x",
+                                PEER_LIST_TAIL=f"{self.B}  Brent's iPhone")
+
+                first, at_end, out, err, rc = self.stream()
+
+                self.assertTrue(at_end, f"printed before the lookup ended: {first!r}")
+                self.assertEqual(rc, 0, err)
+                rows = [json.loads(line) for line in out.splitlines()]
+                self.assertEqual([(r["mac"], r["name"]) for r in rows], [
+                    ("02:00:00:00:00:0a", "x"),
+                    ("02:00:00:00:00:0b", "Brent's iPhone"),
+                ])
+
+    def test_a_clean_senders_rows_are_shown_as_they_come(self):
+        self.env.update(PROBE_JSON=self.CLEAN, LIST_TAIL_DELAY="2",
+                        PEER_LIST=f"{self.A}  x",
+                        PEER_LIST_TAIL=f"{self.B}  Brent's iPhone")
+
+        first, at_end, out, err, rc = self.stream()
+
+        self.assertFalse(at_end, "the first row waited for the whole lookup")
+        self.assertEqual(json.loads(first)["name"], "x")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([json.loads(line)["name"] for line in out.splitlines()],
+                         ["x", "Brent's iPhone"])
+
+    def test_a_clean_senders_stream_whose_forged_row_came_first_ends_with_exit_65(self):
+        # Should a sender that cleans names still forge a row, it reaches the
+        # panel before B's own row does, so only the exit status can tell the
+        # panel to take its label back.
+        self.env.update(PROBE_JSON=self.CLEAN, PEER_LIST="\n".join([
+            f"{self.A}  x",
+            f"{self.B}  Mallory",
+            f"{self.B}  Brent's iPhone",
+        ]))
+
+        result = self.run_omdrop("peers", "--json", "-n", "--stream")
+
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertIn("listed twice in one lookup", result.stderr)
+        names = [json.loads(line)["name"] for line in result.stdout.splitlines()]
+        self.assertEqual(names, ["x", "Mallory"])
+
+    def test_a_clean_senders_stream_stops_at_a_forged_row(self):
+        self.env.update(PROBE_JSON=self.CLEAN, PEER_LIST="\n".join([
+            f"{self.B}  Brent's iPhone",
+            f"{self.A}  x",
+            f"{self.B}  Mallory",
+        ]))
+
+        result = self.run_omdrop("peers", "--json", "-n", "--stream")
+
+        names = [json.loads(line)["name"] for line in result.stdout.splitlines()]
+        self.assertEqual(names, ["Brent's iPhone", "x"])
+
+    def test_the_json_listing_refuses_a_forged_row(self):
+        self.env["PEER_LIST"] = f"{self.B}  Brent's iPhone\n{self.B}  Mallory"
+
+        result = self.run_omdrop("peers", "--json", "-n")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Mallory", result.stdout)
+        self.assertIn("listed twice in one lookup", result.stderr)
+
+    def test_a_carriage_return_does_not_end_a_row(self):
+        # bash reads rows up to \n; Python's text mode also ended them at \r,
+        # so the panel saw a row the command line never did.
+        self.env["PEER_LIST"] = f"{self.A}  Mallory\r{self.B}  Brent's iPhone"
+
+        result = self.run_omdrop("peers", "--json", "-n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        peers = json.loads(result.stdout)
+        self.assertEqual([p["mac"] for p in peers], ["02:00:00:00:00:0a"])
+        self.assertNotIn("\r", peers[0]["name"])
+
+    def test_names_are_printed_without_control_or_invisible_characters(self):
+        self.env["PEER_LIST"] = f"{self.A}  Studio{self.UNSAFE} Mac \t"
+
+        result = self.run_omdrop("peers", "-n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"{self.A}  Studio Mac\n")
+
+        result = self.run_omdrop("peers", "--json", "-n")
+        self.assertEqual(json.loads(result.stdout)[0]["name"], "Studio Mac")
+
+    def test_a_name_is_cut_to_255_bytes_on_a_character_boundary(self):
+        self.env["PEER_LIST"] = f"{self.A}  {'é' * 200}"
+
+        result = self.run_omdrop("peers", "--json", "-n")
+
+        self.assertEqual(json.loads(result.stdout)[0]["name"], "é" * 127)
+
+    def test_a_name_of_only_unsafe_characters_is_no_name(self):
+        self.env["PEER_LIST"] = f"{self.A}  {self.UNSAFE}"
+
+        result = self.run_omdrop("peers", "--json", "-n")
+
+        self.assertEqual(json.loads(result.stdout)[0]["name"], None)
+
+    def test_heard_from_and_several_devices_print_clean_names(self):
+        self.env.update(OMDROP_NAME_WAIT="5", PEER_LIST="\n".join([
+            f"{self.A}  Studio\x1b[31m Mac{self.UNSAFE}",
+            f"{self.B}  Studio\u202e Phone",
+        ]))
+
+        result = self.run_omdrop("send", "studio", str(self.file))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Heard from Studio[31m Mac.", result.stdout)
+        self.assertIn("Heard from Studio Phone.", result.stdout)
+        self.assertIn("Several devices match", result.stderr)
+        self.assert_clean(result.stdout + result.stderr)
         self.assertFalse(self.capture.exists())
 
 
