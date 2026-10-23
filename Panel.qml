@@ -664,10 +664,12 @@ Panel {
     command: [root.cli, "peers", "--json", "-n", "--stream"]
     property double startedAt: 0
     property bool learnt: false    // this lookup found a name we did not have
-    // The names known when this lookup started. Rows stream in as devices
-    // answer, so a row forged inside another device's name can reach
-    // learnName before the CLI sees the address twice and exits 65; the names
-    // this lookup taught are then put back to these.
+    // The names known when this lookup started. The CLI passes rows on as
+    // devices answer only from a sender that keeps each name on one line, and
+    // otherwise holds them until the whole lookup has passed its check. As a
+    // second guard, should a row forged inside another device's name still
+    // reach learnName before the CLI sees the address twice and exits 65, the
+    // names this lookup taught are put back to these.
     property var namesBefore: ({})
     onStarted: { startedAt = Date.now(); learnt = false; namesBefore = root.peerNames }
     stdout: SplitParser {

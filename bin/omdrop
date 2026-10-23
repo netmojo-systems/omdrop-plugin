@@ -962,6 +962,12 @@ PROBE_TIMEOUT=${OMDROP_PROBE_TIMEOUT:-5}
 # advertiser follow docs/identity-contract.md. Features newer than this are
 # found by asking the sender (`--help`), not by version.
 BACKEND_CONTRACT_MIN=0.7.0
+# The first omdrop-awdl whose sender cleans peer names itself (clean_name in
+# airdrop-send.py: no controls, line or paragraph separators, bidi or
+# zero-width characters, at most 255 bytes). Its names cannot hold a line
+# break, so each line it prints is one peer, and `peers --stream` can pass a
+# row on as it arrives. Any other sender's rows wait for the whole lookup.
+NAMES_CLEAN_VERSION=0.10.1
 # Item IDs the plugin reports itself, and the panel acts on. A backend's own
 # item under one of these names is passed on as backend-<id>, so its sentence
 # still shows but no button offers a fix that cannot fix it.
@@ -1033,6 +1039,17 @@ backend_contract_say() {
   local contract
   contract=$(probe_field contract)
   printf '%s' "The installed radio backend ($(probe_field backend)) follows helper contract ${contract:-none}, older than the $BACKEND_CONTRACT_MIN this version of Omdrop needs. Update its package."
+}
+
+# Whether the sender keeps every peer on one line of its own: omdrop-awdl at
+# NAMES_CLEAN_VERSION or newer, by its probe. No probe, a hung one, another
+# backend, or an older version all count as no.
+sender_names_clean() {
+  radio_probe || return 1
+  [[ "$(probe_field backend)" == awdl ]] || return 1
+  local version
+  version=$(probe_field version)
+  [[ -n "$version" ]] && version_ge "$version" "$NAMES_CLEAN_VERSION"
 }
 
 # For messages that ask for a newer or missing radio helper: what provides
@@ -2443,15 +2460,22 @@ cmd_peers() {
   if (( ${#names[@]} )) && ! "$SENDER" --help 2>&1 | grep -q -- '--names'; then
     die "Looking up peer names needs a newer $(radio_pkg). $(radio_update)"
   fi
-  # --stream: one JSON object per peer on its own line, written the moment
-  # that peer answers, so the panel shows a name seconds after it arrives
-  # rather than when the whole lookup ends. The lookup still runs as its own
-  # process group, so stopping this command stops the sender and its advert.
-  # A driver too old for --stream gives the same lines, all at the end.
+  # --stream: one JSON object per peer on its own line, so the panel shows a
+  # name seconds after it arrives rather than when the whole lookup ends. The
+  # lookup still runs as its own process group, so stopping this command
+  # stops the sender and its advert. A driver too old for --stream gives the
+  # same lines, all at the end.
+  #
+  # A row is written the moment that peer answers only when the sender keeps
+  # each peer on one line (sender_names_clean). From any other sender, a name
+  # with a line break in it can forge a row that is only found out when its
+  # address comes round again, and by then the panel would have shown it; so
+  # the rows are held until the sender exits and all of them have passed.
   if (( stream )); then
-    local sflag=()
+    local sflag=() early=()
     "$SENDER" --help 2>&1 | grep -q -- '--stream' && sflag=(--stream)
-    peers_stream() { "$SENDER" --list "${names[@]}" "${wake[@]}" "${sflag[@]}" | peer_rows --lines; }
+    sender_names_clean && early=(--early)
+    peers_stream() { "$SENDER" --list "${names[@]}" "${wake[@]}" "${sflag[@]}" | peer_rows --lines "${early[@]}"; }
     run_cancellable peers_stream
     return
   fi
@@ -2535,12 +2559,15 @@ cmd_peers() {
 #
 #   --text   the listing, cleaned; other lines kept, cleaned the same way
 #   --json   one JSON array, for `peers --json`
-#   --lines  one JSON object per row as it arrives, for the panel's stream
+#   --lines  one JSON object per row, for the panel's stream: all of them once
+#            the lookup has ended and none was forged, or, with --early, each
+#            as it arrives (for a sender that keeps each peer on one line)
 # The placeholders a lookup prints for a peer that did not answer are not
 # names, so they become null rather than labels on the radar.
 PEER_ROWS_PY='
 import json, re, sys
 mode = sys.argv[1]
+early = sys.argv[2:] == ["--early"]
 row = re.compile(r"((?:[0-9a-f]{2}:){5}[0-9a-f]{2})\s+(-?[0-9]+|\?) dBm\s+\S+\s*")
 unsafe = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]")
 # Unicode White_Space, as omdrop-core trims it.
@@ -2579,7 +2606,7 @@ for raw in iter(sys.stdin.buffer.readline, b""):
         "rssi": None if m.group(2) == "?" else int(m.group(2)),
         "name": None if name in ("", "(no response)", "(anonymous)") else name,
     }
-    if mode == "--lines":
+    if mode == "--lines" and early:
         print(json.dumps(peer), flush=True)
     else:
         peers.append(peer)
@@ -2587,6 +2614,9 @@ if forged:
     sys.exit(65)
 if mode == "--json":
     print(json.dumps(peers))
+elif mode == "--lines":
+    for peer in peers:
+        print(json.dumps(peer), flush=True)
 '
 peer_rows() { python3 -c "$PEER_ROWS_PY" "$@"; }
 

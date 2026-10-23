@@ -89,6 +89,8 @@ if [ "$1" = --list ]; then
   fi
   if [ -n "$PEER_LIST_TAIL" ]; then
     sleep "${LIST_TAIL_DELAY:-0}"
+    # Marks that the lookup has reached its last row.
+    : > "$CAPTURE_LIST.tail"
     printf '%s\\n' "$PEER_LIST_TAIL"
   fi
   exit 0
@@ -112,9 +114,12 @@ echo "    inet6 fe80::1c9a:4bff:fe33:1/64 scope link"
         )
         # Whether a window is open is the radio helper's to say: awdl0 keeps
         # its address after `omdrop off`. WINDOW_JSON replaces the answer.
+        # PROBE_JSON, when set, is the backend's answer to `probe --json`;
+        # otherwise the helper has no probe the plugin can read.
         self.discoverable = self.command(
             "omdrop-discoverable",
             """#!/bin/sh
+[ "$1" = probe ] && [ -n "$PROBE_JSON" ] && { printf '%s\\n' "$PROBE_JSON"; exit 0; }
 [ -n "$WINDOW_JSON" ] && { printf '%s\\n' "$WINDOW_JSON"; exit 0; }
 if [ "${WINDOW:-${RADIO:-up}}" = up ]; then echo '{"visible":true}'; else echo '{"visible":false}'; fi
 """,
@@ -159,6 +164,7 @@ exit 1
             PEER_LIST_LATER="",
             PEER_LIST_TAIL="",
             LIST_TAIL_DELAY="",
+            PROBE_JSON="",
         )
 
     def command(self, name, body):
@@ -899,14 +905,90 @@ class PeerNameTests(SenderFixture):
         for line in result.stdout.splitlines()[1:]:
             self.assertTrue(line.startswith("  "), line)
 
-    def test_a_stream_whose_forged_row_came_first_ends_with_exit_65(self):
-        # The forged row for B reaches the panel before B's own row does, so
-        # only the exit status can tell the panel to take its label back.
-        self.env["PEER_LIST"] = "\n".join([
+    # The panel's lookup, from senders that may pass a line break on inside a
+    # name: a helper with no probe, another backend, and omdrop-awdl before
+    # its sender cleaned names.
+    UNVETTED = {
+        "no probe": "",
+        "another backend": json.dumps({"backend": "owl", "version": "0.2.0", "contract": "0.7.0"}),
+        "omdrop-awdl 0.10.0": json.dumps({"backend": "awdl", "version": "0.10.0", "contract": "0.7.0"}),
+    }
+    # omdrop-awdl from 0.10.1, whose sender keeps each peer on one line.
+    CLEAN = json.dumps({"backend": "awdl", "version": "0.10.1", "contract": "0.7.0"})
+
+    def stream(self):
+        """Runs the panel's lookup and reads it as the panel does. Returns the
+        first line, whether the sender had reached its last row when that
+        line came, then all of stdout, stderr and the exit status."""
+        tail = Path(f"{self.capture_list}.tail")
+        tail.unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            [OMDROP, "peers", "--json", "-n", "--stream"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        first = proc.stdout.readline()
+        at_end = tail.exists()
+        # From the same buffered pipe: communicate() would skip whatever
+        # readline() has already buffered.
+        with proc:
+            rest, err = proc.stdout.read(), proc.stderr.read()
+        return first, at_end, first + rest, err, proc.returncode
+
+    def test_an_unvetted_senders_forged_row_is_never_shown(self):
+        # The row forged for B comes first and B's own row a second later.
+        # Before, the panel had the forged name to show, and to send to, for
+        # that second; now nothing from the lookup reaches it.
+        for backend, probe in self.UNVETTED.items():
+            with self.subTest(backend=backend):
+                self.env.update(PROBE_JSON=probe, LIST_TAIL_DELAY="1",
+                                PEER_LIST=f"{self.A}  x\n{self.B}  Mallory",
+                                PEER_LIST_TAIL=f"{self.B}  Brent's iPhone")
+
+                first, at_end, out, err, rc = self.stream()
+
+                self.assertTrue(at_end, f"printed before the lookup ended: {first!r}")
+                self.assertEqual(out, "")
+                self.assertEqual(rc, 65, err)
+                self.assertIn("listed twice in one lookup", err)
+
+    def test_an_unvetted_senders_rows_come_once_the_lookup_has_passed(self):
+        for backend, probe in self.UNVETTED.items():
+            with self.subTest(backend=backend):
+                self.env.update(PROBE_JSON=probe, LIST_TAIL_DELAY="1",
+                                PEER_LIST=f"{self.A}  x",
+                                PEER_LIST_TAIL=f"{self.B}  Brent's iPhone")
+
+                first, at_end, out, err, rc = self.stream()
+
+                self.assertTrue(at_end, f"printed before the lookup ended: {first!r}")
+                self.assertEqual(rc, 0, err)
+                rows = [json.loads(line) for line in out.splitlines()]
+                self.assertEqual([(r["mac"], r["name"]) for r in rows], [
+                    ("02:00:00:00:00:0a", "x"),
+                    ("02:00:00:00:00:0b", "Brent's iPhone"),
+                ])
+
+    def test_a_clean_senders_rows_are_shown_as_they_come(self):
+        self.env.update(PROBE_JSON=self.CLEAN, LIST_TAIL_DELAY="2",
+                        PEER_LIST=f"{self.A}  x",
+                        PEER_LIST_TAIL=f"{self.B}  Brent's iPhone")
+
+        first, at_end, out, err, rc = self.stream()
+
+        self.assertFalse(at_end, "the first row waited for the whole lookup")
+        self.assertEqual(json.loads(first)["name"], "x")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([json.loads(line)["name"] for line in out.splitlines()],
+                         ["x", "Brent's iPhone"])
+
+    def test_a_clean_senders_stream_whose_forged_row_came_first_ends_with_exit_65(self):
+        # Should a sender that cleans names still forge a row, it reaches the
+        # panel before B's own row does, so only the exit status can tell the
+        # panel to take its label back.
+        self.env.update(PROBE_JSON=self.CLEAN, PEER_LIST="\n".join([
             f"{self.A}  x",
             f"{self.B}  Mallory",
             f"{self.B}  Brent's iPhone",
-        ])
+        ]))
 
         result = self.run_omdrop("peers", "--json", "-n", "--stream")
 
@@ -915,12 +997,12 @@ class PeerNameTests(SenderFixture):
         names = [json.loads(line)["name"] for line in result.stdout.splitlines()]
         self.assertEqual(names, ["x", "Mallory"])
 
-    def test_the_panels_stream_stops_at_a_forged_row(self):
-        self.env["PEER_LIST"] = "\n".join([
+    def test_a_clean_senders_stream_stops_at_a_forged_row(self):
+        self.env.update(PROBE_JSON=self.CLEAN, PEER_LIST="\n".join([
             f"{self.B}  Brent's iPhone",
             f"{self.A}  x",
             f"{self.B}  Mallory",
-        ])
+        ]))
 
         result = self.run_omdrop("peers", "--json", "-n", "--stream")
 
