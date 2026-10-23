@@ -899,6 +899,22 @@ class PeerNameTests(SenderFixture):
         for line in result.stdout.splitlines()[1:]:
             self.assertTrue(line.startswith("  "), line)
 
+    def test_a_stream_whose_forged_row_came_first_ends_with_exit_65(self):
+        # The forged row for B reaches the panel before B's own row does, so
+        # only the exit status can tell the panel to take its label back.
+        self.env["PEER_LIST"] = "\n".join([
+            f"{self.A}  x",
+            f"{self.B}  Mallory",
+            f"{self.B}  Brent's iPhone",
+        ])
+
+        result = self.run_omdrop("peers", "--json", "-n", "--stream")
+
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertIn("listed twice in one lookup", result.stderr)
+        names = [json.loads(line)["name"] for line in result.stdout.splitlines()]
+        self.assertEqual(names, ["x", "Mallory"])
+
     def test_the_panels_stream_stops_at_a_forged_row(self):
         self.env["PEER_LIST"] = "\n".join([
             f"{self.B}  Brent's iPhone",

@@ -664,14 +664,26 @@ Panel {
     command: [root.cli, "peers", "--json", "-n", "--stream"]
     property double startedAt: 0
     property bool learnt: false    // this lookup found a name we did not have
-    onStarted: { startedAt = Date.now(); learnt = false }
+    // The names known when this lookup started. Rows stream in as devices
+    // answer, so a row forged inside another device's name can reach
+    // learnName before the CLI sees the address twice and exits 65; the names
+    // this lookup taught are then put back to these.
+    property var namesBefore: ({})
+    onStarted: { startedAt = Date.now(); learnt = false; namesBefore = root.peerNames }
     stdout: SplitParser {
       onRead: function(line) {
         try { root.learnName(JSON.parse(line)) } catch (e) {}
       }
     }
     property bool stopped: false   // we ended it, so it says nothing about the peers
-    onExited: {
+    onExited: function(code) {
+      if (code === 65) {
+        root.peerNames = namesBefore
+        root.peers = root.peers.map(function(p) {
+          return { mac: p.mac, rssi: p.rssi, name: namesBefore[p.mac] || "" }
+        })
+        learnt = false
+      }
       if (stopped) {
         stopped = false
         if (root.scanning) root.lookUpNames(root.namesRetryMs)
