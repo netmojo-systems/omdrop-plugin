@@ -1,15 +1,16 @@
 """Property lists from untrusted peers, decoded under limits.
 
-A binary plist may reference one object many times. plistlib shares that
-object rather than copying it, so decoding stays cheap, but everything that
-walks the result -- a log line, a repr, an XML dump -- visits every reference.
-A 960 KB /Ask whose Files array names one 60 KB entry 900 000 times decodes in
-milliseconds and then needs 54 GB to log. So the decoded value is measured as
-if each reference were a copy, and refused past the limits omdrop-core's
-safeplist.rs applies while it parses: MAX_EVENTS values, MAX_DEPTH nested
-collections, and byte_budget() decoded bytes. A reference cycle, which a
-binary plist can also express, fails the depth limit.
+A binary plist may reference one object many times, or give one object many
+IDs. plistlib shares an object referenced by one ID, so walking the result --
+a log line, a printed name, an XML dump -- visits every reference, and it
+builds an object afresh for each ID, so decoding itself can allocate far more
+than the input. Both are bounded by the limits omdrop-core's safeplist.rs
+applies while it parses: MAX_EVENTS values, MAX_DEPTH nested collections, and
+byte_budget() decoded bytes, with every reference counted as a copy. A binary
+plist is stopped while it is decoded; a reference cycle fails the depth limit.
+The same module is omdrop-awdl's userspace/awdl_plist.py.
 """
+import io
 import plistlib
 
 # Values (and collection ends) one plist may hold. A real Ask with 512 files
@@ -71,9 +72,81 @@ def _measure(root, budget):
             raise TooComplex()
 
 
+class _BoundedBinaryParser(plistlib._BinaryPlistParser):
+    """plistlib's binary parser, stopped as soon as the plist it is building
+    passes the limits, rather than measured afterwards.
+
+    plistlib caches a decoded object by its ID, but a binary plist can give
+    one object many IDs: 1000 IDs naming one 200 000-member array make
+    plistlib build 1000 separate lists (1.6 GB) from a 400 KB input. And it
+    reads a collection's whole reference list before its first member, at
+    every nesting level: 34 nested arrays whose reference lists overlap held
+    13 MB of pending references for a 21 KB input. So every reference is
+    charged as a value when its list is read, before plistlib builds the
+    list, and every object's size when it is built: nothing is allocated
+    past MAX_EVENTS references or the byte budget."""
+
+    def __init__(self, input_len):
+        super().__init__(dict_type=dict)
+        self._input_len = input_len
+        self._budget = byte_budget(input_len)
+        self._events = 1  # the top object, which no reference names
+        self._decoded = self._depth = 0
+        self.too_complex = False
+
+    def _refuse(self):
+        # parse() turns every ValueError into InvalidFileException; the flag
+        # lets loads() say which it was.
+        self.too_complex = True
+        raise TooComplex()
+
+    def _read_ints(self, n, size):
+        # n is the peer's count. Before 3.13, plistlib builds a struct format n
+        # characters long before checking that the bytes are there.
+        if n * size > self._input_len:
+            raise plistlib.InvalidFileException()
+        return super()._read_ints(n, size)
+
+    def _read_refs(self, n):
+        # A collection's members (a dictionary reads its keys and its values
+        # as two lists), charged before the list exists. Each is read later
+        # by _read_object, from the cache or not, so each costs one value.
+        self._events += n
+        if self._events > MAX_EVENTS:
+            self._refuse()
+        return super()._read_refs(n)
+
+    def _read_object(self, ref):
+        # One past MAX_DEPTH: the exact depth limit is _measure's, after.
+        if self._depth > MAX_DEPTH:
+            self._refuse()
+        self._depth += 1
+        try:
+            value = super()._read_object(ref)
+        finally:
+            self._depth -= 1
+        self._decoded += _size(value)
+        if self._decoded > self._budget:
+            self._refuse()
+        return value
+
+
 def loads(data):
     """plistlib.loads, refusing a value whose references expand past the
-    limits above with TooComplex (a ValueError)."""
-    value = plistlib.loads(data)
+    limits above with TooComplex (a ValueError). A binary plist is refused
+    while it is decoded; an XML one, which cannot share objects, decodes to
+    about its own size and is measured after."""
+    if data[:8] == b'bplist00':
+        parser = _BoundedBinaryParser(len(data))
+        try:
+            value = parser.parse(io.BytesIO(data))
+        except plistlib.InvalidFileException:
+            if parser.too_complex:
+                raise TooComplex() from None
+            raise
+    else:
+        value = plistlib.loads(data)
+    # Exact limits, the same for both formats, and a reference cycle, which
+    # the parser returns from its cache, fails the depth limit.
     _measure(value, byte_budget(len(data)))
     return value
