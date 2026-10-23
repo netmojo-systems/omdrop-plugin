@@ -48,7 +48,7 @@ If the change affects how Omdrop talks to an Apple device, show the behaviour be
 
 ### omdrop-core
 
-`core/` holds omdrop-core, the same programs in Rust, as one Cargo workspace. Omdrop runs it wherever the radio backend supports it; today that is omdrop-awdl and omdrop-bcm4360, and omdrop-owl follows once it ships core's hooks (#73). Other backends run the bash and Python programs. Core builds and installs as its own package; nothing in it runs from the plugin's clone. Users install it with `omdrop install-core`, which `omdrop setup` and `omdrop doctor` offer with a supported backend, and which builds this `core/` with makepkg when no repository carries its version. Its tests run as an ordinary user, never root:
+`core/` holds omdrop-core, the same programs in Rust, as one Cargo workspace. Omdrop runs it wherever the radio backend supports it; today that is omdrop-awdl and omdrop-bcm4360. omdrop-owl ships core's hooks since 0.4.0, so an installed core runs on it, but `setup` and `doctor` don't offer core there until it has been tested on owl hardware (#73). Other backends run the bash and Python programs. Core builds and installs as its own package; nothing in it runs from the plugin's clone. Users install it with `omdrop install-core`, which `omdrop setup` and `omdrop doctor` offer with a supported backend, and which builds this `core/` with makepkg when no repository carries its version. Its tests run as an ordinary user, never root:
 
 ```bash
 cd core

@@ -22,8 +22,9 @@ executable per hook in the fixed, root-owned directory
 
 Backends conflict with each other at the package level, so only one is ever
 installed. Hooks can be written in any language. Today's backends are
-omdrop-awdl (Broadcom firmware AWDL on Apple Silicon Macs) and omdrop-owl
-(userspace AWDL through OWL on other Wi-Fi cards).
+omdrop-awdl (Broadcom firmware AWDL on Apple Silicon Macs) and omdrop-owl,
+from Owly (userspace AWDL through Owly's radio service, `owlyd`, on other Wi-Fi
+cards; its hooks are D-Bus clients of `owlyd`).
 
 ## Summary
 
@@ -112,12 +113,12 @@ group and its leader's start time in `hook.pgid`. If the supervisor is
 killed outright, `stop` (or the next `start`) kills that group, after
 checking that its leader is still the recorded process.
 
-A hook may leave a long-lived process running (omdrop-owl's `up` starts the
-OWL daemon). That process must start its own session (`setsid`), so the group
-kill on a later timeout does not reach it, and it must not keep the hook's
-stdout or stderr open. Core stops reading a hook's output 1 s after the hook
-exits, whether or not the pipes have closed. `down` must stop any such
-process.
+A hook may leave a long-lived process running (omdrop-owl before 0.4.0 started
+the OWL daemon in `up`). That process must start its own session (`setsid`),
+so the group kill on a later timeout does not reach it, and it must not keep
+the hook's stdout or stderr open. Core stops reading a hook's output 1 s after
+the hook exits, whether or not the pipes have closed. `down` must stop any
+such process.
 
 `start` as a whole returns within **720 s**, its bound for callers: the
 window lock (10 s) and a wait for a closing window (90 s), then `probe`,

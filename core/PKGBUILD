@@ -81,8 +81,9 @@ package() {
   # `omdrop` too, off PATH: the plugin's own `omdrop` is the one entry point,
   # so it can apply CORE_MIN and OMDROP_IMPLEMENTATION before core runs. A
   # core at /usr/bin/omdrop would come before the plugin's ~/.local/bin/omdrop
-  # and skip both. It moves to /usr/bin/omdrop only once omdrop-owl runs on
-  # core and cores older than the plugin's hand-off are gone.
+  # and skip both. It moves to /usr/bin/omdrop only once core is offered on
+  # every backend that ships its hooks (omdrop-owl is not yet) and cores older
+  # than the plugin's hand-off are gone.
   local lib="${pkgdir}/usr/lib/omdrop-core" prog
   for prog in omdrop omdrop-radio omdrop-receiver omdrop-adv airdrop-send send-to-peer; do
     install -Dm755 "${bin}/${prog}" "${lib}/${prog}"

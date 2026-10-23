@@ -70,8 +70,9 @@ version_ge() {
 # applies CORE_MIN and OMDROP_IMPLEMENTATION before core runs. When a core
 # this plugin can use is installed, every command goes to it, and
 # `exec -a "$0"` lets core find this plugin through the path we were run as.
-# Core moves to /usr/bin/omdrop only once omdrop-owl runs on it and cores
-# older than this hand-off are gone.
+# Core moves to /usr/bin/omdrop only once it is offered on every backend that
+# ships its hooks (omdrop-owl is not yet) and cores older than this hand-off
+# are gone.
 # OMDROP_IMPLEMENTATION picks the stack: python keeps this script and the
 # Python programs; rust requires a usable core; unset uses core when a usable
 # one is installed. Anything else is refused, so a typo cannot quietly pick a
@@ -99,10 +100,12 @@ version_ge() {
 # while the Python receiver beside this script has the renewed one.
 #
 # Core also needs a radio backend that ships its hooks (core's
-# docs/backend-contract.md): omdrop-awdl from 0.10.0 does, omdrop-owl does not
-# yet. Without them this script and the Python programs run, so a core that
-# arrives with the omdrop package never drives a backend it has not been
-# tested with. The check is one file test. OMDROP_HOOKS moves it for tests.
+# docs/backend-contract.md): omdrop-awdl from 0.10.0 does, and so does
+# omdrop-owl from 0.4.0. Without them this script and the Python programs run.
+# Hooks are enough for a core that is already installed to run, but
+# core_supported decides where it is offered, and that is only where it has
+# been tested: omdrop-awdl so far. The check is one file test. OMDROP_HOOKS
+# moves it for tests.
 CORE_MIN=0.1.7
 CORE_TOO_OLD=
 CORE_NO_HOOKS=

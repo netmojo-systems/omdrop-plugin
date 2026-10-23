@@ -112,8 +112,9 @@ class CoreHandoffTests(unittest.TestCase):
         self.assert_handed_off(self.run_omdrop("version", OMDROP_IMPLEMENTATION="rust"))
 
     def test_a_backend_without_hooks_keeps_the_bash(self):
-        # omdrop-owl ships no hooks yet: a core that came with the omdrop
-        # package must not drive it.
+        # A backend without hooks (omdrop-owl before 0.4.0, or one that never
+        # ships them): a core that came with the omdrop package must not
+        # drive it.
         (self.hooks / "probe").unlink()
         self.assert_ran_here(self.run_omdrop("version"))
 
