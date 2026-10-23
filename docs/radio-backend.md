@@ -80,18 +80,20 @@ taken for omdrop-awdl, and `omdrop install-driver` refuses to run.
 
 ### Item IDs
 
-`driver`, `library` and `service` belong to the plugin, and the panel acts on
-them: it offers its install button for `driver` and `library`, and that button
-runs `omdrop install-driver`, which can't fix anything of a backend's. A
-backend's item under one of these IDs is shown as `backend-<id>`, without the
-button. Use your own IDs instead, such as `radio`.
+`driver`, `library`, `service` and `firewall` belong to the plugin, and the
+panel acts on them: it offers its install button for `driver`, `library` and
+`firewall`, and that button runs `omdrop install-driver`, which can't fix
+anything of a backend's. A backend's item under one of these IDs is shown as
+`backend-<id>`, without the button. Use your own IDs instead, such as `radio`.
 
 The plugin adds its own items after the backend's: `library` (the receiver's
-packages) and `service` (the receiving service). It reports `backend` itself
-when the probe doesn't answer or the contract is too old.
+packages), `service` (the receiving service) and `firewall` (UFW drops
+incoming traffic and no rule admits the receiver's). It reports `backend`
+itself when the probe doesn't answer or the contract is too old.
 
 With any other probing backend, `omdrop install-driver` installs only what belongs to
-the plugin: the receiver's packages, and its firewall rule when ufw is active.
+the plugin: the receiver's packages, and its firewall rule when ufw is active
+and its rules don't already have it.
 The backend is a package of its own, installed before the plugin can ask it
 anything, so messages that ask for a newer helper name the backend's package
 instead of `omdrop install-driver`.

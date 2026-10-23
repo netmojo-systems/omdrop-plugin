@@ -965,7 +965,7 @@ BACKEND_CONTRACT_MIN=0.7.0
 # Item IDs the plugin reports itself, and the panel acts on. A backend's own
 # item under one of these names is passed on as backend-<id>, so its sentence
 # still shows but no button offers a fix that cannot fix it.
-PLUGIN_ITEM_IDS="driver library service"
+PLUGIN_ITEM_IDS="driver library service firewall"
 
 # RADIO_PROBE: empty until asked, then `none` (omdrop-awdl), `hung` (a helper
 # that did not answer in time) or the probe's JSON. A hung helper still counts
@@ -1070,6 +1070,7 @@ prereqs_missing() {
     receiver_libs_installed \
       || printf 'library\t%s\n' "Packages the receiver needs ($RECEIVER_PKGS) are not installed. The button below installs them."
     have_unit || printf 'service\t%s\n' "The service that receives files is not installed yet. Turning Omdrop on installs it."
+    firewall_missing && printf 'firewall\t%s\n' "$FIREWALL_SAY"
     return 0
   fi
   # First, and alone: nothing else on this list can be fixed on this machine.
@@ -1085,6 +1086,8 @@ prereqs_missing() {
     printf 'radio\t%s\n' "The driver is installed but its Apple-compatible radio is not running yet, so nobody can see this computer. Restarting usually brings it up."
   fi
   have_unit || printf 'service\t%s\n' "The service that receives files is not installed yet. Turning Omdrop on installs it."
+  firewall_missing && printf 'firewall\t%s\n' "$FIREWALL_SAY"
+  return 0
 }
 
 # `doctor` is the panel's version of the same answer. --json so the widget can
@@ -1143,6 +1146,80 @@ ufw_active() {
   command -v ufw >/dev/null 2>&1 \
     && systemctl is-active --quiet ufw.service
 }
+
+# UFW keeps each rule in its rules file as a `### tuple ###` line, which
+# unlike `ufw status` takes no root to read. Ours, as `ufw` writes it:
+#   ### tuple ### allow tcp 8771 fe80::/10 any fe80::/10 in_awdl0 comment=…
+# OMDROP_UFW_ETC stands in for /etc in the tests.
+UFW_TUPLE='### tuple ### allow tcp 8771 fe80::/10 any fe80::/10 in_awdl0'
+
+# Whether our rule is in UFW's rules: present, absent, or unknown when the
+# file can't be read.
+ufw_rule_state() {
+  local rules="${OMDROP_UFW_ETC:-/etc}/ufw/user6.rules" rc=0
+  [[ -r "$rules" ]] || { echo unknown; return 0; }
+  grep -qE "^${UFW_TUPLE}( |\$)" "$rules" || rc=$?
+  case $rc in
+    0) echo present ;;
+    1) echo absent ;;
+    *) echo unknown ;;
+  esac
+}
+
+# Whether UFW lets senders reach the receiver: yes, no, or unknown when its
+# files can't be read. Yes when incoming traffic isn't dropped by default, or
+# when any allow (or limit) rule could admit TCP 8771 on awdl0: ours, or a
+# broader one such as `ufw allow 8771/tcp` or `ufw allow in on awdl0`. Rule
+# addresses aren't compared, so a rule that might match counts as one that
+# does: a false "blocked" would send someone to fix a working receiver.
+ufw_admits_receiver() {
+  UFW_ETC="${OMDROP_UFW_ETC:-/etc}" python3 -c '
+import os, re, sys
+etc = os.environ["UFW_ETC"]
+try:
+    policy = open(etc + "/default/ufw").read()
+    rules = open(etc + "/ufw/user6.rules").read()
+except OSError:
+    sys.exit(print("unknown"))
+m = re.search(r"^DEFAULT_INPUT_POLICY=\"?([A-Z]+)\"?\s*$", policy, re.M)
+if not m:
+    sys.exit(print("unknown"))
+if m.group(1) not in ("DROP", "REJECT"):
+    sys.exit(print("yes"))
+def covers(ports):
+    for p in ports.split(","):
+        lo, _, hi = p.partition(":")
+        hi = hi or lo
+        if p == "any" or (lo.isdigit() and hi.isdigit() and int(lo) <= 8771 <= int(hi)):
+            return True
+    return False
+for line in rules.splitlines():
+    if not line.startswith("### tuple ### "):
+        continue
+    # action proto dport dst sport src [dapp sapp] direction[_iface]
+    f = line[14:].split(" comment=")[0].split()
+    if (len(f) in (7, 9) and f[0].split("_")[0] in ("allow", "limit")
+            and f[1] in ("tcp", "any") and covers(f[2]) and f[-1] in ("in", "in_awdl0")):
+        sys.exit(print("yes"))
+print("no")'
+}
+
+# A blocker only when it certainly is one: UFW on and enforcing, and nothing
+# in its rules admitting the receiver. ufw.service stays active after
+# `ufw disable`, which only sets ENABLED=no, so that is checked too.
+firewall_missing() {
+  ufw_active \
+    && grep -qx 'ENABLED=yes' "${OMDROP_UFW_ETC:-/etc}/ufw/ufw.conf" 2>/dev/null \
+    && [[ "$(ufw_admits_receiver)" == no ]]
+}
+
+# Whether install-driver adds the rule: whenever UFW is active and the rule
+# isn't known to be there. `ufw allow` skips a rule it already has.
+firewall_needed() {
+  ufw_active && [[ "$(ufw_rule_state)" != present ]]
+}
+
+FIREWALL_SAY="UFW is blocking AirDrop: Apple devices can find this computer but not connect to its receiver. The button below adds the one rule it needs."
 
 cmd_firewall() {
   local action=${1:-}
@@ -1204,6 +1281,11 @@ cmd_install_driver() {
     return
   fi
   if [[ -x "$DISCOVERABLE" ]] && driver_current && receiver_libs_installed; then
+    # The firewall rule is still Omdrop's to add, as install_for_backend adds it.
+    if firewall_needed; then
+      install_firewall_only
+      return
+    fi
     echo "The driver and the Python library the receiver needs are both installed and current. Nothing to do."
     return 0
   fi
@@ -1264,7 +1346,7 @@ git -C '$src' checkout --detach e7891ab56957dde46f134c1991e4e4717f94d2e4 && make
   # Keep the receiver's firewall policy in this plugin, not in the reusable
   # driver package. Running it in the same terminal means sudo normally reuses
   # the authentication from pacman/makepkg instead of asking a second time.
-  if ufw_active; then
+  if firewall_needed; then
     build="$build
 $self_q firewall install"
   fi
@@ -1288,6 +1370,20 @@ $self_q firewall install"
   launch_install "$build" "Omdrop requires a patched wifi driver, which requires administrative privilege to install. You will be prompted for your password."
 }
 
+# The driver and the receiver's packages are current: only the firewall rule
+# remains, run the same way as the driver install.
+install_firewall_only() {
+  local build="set -e
+$self_q firewall install"
+  if ! command -v omarchy-launch-floating-terminal-with-presentation >/dev/null 2>&1; then
+    echo "Add the firewall rule the receiver needs with:"
+    printf '\n%s\n\n' "$build"
+    return 0
+  fi
+  echo "Opening a terminal to add the firewall rule the receiver needs."
+  launch_install "$build" "Omdrop needs a firewall rule for its receiver, which requires administrative privilege to add. You will be prompted for your password."
+}
+
 # With a radio backend that probes, the radio is that package's business: it
 # is installed (it answered), and it reports its own blockers through doctor.
 # What remains is this plugin's own part, the receiver's packages and its
@@ -1302,7 +1398,7 @@ install_for_backend() {
   backend_contract_ok || echo "$(backend_contract_say)" >&2
   receiver_libs_installed || build="$build
 sudo pacman -S --needed --asdeps $RECEIVER_PKGS"
-  ufw_active && build="$build
+  firewall_needed && build="$build
 $self_q firewall install"
   if [[ "$build" == "set -e" ]]; then
     echo "The receiver's packages are installed and the radio comes from $(probe_field backend) $(probe_field version). Nothing to do."

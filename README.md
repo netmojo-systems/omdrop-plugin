@@ -218,7 +218,7 @@ The radio helper, `/usr/lib/omdrop/omdrop-discoverable`, runs as root through `p
 
 With omdrop-core installed, its root helper, `/usr/lib/omdrop-core/omdrop-radio`, runs as root instead, through polkit action `org.omarchy.omdrop.radio`, with the same password rules. It runs the radio backend's hooks in `/usr/lib/omdrop/radio/`, and the backend's `omdrop-discoverable` when there are none.
 
-The receiver runs as you, so received files are yours. The firewall rule is added with `sudo ufw` in the install terminal, which normally reuses that terminal's earlier authentication.
+The receiver runs as you, so received files are yours. The firewall rule is added with `sudo ufw` in the install terminal, which normally reuses that terminal's earlier authentication. If UFW drops incoming traffic and no rule lets the receiver's through, for example because UFW was turned on after Omdrop was installed, `omdrop doctor` and the panel say so, and the panel's button adds the rule. They read `/etc/default/ufw` and `/etc/ufw/user6.rules` to tell, which needs no root.
 
 The AirDrop identity is kept in `~/.omdrop/keys`, or in 1Password; see [Your AirDrop identity](#your-airdrop-identity). If `~/.opendrop/keys` exists and `~/.omdrop` doesn't, Omdrop copies it there once and leaves the original in place for OpenDrop.
 

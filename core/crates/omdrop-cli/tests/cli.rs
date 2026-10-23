@@ -1245,7 +1245,22 @@ impl Radio {
                 .join("bin/omarchy-launch-floating-terminal-with-presentation"),
             "#!/bin/sh\nprintf '%s\\n' \"$1\"\n",
         );
-        let env = vec![("OMDROP_SYSFS".to_string(), sys.display().to_string())];
+        // UFW's own files are the test's: enforcing, dropping incoming
+        // traffic by default, and no rules file, so whether the rule is there
+        // can't be told until a test writes one.
+        let etc = f.root.join("etc");
+        std::fs::create_dir_all(etc.join("ufw")).unwrap();
+        std::fs::create_dir_all(etc.join("default")).unwrap();
+        std::fs::write(etc.join("ufw/ufw.conf"), "ENABLED=yes\nLOGLEVEL=low\n").unwrap();
+        std::fs::write(
+            etc.join("default/ufw"),
+            "IPV6=yes\nDEFAULT_INPUT_POLICY=\"DROP\"\n",
+        )
+        .unwrap();
+        let env = vec![
+            ("OMDROP_SYSFS".to_string(), sys.display().to_string()),
+            ("OMDROP_UFW_ETC".to_string(), etc.display().to_string()),
+        ];
         Self { f, env }
     }
 
@@ -1850,6 +1865,160 @@ fn a_current_driver_with_ufw_inactive_has_nothing_to_do() {
         write_exec(&r.f.root.join("bin/ufw"), "#!/bin/sh\nexit 0\n");
         let out = r.run(&["install-driver"]);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(
+            text(&out.stdout),
+            "The driver and the Python library the receiver needs are both installed and current. Nothing to do.\n",
+            "{probe:?}"
+        );
+    }
+}
+
+/// The receiver's rule as `ufw` writes it into user6.rules, comment and all.
+const RECEIVER_TUPLE: &str = "### tuple ### allow tcp 8771 fe80::/10 any fe80::/10 in_awdl0 comment=4f6d64726f702041697244726f70207265636569766572";
+const SSH_TUPLE: &str = "### tuple ### allow tcp 22 0.0.0.0/0 any 0.0.0.0/0 in";
+
+fn ufw_rules(r: &Radio, tuples: &[&str]) {
+    let mut text = String::from("*filter\n");
+    for t in tuples {
+        text.push_str(t);
+        text.push('\n');
+    }
+    text.push_str("COMMIT\n");
+    std::fs::write(r.f.root.join("etc/ufw/user6.rules"), text).unwrap();
+}
+
+/// A radio backend with nothing missing, and UFW on: the plugin's own items
+/// are all doctor can report.
+fn ready_owl_behind_ufw() -> Radio {
+    let r = Radio::new();
+    r.helper(&backend_helper(Some(owl(serde_json::json!([])))));
+    with_ufw_active(&r);
+    r
+}
+
+#[test]
+fn ufw_enforcing_without_the_receivers_rule_is_reported_last() {
+    let r = ready_owl_behind_ufw();
+    ufw_rules(&r, &[SSH_TUPLE]);
+    let doctor = r.doctor();
+    let last = doctor["missing"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(last["id"], "firewall");
+    assert!(
+        last["say"]
+            .as_str()
+            .unwrap()
+            .contains("Apple devices can find this computer but not connect"),
+        "{last}"
+    );
+}
+
+#[test]
+fn the_firewall_is_reported_only_when_ufw_certainly_drops_the_receiver() {
+    let rule_there = ready_owl_behind_ufw();
+    ufw_rules(&rule_there, &[SSH_TUPLE, RECEIVER_TUPLE]);
+    let unreadable = ready_owl_behind_ufw();
+    let no_policy = ready_owl_behind_ufw();
+    ufw_rules(&no_policy, &[SSH_TUPLE]);
+    std::fs::remove_file(no_policy.f.root.join("etc/default/ufw")).unwrap();
+    let accepting = ready_owl_behind_ufw();
+    ufw_rules(&accepting, &[SSH_TUPLE]);
+    std::fs::write(
+        accepting.f.root.join("etc/default/ufw"),
+        "DEFAULT_INPUT_POLICY=\"ACCEPT\"\n",
+    )
+    .unwrap();
+    let disabled = ready_owl_behind_ufw();
+    ufw_rules(&disabled, &[SSH_TUPLE]);
+    std::fs::write(disabled.f.root.join("etc/ufw/ufw.conf"), "ENABLED=no\n").unwrap();
+    let inactive = Radio::new();
+    inactive.helper(&backend_helper(Some(owl(serde_json::json!([])))));
+    write_exec(&inactive.f.root.join("bin/ufw"), "#!/bin/sh\nexit 0\n");
+    ufw_rules(&inactive, &[SSH_TUPLE]);
+    for (name, r) in [
+        ("the rule is there", rule_there),
+        ("the rules can't be read", unreadable),
+        ("the default policy can't be read", no_policy),
+        ("incoming traffic is accepted by default", accepting),
+        ("ufw is disabled", disabled),
+        ("ufw.service is inactive", inactive),
+    ] {
+        assert!(!r.ids().contains(&"firewall".to_string()), "{name}");
+    }
+}
+
+#[test]
+fn a_broader_rule_that_admits_the_receiver_is_enough() {
+    for broader in [
+        "### tuple ### allow tcp 8771 ::/0 any ::/0 in",
+        "### tuple ### allow any any ::/0 any ::/0 in_awdl0",
+        "### tuple ### allow tcp 8000:9000 ::/0 any ::/0 in",
+        "### tuple ### allow tcp 80,443,8771 ::/0 any ::/0 in",
+        "### tuple ### limit tcp 8771 ::/0 any ::/0 in",
+        "### tuple ### allow_log tcp 8771 ::/0 any ::/0 in",
+    ] {
+        let r = ready_owl_behind_ufw();
+        ufw_rules(&r, &[SSH_TUPLE, broader]);
+        assert!(!r.ids().contains(&"firewall".to_string()), "{broader}");
+    }
+}
+
+#[test]
+fn a_rule_that_cant_admit_the_receiver_doesnt_count() {
+    for other in [
+        RECEIVER_TUPLE.replace(" 8771 ", " 87710 "),
+        RECEIVER_TUPLE.replace(" 8771 ", " 8772:9000 "),
+        RECEIVER_TUPLE.replace("in_awdl0", "in_awdl01"),
+        RECEIVER_TUPLE.replace("in_awdl0", "out_awdl0"),
+        RECEIVER_TUPLE.replace(" tcp ", " udp "),
+        RECEIVER_TUPLE.replace("allow", "deny"),
+    ] {
+        let r = ready_owl_behind_ufw();
+        ufw_rules(&r, &[&other]);
+        assert!(r.ids().contains(&"firewall".to_string()), "{other}");
+    }
+}
+
+#[test]
+fn install_adds_the_rule_unless_it_is_known_to_be_there() {
+    for (rules, adds) in [
+        (Some(&[SSH_TUPLE][..]), true),
+        (None, true),
+        (Some(&[SSH_TUPLE, RECEIVER_TUPLE][..]), false),
+    ] {
+        let r = ready_owl_behind_ufw();
+        if let Some(rules) = rules {
+            ufw_rules(&r, rules);
+        }
+        let out = r.run(&["install-driver"]);
+        let stdout = text(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        assert_eq!(
+            stdout.contains(" firewall install"),
+            adds,
+            "{rules:?}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_current_driver_with_the_rule_in_place_has_nothing_to_do() {
+    if !receiver_libs_here() {
+        eprintln!("this machine lacks the receiver's packages; nothing would be current");
+        return;
+    }
+    for probe in [None, Some(awdl_hooks(serde_json::json!([])))] {
+        let r = Radio::new();
+        r.helper(&backend_helper(probe.clone()));
+        on_a_mac(&r);
+        with_driver(&r, Some("0.10.0-1"));
+        with_ufw_active(&r);
+        ufw_rules(&r, &[SSH_TUPLE, RECEIVER_TUPLE]);
+        let out = r.run(&["install-driver"]);
         assert_eq!(
             text(&out.stdout),
             "The driver and the Python library the receiver needs are both installed and current. Nothing to do.\n",

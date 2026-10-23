@@ -274,8 +274,10 @@ Panel {
     }
     return "Nearby Apple devices should see " + who + " in AirDrop, after 10 seconds."
   }
-  // An empty allow-list is a window nobody can use, so it reads as a fault.
-  readonly property bool detailUrgent: detailText === visibleText && audience === "contacts" && senders === 0
+  // An empty allow-list is a window nobody can use, so it reads as a fault, as
+  // does a firewall that drops every sender.
+  readonly property bool detailUrgent: (detailText === visibleText && audience === "contacts" && senders === 0)
+                                       || (firewallText !== "" && detailText === firewallText)
 
   readonly property string detailText: {
     if (!usable) return doctorText !== "" ? doctorText
@@ -284,6 +286,7 @@ Panel {
     if (lastError !== "") return lastError
     if (reasonText !== "") return reasonText
     if (!receiving) return "Nearby Apple devices cannot see this computer."
+    if (firewallText !== "") return firewallText
     if (visibility === 0) return "The receiver is up, but nothing is advertising on the radio."
     if (visibility === -1) return "Cannot tell whether anyone can see us."
     return visibleText
@@ -895,6 +898,10 @@ Panel {
   // Only when we cannot work: a healthy panel never spawns this.
   property string doctorText: ""
   property bool driverInstallable: false
+  // UFW dropping every sender is the one blocker a working panel can't see:
+  // the radio is up and advertising. doctor is asked again each time Omdrop
+  // turns on, and its firewall item shown while receiving.
+  property string firewallText: ""
   Process {
     id: doctorProc
     command: [root.cli, "doctor", "--json"]
@@ -910,9 +917,12 @@ Panel {
           root.driverInstallable = missing.some(function(m) {
             return m.id === "driver" || m.id === "library"
           })
+          var firewall = missing.filter(function(m) { return m.id === "firewall" })
+          root.firewallText = firewall.length ? firewall[0].say : ""
         } catch (e) {
           root.doctorText = ""
           root.driverInstallable = false
+          root.firewallText = ""
         }
       }
     }
@@ -923,13 +933,19 @@ Panel {
   Process {
     id: installDriverProc
     command: [root.cli, "install-driver"]
-    onExited: { root.doctorText = ""; root.refreshStatus() }
+    onExited: {
+      root.doctorText = ""
+      // The terminal has closed; a rule added there clears the item.
+      if (root.firewallText !== "" && !doctorProc.running) doctorProc.running = true
+      root.refreshStatus()
+    }
   }
 
   function applyStatus(text) {
     try {
       var s = JSON.parse(text)
       installed = true
+      var wasReceiving = receiving
       receiving = !!s.receiving
       visibility = (s.visible === null || s.visible === undefined) ? -1 : (s.visible ? 1 : 0)
       remaining = (s.remaining === null || s.remaining === undefined) ? -1 : s.remaining
@@ -943,6 +959,7 @@ Panel {
       if (!nameField.activeFocus) nameField.text = shownName
       // Asked once per transition into unusable, not on every poll.
       if (!usable && doctorText === "" && !doctorProc.running) doctorProc.running = true
+      if (usable && receiving && !wasReceiving && !doctorProc.running) doctorProc.running = true
       if (usable) { doctorText = ""; driverInstallable = false }
     } catch (e) {
       installed = false
@@ -1130,10 +1147,14 @@ Panel {
         // doctor reports is either a command (`omdrop setup`) or a restart, so
         // only the missing driver gets a button -- and it opens a terminal
         // rather than installing anything quietly. Installing a kernel module
-        // is the user's decision, taken at their own sudo prompt.
+        // is the user's decision, taken at their own sudo prompt. The firewall
+        // rule takes the same press: install-driver adds it, and only it, once
+        // everything else is current.
         Button {
-          visible: root.driverInstallable
-          text: "Install the Wi-Fi driver"
+          readonly property bool firewall: !root.driverInstallable && root.usable
+                                           && root.receiving && root.firewallText !== ""
+          visible: root.driverInstallable || firewall
+          text: firewall ? "Add the firewall rule" : "Install the Wi-Fi driver"
           bordered: true
           foreground: root.foreground
           onClicked: installDriverProc.running = true
