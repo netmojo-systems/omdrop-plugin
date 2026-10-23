@@ -834,21 +834,51 @@ fn log_labels_leave_no_room_for_forgery() {
     assert_eq!(transfer_label("x: stored /etc/passwd"), "xstoredetcpasswd");
     assert_eq!(transfer_label("..."), "upload");
     assert_eq!(transfer_label(&"a".repeat(100)).len(), 64);
-    let names: Vec<String> = (0..512)
-        .map(|i| format!("{i:03}{}", "n".repeat(250)))
-        .collect();
-    let lines = stored_lines(&names);
-    assert!(lines.len() > 1);
-    assert!(lines.iter().all(|l| l.len() <= MAX_STORED_LINE_BYTES));
-    let rejoined: Vec<String> = lines
-        .iter()
-        .flat_map(|l| l.split(", ").map(str::to_string))
-        .collect();
-    assert_eq!(rejoined, names);
+}
+
+/// One record per stored name: a name holding `, ` is never split, and 200
+/// names of about 200 bytes are all named, each under the log's cap.
+#[test]
+fn each_stored_name_has_a_record_of_its_own() {
+    assert_eq!(stored_records("T-1", &[]), ["upload T-1: stored "]);
     assert_eq!(
-        stored_lines(&["a.txt".into(), "b.txt".into()]),
-        ["a.txt, b.txt"]
+        stored_records("T-1", &["private.png, sent.txt".into()]),
+        ["upload T-1: stored private.png, sent.txt"]
     );
+    assert_eq!(
+        stored_records("T-1", &["a.txt".into(), "b, c.txt".into()]),
+        [
+            "upload T-1 (1/2): stored a.txt",
+            "upload T-1 (2/2): stored b, c.txt"
+        ]
+    );
+    let names: Vec<String> = (0..200)
+        .map(|i| format!("{i:03}, {}.jpg", "n".repeat(196)))
+        .collect();
+    let records = stored_records("T-1", &names);
+    assert_eq!(records.len(), 200);
+    for (k, (record, name)) in records.iter().zip(&names).enumerate() {
+        assert_eq!(
+            *record,
+            format!("upload T-1 ({}/200): stored {name}", k + 1)
+        );
+        assert_eq!(crate::log::escape(record), *record);
+    }
+}
+
+/// A line separator in a received name would be escaped in the log, which
+/// would then name a file that does not exist: it is dropped when stored.
+#[test]
+fn a_name_with_a_line_separator_is_stored_and_logged_without_it() {
+    let fx = start(false, |_| {});
+    let mut c = connect(&fx, false);
+    assert_eq!(
+        upload(&mut c, &dvzip(&[("a\u{2028}b\u{2029}.txt", b"x")])),
+        200
+    );
+    assert_eq!(fx.files(), ["ab.txt"]);
+    let record = &stored_records("T", &fx.files())[0];
+    assert_eq!(crate::log::escape(record), "upload T: stored ab.txt");
 }
 
 #[test]
@@ -873,6 +903,124 @@ fn links_with_spaces_are_not_stored() {
         200
     );
     assert!(fx.files().is_empty());
+}
+
+fn links_ask(urls: &[&str]) -> Vec<u8> {
+    let mut d = Dictionary::new();
+    d.insert(
+        "TransferType".into(),
+        Value::Dictionary(Dictionary::from_iter([(
+            "links".to_string(),
+            Value::Integer(1.into()),
+        )])),
+    );
+    d.insert(
+        "Items".into(),
+        Value::Array(urls.iter().map(|u| Value::String((*u).into())).collect()),
+    );
+    plist_bytes(d)
+}
+
+/// A links Ask is the whole transfer, so it gets an upload's budget: 512
+/// links a time, any number of times, must not fill the disk past
+/// MIN_FREE_BYTES.
+#[test]
+fn links_past_the_receive_budget_are_refused_and_none_stored() {
+    let ask = links_ask(&["https://example.com/a", "https://example.com/b"]);
+    for tweak in [
+        (|s: &mut Settings| s.min_free_bytes = u64::MAX) as fn(&mut Settings),
+        |s| s.max_receive_percent = 0,
+    ] {
+        let fx = start(false, tweak);
+        assert_eq!(post(&mut connect(&fx, false), "/Ask", &ask).0, 507);
+        assert!(fx.files().is_empty());
+    }
+    // Within budget, all are stored.
+    let fx = start(false, |_| {});
+    assert_eq!(post(&mut connect(&fx, false), "/Ask", &ask).0, 200);
+    assert_eq!(fx.files(), ["example.com-a.url", "example.com-b.url"]);
+    // Each costs its file and a block.
+    let url = "https://example.com/";
+    assert_eq!(
+        links_cost(&[url, url]),
+        2 * ("[InternetShortcut]\nURL=\n".len() + url.len() + 4096) as u64
+    );
+}
+
+/// Two links Asks that each fit the budget alone, but not together, sent
+/// at once: one is stored whole, the other refused with nothing stored.
+/// Checked against the same free bytes without the links lock, both passed.
+#[test]
+fn concurrent_links_asks_cannot_share_the_same_free_bytes() {
+    // Links of the longest URL: each file then takes about what it is
+    // charged (12 KiB) on tmpfs and 4 KiB-block filesystems, so after one
+    // Ask is written the other no longer fits.
+    let base = "https://example.com/";
+    let ask_of = |tag: &str| -> Vec<String> {
+        (0..120)
+            .map(|i| {
+                let head = format!("{base}{tag}{i:03}-");
+                format!("{head}{}", "a".repeat(MAX_LINK_URL_BYTES - head.len()))
+            })
+            .collect()
+    };
+    let (a, b) = (ask_of("a"), ask_of("b"));
+    let a: Vec<&str> = a.iter().map(String::as_str).collect();
+    let b: Vec<&str> = b.iter().map(String::as_str).collect();
+    let cost = links_cost(&a);
+    assert_eq!(cost, links_cost(&b));
+    // Room for one and a half Asks.
+    let free = ReceiveBudget::of(&std::env::temp_dir(), 100, 0)
+        .unwrap()
+        .unwrap()
+        .free_bytes;
+    let fx = start(false, |s| {
+        s.max_receive_percent = 100;
+        s.min_free_bytes = free - cost * 3 / 2;
+    });
+    let (body_a, body_b) = (links_ask(&a), links_ask(&b));
+    // Both wait at the lock, so both are in flight when it opens.
+    let held = fx.server.links.lock().unwrap();
+    let statuses = std::thread::scope(|s| {
+        let asks: Vec<_> = [&body_a, &body_b]
+            .into_iter()
+            .map(|body| {
+                let mut c = connect(&fx, false);
+                s.spawn(move || post(&mut c, "/Ask", body).0)
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(held);
+        let mut statuses: Vec<u16> = asks.into_iter().map(|h| h.join().unwrap()).collect();
+        statuses.sort_unstable();
+        statuses
+    });
+    assert_eq!(statuses, [200, 507]);
+    let files = fx.files();
+    assert_eq!(files.len(), 120, "{} files", files.len());
+    // Which Ask each stored link came from: its URL's tag.
+    let tag_at = "[InternetShortcut]\nURL=https://example.com/".len();
+    let stored: std::collections::BTreeSet<u8> = files
+        .iter()
+        .map(|f| std::fs::read(fx.dest().join(f)).unwrap()[tag_at])
+        .collect();
+    assert_eq!(stored.len(), 1, "both Asks stored links");
+}
+
+#[test]
+fn links_longer_than_8192_bytes_are_not_stored() {
+    let fx = start(false, |_| {});
+    let base = "https://example.com/";
+    let longest = format!("{base}{}", "a".repeat(MAX_LINK_URL_BYTES - base.len()));
+    let over = format!("{longest}b");
+    let ask = links_ask(&[&over, &longest]);
+    assert_eq!(post(&mut connect(&fx, false), "/Ask", &ask).0, 200);
+    let files = fx.files();
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(
+        std::fs::read_to_string(fx.dest().join(&files[0])).unwrap(),
+        format!("[InternetShortcut]\nURL={longest}\n")
+    );
 }
 
 #[test]

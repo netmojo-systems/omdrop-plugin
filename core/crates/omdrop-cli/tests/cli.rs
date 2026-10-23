@@ -390,6 +390,86 @@ fn arrival(f: &Fixture, name: &str) -> PathBuf {
 
 const TS: &str = "2026-10-10 16:14:20,098 INFO root: ";
 
+/// The receiver's records for one upload of `names`, as it writes them: the
+/// one name plain, else one `(K/N)` record per name.
+fn stored_records(tid: &str, names: &[String]) -> Vec<String> {
+    let n = names.len();
+    if n == 1 {
+        return vec![format!("{TS}upload {tid}: stored {}", names[0])];
+    }
+    names
+        .iter()
+        .enumerate()
+        .map(|(k, name)| format!("{TS}upload {tid} ({}/{n}): stored {name}", k + 1))
+        .collect()
+}
+
+/// `watch --once` over `records`: (stdout, events).
+fn watch_once(f: &Fixture, records: &[String]) -> (String, String) {
+    let (out, ev) = f.run(&["watch", "--once"], &[("JOURNAL", &records.join("\n"))]);
+    assert!(out.status.success());
+    (String::from_utf8_lossy(&out.stdout).into_owned(), ev)
+}
+
+/// Every name of a 2-file and a 200-file upload is announced, and a
+/// one-file window closes once, only after the last record.
+#[test]
+fn every_file_of_a_transfer_is_announced_before_the_window_closes() {
+    for count in [2, 200] {
+        let f = Fixture::new();
+        let names: Vec<String> = (0..count)
+            .map(|i| format!("{i:03}, {}.jpg", "n".repeat(192)))
+            .collect();
+        let files: Vec<PathBuf> = names.iter().map(|n| arrival(&f, n)).collect();
+        let late = arrival(&f, "late.jpg");
+        let mut records = stored_records("T-1", &names);
+        assert_eq!(records.len(), count);
+        records.push(format!("{TS}upload T-2: stored late.jpg"));
+        let (stdout, ev) = watch_once(&f, &records);
+        for file in &files {
+            assert!(
+                stdout.contains(&format!("omdrop watch: announcing {}\n", file.display())),
+                "{} not announced",
+                file.display()
+            );
+        }
+        assert!(!stdout.contains(&late.display().to_string()), "{stdout}");
+        assert_eq!(ev.lines().filter(|l| l.contains(" handle ")).count(), count);
+        assert!(last(&ev, " handle ") < last(&ev, " off --force"));
+        assert_eq!(ev.matches(" off --force").count(), 1, "{ev}");
+
+        // Without the last record, the window stays open.
+        let f = Fixture::new();
+        for name in &names {
+            arrival(&f, name);
+        }
+        let mut records = stored_records("T-1", &names);
+        records.pop();
+        let (_, ev) = watch_once(&f, &records);
+        assert!(ev.contains(" handle "), "{ev}");
+        assert!(!ev.contains(" off --force"), "{ev}");
+    }
+}
+
+/// A record's whole remainder is one name: a file named like the first
+/// piece of a name holding ", " is not announced (hume, on plugin #106).
+#[test]
+fn a_name_holding_a_comma_announces_that_file_and_nothing_else() {
+    let f = Fixture::new();
+    let real = arrival(&f, "private.png, sent.txt");
+    let decoy = arrival(&f, "private.png");
+    let (stdout, ev) = watch_once(&f, &[format!("{TS}upload T: stored private.png, sent.txt")]);
+    assert!(
+        stdout.contains(&format!("omdrop watch: announcing {}\n", real.display())),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("announcing {}\n", decoy.display())),
+        "{stdout}"
+    );
+    assert_eq!(ev.lines().filter(|l| l.contains(" handle ")).count(), 1);
+}
+
 #[test]
 fn a_one_file_window_closes_in_a_unit_of_its_own() {
     let f = Fixture::new();
@@ -681,12 +761,13 @@ fn handle_capturing_stdin(f: &Fixture, file: &Path, env: &[(&str, &str)]) -> (St
 }
 
 /// What the clipboard's decode left in the runtime dir. The toast's previews
-/// have a directory of their own there, and their tests below.
+/// have a directory of their own there, and their tests below; the decode
+/// lock stays, as flock(1)'s does.
 fn clip_dirs_left(f: &Fixture) -> Vec<PathBuf> {
     std::fs::read_dir(f.root.join("run/omdrop"))
         .map(|d| {
             d.map(|e| e.unwrap().path())
-                .filter(|p| !p.ends_with("previews"))
+                .filter(|p| !p.ends_with("previews") && !p.ends_with("decode.lock"))
                 .collect()
         })
         .unwrap_or_default()
@@ -991,42 +1072,64 @@ fn only_the_newest_previews_are_kept_and_nothing_else_is_touched() {
     assert!(other.exists());
 }
 
+/// heif-convert and magick stand-ins that log when each run starts and ends,
+/// sleeping 2 s in the preview decode of a file named SLOW.
+const LOGGED_HEIF_CONVERT: &str = "#!/bin/sh\nprintf 'decode-start heif-convert %s\\n' \"$*\" >> \"$CAPTURE\"\ncase \"$*\" in *SLOW*/omdrop/previews/*) sleep 2 ;; esac\nfor a; do d=$a; done\nprintf jpeg > \"$d\"\nprintf 'decode-end\\n' >> \"$CAPTURE\"\n";
+const LOGGED_MAGICK: &str = "#!/bin/sh\nprintf 'decode-start magick\\n' >> \"$CAPTURE\"\nfor a; do d=$a; done\nprintf small > \"${d#jpg:}\"\nprintf 'decode-end\\n' >> \"$CAPTURE\"\n";
+
 #[test]
-fn a_preview_still_being_decoded_survives_other_arrivals() {
-    // Arrivals are handled in parallel. One photo's preview decodes slowly
-    // while eleven others arrive and finish; their pruning must not delete
-    // the file the slow decode has already written into.
+fn arrivals_decode_one_at_a_time() {
+    // Arrivals are handled in parallel, each in its own unit, and a sender
+    // in Everyone mode chooses how many arrive and how large each decodes.
+    // Decodes (the clipboard's, the preview's and its shrink) queue on one
+    // lock, the bash `omdrop`'s too.
+    use std::os::unix::fs::PermissionsExt;
     let f = preview_fixture();
-    write_exec(
-        &f.root.join("bin/heif-convert"),
-        &format!(
-            "#!/bin/sh\n{HEIF_CONVERT}case \"$3$4\" in *SLOW*/omdrop/previews/*) sleep 2 ;; esac\n"
-        ),
-    );
+    write_exec(&f.root.join("bin/heif-convert"), LOGGED_HEIF_CONVERT);
+    write_exec(&f.root.join("bin/magick"), LOGGED_MAGICK);
     let slow = f.root.join("SLOW.heic");
     std::fs::write(&slow, "photo").unwrap();
     let decoding = spawn_with(&f, &["handle", slow.to_str().unwrap()], &[]);
     std::thread::sleep(std::time::Duration::from_millis(500));
-    for n in 0..11 {
-        arrive(&f, &format!("IMG_{n}.heic"), &[]);
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    let others: Vec<_> = (0..3)
+        .map(|n| {
+            let photo = f.root.join(format!("IMG_{n}.heic"));
+            std::fs::write(&photo, "photo").unwrap();
+            spawn_with(&f, &["handle", photo.to_str().unwrap()], &[])
+        })
+        .collect();
+    for child in std::iter::once(decoding).chain(others) {
+        let out = finish_within(child, std::time::Duration::from_secs(30));
+        assert!(out.status.success());
     }
-    let out = finish_within(decoding, std::time::Duration::from_secs(30));
-    assert!(out.status.success());
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    let mut running = 0;
+    for line in ev.lines() {
+        if line.starts_with("decode-start ") {
+            running += 1;
+            assert_eq!(running, 1, "two decodes at once:\n{ev}");
+        } else if line == "decode-end" {
+            running -= 1;
+        }
+    }
+    // 4 clipboard decodes, 4 preview decodes and 4 shrinks.
+    assert_eq!(ev.matches("decode-end").count(), 12, "{ev}");
+    let lock = f.root.join("run/omdrop/decode.lock");
+    let mode = std::fs::metadata(&lock).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
     let (_, image) = toasts(&f)
         .into_iter()
         .find(|t| t.0 == "SLOW.heic")
         .expect("no toast for the slow photo");
-    let image = image.expect("the slow photo's toast lost its preview");
-    assert!(image.exists());
-    assert_eq!(image.parent(), Some(previews(&f).as_path()));
+    assert!(image.expect("the slow photo lost its preview").exists());
 }
 
 #[test]
-fn a_preview_whose_shrink_timed_out_survives_newer_previews() {
-    // A shrink that times out leaves the decode's older time on the preview,
-    // and ten newer previews finish meanwhile; pruning must still keep the
-    // preview this toast is about to show.
+fn a_preview_whose_shrink_timed_out_is_dated_when_it_finished() {
+    // A shrink that times out leaves the decode's older time on the preview.
+    // Pruning keeps the newest previews, so a preview dated by its decode
+    // could be pruned by previews finished after its decode but before its
+    // toast showed it.
     let f = preview_fixture();
     write_exec(
         &f.root.join("bin/heif-convert"),
@@ -1038,19 +1141,11 @@ fn a_preview_whose_shrink_timed_out_survives_newer_previews() {
     );
     let slow = f.root.join("SLOW.heic");
     std::fs::write(&slow, "photo").unwrap();
-    let mut decoding = spawn_with(
+    let started = std::time::SystemTime::now();
+    let decoding = spawn_with(
         &f,
         &["handle", slow.to_str().unwrap()],
-        &[("OMDROP_PREVIEW_TIMEOUT", "5")],
-    );
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    for n in 0..10 {
-        arrive(&f, &format!("IMG_{n}.heic"), &[]);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(
-        decoding.try_wait().unwrap().is_none(),
-        "the slow shrink ended before the others finished"
+        &[("OMDROP_PREVIEW_TIMEOUT", "2")],
     );
     let out = finish_within(decoding, std::time::Duration::from_secs(30));
     assert!(out.status.success());
@@ -1059,7 +1154,23 @@ fn a_preview_whose_shrink_timed_out_survives_newer_previews() {
         .find(|t| t.0 == "SLOW.heic")
         .expect("no toast for the slow photo");
     let image = image.expect("the slow photo's toast lost its preview");
-    assert!(image.exists(), "pruned before its toast showed it");
+    assert_eq!(std::fs::read(&image).unwrap(), b"slow");
+    let dated = std::fs::metadata(&image).unwrap().modified().unwrap();
+    assert!(
+        dated.duration_since(started).unwrap() >= std::time::Duration::from_secs(2),
+        "dated by its decode, not by its timed-out shrink"
+    );
+}
+
+#[test]
+fn a_name_that_looks_like_an_option_is_not_one_to_the_notification() {
+    // omarchy-notification-send has no `--`; the sender chose this name.
+    let f = preview_fixture();
+    arrive(&f, "--app-name=X.jpg", &[]);
+    arrive(&f, "-t.jpg", &[]);
+    arrive(&f, "a-b.jpg", &[]);
+    let titles: Vec<String> = toasts(&f).into_iter().map(|t| t.0).collect();
+    assert_eq!(titles, ["./--app-name=X.jpg", "./-t.jpg", "a-b.jpg"]);
 }
 
 #[test]
@@ -1157,7 +1268,7 @@ fn the_notification_outlives_the_watcher_too() {
     let (out, ev) = f.run(&["watch", "--once"], &[("JOURNAL", &journal)]);
     assert!(out.status.success());
     let unit = format!(
-        "systemd-run --user --quiet --collect {} handle {}",
+        "systemd-run --user --quiet --collect -p MemoryMax=512M {} handle {}",
         f.omdrop.display(),
         file.display()
     );
@@ -1756,6 +1867,48 @@ fn awdl_with_a_current_driver_has_nothing_to_install() {
     );
     for driver in ["brcmfmac-awdl-dkms", "makepkg", "omdrop-awdl"] {
         assert!(!stdout.contains(driver), "{driver}: {stdout}");
+    }
+}
+
+/// pacman with brcmfmac-awdl-dkms 0.9.0-1 installed and its sync databases
+/// offering `offered`. Outside the C locale it answers in Spanish, as a
+/// translated pacman does.
+fn with_repo_driver(r: &Radio, offered: &str) {
+    write_exec(
+        &r.f.root.join("bin/pacman"),
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n  '-Q brcmfmac-awdl-dkms') echo 'brcmfmac-awdl-dkms 0.9.0-1' ;;\n  '-Si brcmfmac-awdl-dkms') key=Versión; [ \"$LC_ALL\" = C ] && key=Version\n    printf 'Repository      : omarchy\\nName            : brcmfmac-awdl-dkms\\n%s         : {offered}\\nDescription     : x: y\\n\\nRepository      : extra\\nName            : brcmfmac-awdl-dkms\\n%s         : 0.0.1-1\\n' \"$key\" \"$key\" ;;\n  *) exit 1 ;;\nesac\n"
+        ),
+    );
+}
+
+#[test]
+fn a_repository_driver_older_than_the_pin_is_not_installed() {
+    // The sync databases are read as they are on disk, never refreshed, so
+    // they can offer a driver older than this version needs.
+    let r = Radio::new();
+    r.helper(&backend_helper(Some(awdl_hooks(serde_json::json!([])))));
+    for (offered, from_repo) in [
+        ("0.9.0-1", false),
+        ("0.10.0rc1-1", false),
+        ("0.10.0-1", true),
+        ("0.10.1-1", true),
+        ("1:0.1.0-1", true),
+    ] {
+        with_repo_driver(&r, offered);
+        let out = r.run(&["install-driver"]);
+        let stdout = text(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+        assert_eq!(
+            stdout.contains("sudo pacman -S --needed --noconfirm brcmfmac-awdl-dkms"),
+            from_repo,
+            "{offered}: {stdout}"
+        );
+        assert_eq!(
+            stdout.contains("omdrop-awdl.git") && stdout.contains("&& makepkg"),
+            !from_repo,
+            "{offered}: {stdout}"
+        );
     }
 }
 

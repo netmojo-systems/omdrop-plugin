@@ -9,7 +9,9 @@
 //! so 100 000 levels overflow the stack and abort the process. This builds the
 //! value from the event stream itself, refusing more than [`MAX_EVENTS`]
 //! events, collections deeper than [`MAX_DEPTH`], or more decoded bytes than
-//! [`byte_budget`] allows.
+//! [`byte_budget`] allows. A binary plist's collections are walked first,
+//! without decoding, because the reader allocates for a collection's members
+//! before its first event.
 
 use std::fmt;
 use std::io::Cursor;
@@ -64,8 +66,138 @@ enum Frame {
     Dict(Dictionary, Option<String>),
 }
 
+/// A binary plist ends with this many bytes of trailer.
+const TRAILER_LEN: usize = 32;
+
+fn malformed() -> PlistError {
+    PlistError::Invalid("malformed binary property list".into())
+}
+
+/// A big-endian unsigned integer of 1 to 8 bytes.
+fn be_uint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0, |n, &b| n << 8 | u64::from(b))
+}
+
+/// One collection open on the walk: where its references start, how many it
+/// declared, and how many have been followed.
+struct Open {
+    refs: usize,
+    len: u64,
+    next: u64,
+}
+
+/// Walk a binary plist's collections the way the `plist` crate's reader does,
+/// holding one position per open collection, before that reader runs.
+///
+/// The reader allocates eight bytes for each member a collection declares as
+/// soon as it meets the collection, and keeps them until the collection ends,
+/// so every open collection holds its whole reference list. It checks a
+/// declared count only against the bytes before the trailer, and those bytes
+/// can serve as every collection's reference list at once: 120 KB of nested
+/// arrays, each declaring 60 000 two-byte references over the same bytes,
+/// held 16 MB before [`MAX_DEPTH`] stopped the 33rd. Each declared member becomes at
+/// least one event, so a plist whose collections declare more than
+/// [`MAX_EVENTS`] members in all could never parse; refusing it here bounds
+/// what the reader allocates to that many references. The object table,
+/// which the reader also widens to eight bytes an entry, is held to
+/// [`MAX_EVENTS`] objects for the same reason: an encoder writes each object
+/// once, so an honest plist has no more objects than values.
+///
+/// What the walk cannot follow is refused as malformed. The reader refuses
+/// it too, except for a reference list or length running into the trailer,
+/// which no encoder writes.
+fn check_binary(data: &[u8]) -> Result<(), PlistError> {
+    if !data.starts_with(b"bplist00") {
+        return Ok(());
+    }
+    let Some(end) = data.len().checked_sub(TRAILER_LEN).filter(|&e| e >= 8) else {
+        return Err(malformed());
+    };
+    let trailer = &data[end..];
+    let offset_size = usize::from(trailer[6]);
+    let ref_size = usize::from(trailer[7]);
+    if !matches!(offset_size, 1..=4 | 8) || !matches!(ref_size, 1 | 2 | 4 | 8) {
+        return Err(malformed());
+    }
+    let objects = be_uint(&trailer[8..16]);
+    let root = be_uint(&trailer[16..24]);
+    let table = be_uint(&trailer[24..32]);
+    if objects > MAX_EVENTS as u64 {
+        return Err(PlistError::TooComplex);
+    }
+    // Only the bytes before the trailer hold objects, lengths and references.
+    let uint_at = |pos: usize, size: usize| -> Result<u64, PlistError> {
+        let bytes = pos
+            .checked_add(size)
+            .filter(|&stop| stop <= end)
+            .and_then(|stop| data.get(pos..stop))
+            .ok_or_else(malformed)?;
+        Ok(be_uint(bytes))
+    };
+    let table = usize::try_from(table).map_err(|_| malformed())?;
+    // `objects` is at most MAX_EVENTS, so neither product overflows.
+    if table.saturating_add(objects as usize * offset_size) > end {
+        return Err(malformed());
+    }
+    let mut open: Vec<Open> = Vec::new();
+    let mut declared = 0u64;
+    let mut object = Some(root);
+    loop {
+        if let Some(index) = object.take() {
+            if index >= objects {
+                return Err(malformed());
+            }
+            let at = uint_at(table + index as usize * offset_size, offset_size)?;
+            let at = usize::try_from(at).map_err(|_| malformed())?;
+            let marker = uint_at(at, 1)? as u8;
+            let per_member = match marker >> 4 {
+                0xa => 1,
+                0xd => 2,
+                _ => 0,
+            };
+            if per_member > 0 {
+                // The reader's object length: the low four bits, or 0xF and
+                // an integer object of 1, 2, 4 or 8 bytes after the marker.
+                let (len, refs) = if marker & 0x0f == 0x0f {
+                    let size = 1usize << (uint_at(at + 1, 1)? & 0x03);
+                    (uint_at(at + 2, size)?, at + 2 + size)
+                } else {
+                    (u64::from(marker & 0x0f), at + 1)
+                };
+                let members = len.checked_mul(per_member).ok_or(PlistError::TooComplex)?;
+                declared = declared.saturating_add(members);
+                if declared > MAX_EVENTS as u64 {
+                    return Err(PlistError::TooComplex);
+                }
+                if open.len() >= MAX_DEPTH {
+                    return Err(PlistError::TooComplex);
+                }
+                // `members` is at most MAX_EVENTS here.
+                if refs.saturating_add(members as usize * ref_size) > end {
+                    return Err(malformed());
+                }
+                open.push(Open {
+                    refs,
+                    len: members,
+                    next: 0,
+                });
+            }
+        }
+        let Some(top) = open.last_mut() else {
+            return Ok(());
+        };
+        if top.next < top.len {
+            object = Some(uint_at(top.refs + top.next as usize * ref_size, ref_size)?);
+            top.next += 1;
+        } else {
+            open.pop();
+        }
+    }
+}
+
 /// Parse an XML or binary property list.
 pub fn parse(data: &[u8]) -> Result<Value, PlistError> {
+    check_binary(data)?;
     let mut stack: Vec<Frame> = Vec::new();
     let mut root: Option<Value> = None;
     let budget = byte_budget(data.len());
@@ -297,5 +429,52 @@ mod tests {
         // itself is valid.
         let fine = parse(&shared_data(840_000, 3)).unwrap();
         assert!(matches!(fine, Value::Array(a) if a.len() == 3));
+    }
+
+    #[test]
+    fn the_walk_passes_large_honest_plists_and_refuses_broken_tables() {
+        // An Ask at its 512-file limit, every file a dictionary of 8 keys.
+        let file: Dictionary = (0..8)
+            .map(|k| (format!("Key{k}"), Value::String(format!("value {k}"))))
+            .collect();
+        let mut ask = Dictionary::new();
+        ask.insert(
+            "Files".into(),
+            Value::Array(vec![Value::Dictionary(file); 512]),
+        );
+        let ask = Value::Dictionary(ask);
+        let data = binary(&ask);
+        assert_eq!(check_binary(&data), Ok(()));
+        assert_eq!(parse(&data).unwrap(), ask);
+        // A dictionary's keys and values both count: 100 001 pairs are over.
+        let mut big = b"bplist00".to_vec();
+        big.extend([0xdf, 0x12]);
+        big.extend(100_001u32.to_be_bytes());
+        big.extend(std::iter::repeat_n(0u8, 200_002));
+        let table = big.len() as u64;
+        big.push(8);
+        big.extend([0u8; 6]);
+        big.extend([1u8, 1]);
+        big.extend(1u64.to_be_bytes());
+        big.extend(0u64.to_be_bytes());
+        big.extend(table.to_be_bytes());
+        assert_eq!(check_binary(&big), Err(PlistError::TooComplex));
+        // An object table, root or reference outside the file.
+        let mut cut = data.clone();
+        let n = cut.len();
+        cut[n - 8..].copy_from_slice(&(n as u64).to_be_bytes());
+        assert!(matches!(check_binary(&cut), Err(PlistError::Invalid(_))));
+        let mut rootless = data.clone();
+        rootless[n - 16..n - 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(matches!(
+            check_binary(&rootless),
+            Err(PlistError::Invalid(_))
+        ));
+        assert!(matches!(
+            check_binary(b"bplist00"),
+            Err(PlistError::Invalid(_))
+        ));
+        // XML is the reader's alone.
+        assert_eq!(check_binary(b"<plist><array/></plist>"), Ok(()));
     }
 }

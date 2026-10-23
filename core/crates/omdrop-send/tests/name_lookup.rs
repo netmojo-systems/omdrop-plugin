@@ -366,6 +366,52 @@ fn listing_rows_and_placeholders() {
     );
 }
 
+/// A name is whatever the device in range chose. It must not add a row,
+/// reach the terminal as a control sequence, or grow a row without bound.
+#[test]
+fn hostile_peer_names_stay_on_their_own_row() {
+    let mut env = Fake::new();
+    let macs = [
+        "e2:9d:03:6c:58:23",
+        "fe:63:e6:68:9f:12",
+        "16:2f:da:27:3d:76",
+        "0a:1b:2c:3d:4e:5f",
+    ];
+    env.peers = macs.iter().map(|m| (m.to_string(), Some(-50))).collect();
+    let forged = "Evil\n16:2f:da:27:3d:76    -3 dBm  [fe80::1%awdl0]:8770  Boss's iPhone";
+    let escapes = "\u{1b}]0;pwned\u{7}\u{1b}[2J\u{9b}31mRed\u{202e}gnp.exe\u{200b}\u{2066}";
+    let huge = "x".repeat(1 << 20);
+    env.answers = answers(&[
+        (macs[0], Some(forged)),
+        (macs[1], Some(escapes)),
+        (macs[2], Some(huge.as_str())),
+        (macs[3], Some(" \u{1b}\u{7}\u{feff}\r\n ")),
+    ]);
+    for argv in [
+        &["--list", "--names", "--no-wake"][..],
+        &["--list", "--names", "--stream", "--no-wake"][..],
+    ] {
+        let mut out = Vec::new();
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        assert_eq!(main(&env, &argv, &mut out, &mut std::io::sink()), 0);
+        let out = String::from_utf8(out).unwrap();
+        let rows: Vec<&str> = out.lines().collect();
+        assert_eq!(rows.len(), 4, "{out:?}");
+        let name_of = |mac: &str| -> &str {
+            let row = rows.iter().find(|r| r.starts_with(mac)).unwrap();
+            row.split_once(":8770  ").unwrap().1
+        };
+        assert_eq!(
+            name_of(macs[0]),
+            "Evil16:2f:da:27:3d:76    -3 dBm  [fe80::1%awdl0]:8770  Boss's iPhone"
+        );
+        assert_eq!(name_of(macs[1]), "]0;pwned[2J31mRedgnp.exe");
+        assert_eq!(name_of(macs[2]), "x".repeat(255));
+        assert_eq!(name_of(macs[3]), "(anonymous)");
+        assert!(!out.chars().any(|c| c != '\n' && c.is_control()), "{out:?}");
+    }
+}
+
 #[test]
 fn choosing_a_peer() {
     let mut env = Fake::new();

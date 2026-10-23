@@ -79,8 +79,11 @@ fn url_file_target(data: &[u8]) -> String {
 }
 
 /// .webloc: the URL key of a property list, XML or binary -- macOS writes both.
+/// Parsed under safeplist's limits: the file came from whoever is nearby, and
+/// 64 KB of binary plist can reference one object until it decodes to more
+/// memory than the machine has.
 fn webloc_target(data: &[u8]) -> Option<String> {
-    let value = plist::Value::from_reader(std::io::Cursor::new(data)).ok()?;
+    let value = omdrop_identity::safeplist::parse(data).ok()?;
     let dict = value.as_dictionary()?;
     Some(match dict.get("URL") {
         Some(plist::Value::String(s)) => s.trim().to_string(),
@@ -313,12 +316,48 @@ fn is_image(lower: &str) -> Option<&'static str> {
 /// crafted to decode slowly must not hold the watcher.
 const HEIF_DECODE_SECS: u64 = 10;
 
+/// The memory each arrival's `handle` unit may use, decodes included, as the
+/// plugin's bash `omdrop` sets it.
+const HANDLE_MEMORY_MAX: &str = "MemoryMax=512M";
+
 /// HEIC, HEIF and AVIF: what an iPhone sends since the receiver asks for
 /// original-format photos (#62), and what few applications can paste.
 fn is_heif(lower: &str) -> bool {
     [".heic", ".heif", ".avif"]
         .iter()
         .any(|e| lower.ends_with(e))
+}
+
+/// The lock every decode of an arrival holds, `$XDG_RUNTIME_DIR/omdrop/
+/// decode.lock`, exclusive, waited for: one decode at a time per user. A
+/// HEIC is decoded at the size it declares, whatever its file size, and a
+/// sender in Everyone mode can send hundreds in one transfer, each arrival
+/// with its own `handle` running at once. The plugin's bash `omdrop` takes
+/// the same lock with flock(1), so decodes from both stacks queue together.
+/// Each decode is bounded by its timeout, so the wait is too. `None` when the
+/// lock cannot be taken: then nothing is decoded.
+fn decode_lock() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = ctx().state_dir();
+    mkdir_private(&dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("decode.lock"))
+        .ok()?;
+    loop {
+        // SAFETY: flock on a descriptor `file` owns; released when it closes.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Some(file);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
 }
 
 /// Decode `f` to a JPEG in a private directory of its own under the runtime
@@ -331,6 +370,7 @@ fn heif_to_jpeg(f: &Path) -> Option<(PathBuf, PathBuf)> {
     if !have("heif-convert") {
         return None;
     }
+    let _decoding = decode_lock()?;
     let base = ctx().runtime.join("omdrop");
     std::fs::create_dir_all(&base).ok()?;
     let nanos = std::time::SystemTime::now()
@@ -391,6 +431,8 @@ fn heic_preview(f: &Path) -> Option<PathBuf> {
     let limit = preview_timeout()?;
     let dir = ctx().state_dir().join("previews");
     mkdir_private(&dir).ok()?;
+    // The decode and the shrink run under the decode lock; the rest does not.
+    let decoding = decode_lock()?;
     // A unique name: IMG_1.heic and IMG_1.avif, or two arrivals with the same
     // name, each keep their own preview. Arrivals are handled in parallel, so
     // a preview is decoded and shrunk under working.*, and becomes preview.*
@@ -428,6 +470,7 @@ fn heic_preview(f: &Path) -> Option<PathBuf> {
         return None;
     }
     shrink_preview(&work, limit);
+    drop(decoding);
     // Pruning goes by when a preview was finished. A shrink that failed or
     // timed out leaves the decode's older time, and the newer previews of a
     // burst would prune this one before its toast could show it.
@@ -589,10 +632,18 @@ pub fn cmd_handle(args: &[OsString]) -> i32 {
     } else {
         format!("Saved to {where_}/")
     };
+    // The sender chose the name, and omarchy-notification-send takes no `--`:
+    // a name like `-t` or `--app-name=X` would be read as an option.
+    let mut title = basename(f.as_os_str());
+    if title.as_bytes().starts_with(b"-") {
+        let mut dotted = OsString::from("./");
+        dotted.push(&title);
+        title = dotted;
+    }
     let mut argv: Vec<OsString> = vec![
         "-t".into(),
         "8000".into(),
-        basename(f.as_os_str()),
+        title,
         format!("{what} (or click this)").into(),
     ];
     if let Some(image) = image {
@@ -637,6 +688,8 @@ pub fn cmd_watch(args: &[String]) -> i32 {
     };
     let mut reader = crate::proc::LineReader::new(read);
     let mut handlers: Vec<Child> = Vec::new();
+    // Transfers with an announced file, for --once.
+    let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         // Woken every second even without a record, so finished `handle`
         // children are reaped promptly rather than at the next arrival.
@@ -666,11 +719,14 @@ pub fn cmd_watch(args: &[String]) -> i32 {
             // kills its whole cgroup, and a notification still decoding its
             // preview would be lost. systemd-run returns once the unit has
             // started. Without it, handle runs here, and a one-file window
-            // waits for it before closing.
-            let unit: [&OsStr; 6] = [
+            // waits for it before closing. MemoryMax caps what a decode of
+            // a crafted photo can take: the unit is killed, not the session.
+            let unit: [&OsStr; 8] = [
                 "--user".as_ref(),
                 "--quiet".as_ref(),
                 "--collect".as_ref(),
+                "-p".as_ref(),
+                HANDLE_MEMORY_MAX.as_ref(),
                 self_exe,
                 "handle".as_ref(),
                 path.as_os_str(),
@@ -683,7 +739,20 @@ pub fn cmd_watch(args: &[String]) -> i32 {
                 Err(e) => errln!("omdrop: {}: {e}", ctx().command_path().display()),
             }
         }
-        if once && !found.is_empty() {
+        // A one-file window closes once the first transfer is complete: a
+        // link, or an upload's last record (`(N/N)`, or its only one), once
+        // some record of that transfer has announced a file. An earlier
+        // record of a long list does not close it.
+        let complete = match &names {
+            ArrivalNames::Link(_) => !found.is_empty(),
+            ArrivalNames::Stored { tid, last, .. } => {
+                if once && !found.is_empty() {
+                    announced.insert(tid.clone());
+                }
+                *last && announced.contains(tid)
+            }
+        };
+        if once && complete {
             for mut handler in handlers.drain(..) {
                 let _ = handler.wait();
             }
@@ -730,18 +799,34 @@ fn receiver_info(line: &str) -> Option<&str> {
     line[23..].strip_prefix(" INFO root: ")
 }
 
-/// The names one of the receiver's records says it stored:
-/// `upload TID: stored NAME, NAME` (names still joined, since a name may
-/// itself hold ", ") or `link stored as NAME.url -> http(s)://...`.
+/// What one of the receiver's records says it stored:
+/// `upload TID: stored NAME` (the whole remainder is the one name, `, ` and
+/// all, or empty when nothing was stored), `upload TID (K/N): stored NAME`
+/// for file K of N, or `link stored as NAME.url -> http(s)://...`.
 pub fn arrivals(line: &str) -> Option<ArrivalNames> {
     let msg = receiver_info(line)?;
     if let Some(rest) = msg.strip_prefix("upload ") {
-        let (tid, names) = rest.split_once(": stored ")?;
+        let (head, name) = rest.split_once(": stored ")?;
+        let (tid, last) = match head.split_once(' ') {
+            None => (head, true),
+            Some((tid, part)) => {
+                let (k, n) = part.strip_prefix('(')?.strip_suffix(')')?.split_once('/')?;
+                let (k, n) = (record_number(k)?, record_number(n)?);
+                if k > n {
+                    return None;
+                }
+                (tid, k == n)
+            }
+        };
         let tid_ok = (1..=64).contains(&tid.len())
             && tid
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'));
-        return (tid_ok && !names.is_empty()).then(|| ArrivalNames::Stored(names.to_string()));
+        return tid_ok.then(|| ArrivalNames::Stored {
+            tid: tid.to_string(),
+            name: name.to_string(),
+            last,
+        });
     }
     let rest = msg.strip_prefix("link stored as ")?;
     let (name, url) = rest.split_once(" -> ")?;
@@ -753,9 +838,27 @@ pub fn arrivals(line: &str) -> Option<ArrivalNames> {
     (name_ok && url_ok).then(|| ArrivalNames::Link(name.to_string()))
 }
 
+/// K or N of a `(K/N)` record number: 1 to 512 (an upload's member limit),
+/// decimal digits only, no leading zero.
+fn record_number(text: &str) -> Option<u16> {
+    let ok = !text.is_empty()
+        && text.len() <= 3
+        && !text.starts_with('0')
+        && text.bytes().all(|c| c.is_ascii_digit());
+    ok.then(|| text.parse().ok())
+        .flatten()
+        .filter(|n| *n <= 512)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArrivalNames {
-    Stored(String),
+    /// An upload's record: its transfer, the one name (empty: none), and
+    /// whether it is the transfer's last record.
+    Stored {
+        tid: String,
+        name: String,
+        last: bool,
+    },
     Link(String),
 }
 
@@ -777,38 +880,20 @@ fn arrived_file(dir: &Path, name: &str) -> Option<PathBuf> {
         .map(|_| path)
 }
 
-/// The files that arrived, and the names that matched none. `, ` both
-/// separates names and may occur inside one, so a piece that is not a file
-/// is joined with the pieces after it until one is.
+/// The file a record names, or the name that matched none. A record with no
+/// name names nothing and is not a missing file.
 pub fn resolve_arrivals(dir: &Path, names: &ArrivalNames) -> (Vec<PathBuf>, Vec<String>) {
-    let (mut found, mut missing) = (Vec::new(), Vec::new());
-    match names {
-        ArrivalNames::Link(name) => match arrived_file(dir, name) {
-            Some(p) => found.push(p),
-            None => missing.push(name.clone()),
-        },
-        ArrivalNames::Stored(joined) => {
-            let pieces: Vec<&str> = joined.split(", ").collect();
-            let mut i = 0;
-            while i < pieces.len() {
-                let hit = (i..pieces.len()).find_map(|j| {
-                    let name = pieces[i..=j].join(", ");
-                    arrived_file(dir, &name).map(|p| (j, p))
-                });
-                match hit {
-                    Some((j, p)) => {
-                        found.push(p);
-                        i = j + 1;
-                    }
-                    None => {
-                        missing.push(pieces[i].to_string());
-                        i += 1;
-                    }
-                }
-            }
+    let name = match names {
+        ArrivalNames::Link(name) => name,
+        ArrivalNames::Stored { name, .. } if name.is_empty() => {
+            return (Vec::new(), Vec::new());
         }
+        ArrivalNames::Stored { name, .. } => name,
+    };
+    match arrived_file(dir, name) {
+        Some(p) => (vec![p], Vec::new()),
+        None => (Vec::new(), vec![name.clone()]),
     }
-    (found, missing)
 }
 
 // ------------------------------------------------------------ link handler
@@ -1214,15 +1299,66 @@ mod tests {
         assert_eq!(webloc_target(b"not a property list"), None);
     }
 
+    /// `root` plus a binary plist's one data object referenced 1 000 times:
+    /// the plist writer stores equal data once. 30 KB on disk, 30 MB decoded.
+    fn shared_reference_bomb(mut root: plist::Dictionary) -> Vec<u8> {
+        let pad = plist::Value::Data(vec![0x41; 30_000]);
+        root.insert("Pad".into(), plist::Value::Array(vec![pad; 1_000]));
+        let mut out = Vec::new();
+        plist::Value::Dictionary(root)
+            .to_writer_binary(&mut out)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_webloc_that_expands_past_its_size_is_not_a_link() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("URL".into(), "https://example.com/".into());
+        let bomb = shared_reference_bomb(dict);
+        assert!(bomb.len() as u64 <= LINK_MAX);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.webloc");
+        std::fs::write(&f, &bomb).unwrap();
+        assert_eq!(link_url(&f), None);
+    }
+
     const TS: &str = "2026-10-10 16:14:20,098";
+
+    fn stored(tid: &str, name: &str, last: bool) -> ArrivalNames {
+        ArrivalNames::Stored {
+            tid: tid.into(),
+            name: name.into(),
+            last,
+        }
+    }
 
     #[test]
     fn only_the_receivers_own_records_name_arrivals() {
-        let stored = format!("{TS} INFO root: upload 1A2B-3c_d.e: stored a.jpg, b c.png");
+        let stored_line = format!("{TS} INFO root: upload 1A2B-3c_d.e: stored a.jpg, b c.png");
         assert_eq!(
-            arrivals(&stored),
-            Some(ArrivalNames::Stored("a.jpg, b c.png".into()))
+            arrivals(&stored_line),
+            Some(stored("1A2B-3c_d.e", "a.jpg, b c.png", true))
         );
+        // Nothing stored: a record naming no file.
+        assert_eq!(
+            arrivals(&format!("{TS} INFO root: upload X: stored ")),
+            Some(stored("X", "", true))
+        );
+        // File K of N, one record each: only the last completes.
+        for (part, last) in [
+            ("1/3", false),
+            ("2/3", false),
+            ("3/3", true),
+            ("512/512", true),
+        ] {
+            let line = format!("{TS} INFO root: upload T-1 ({part}): stored a.jpg, b (1/2): c");
+            assert_eq!(
+                arrivals(&line),
+                Some(stored("T-1", "a.jpg, b (1/2): c", last)),
+                "{line}"
+            );
+        }
         let link = format!("{TS} INFO root: link stored as Example.url -> https://example.com/");
         assert_eq!(
             arrivals(&link),
@@ -1235,6 +1371,16 @@ mod tests {
             format!("x{TS} INFO root: upload X: stored a.jpg"),
             format!("{TS} INFO root: upload X Y: stored a.jpg"),
             format!("{TS} INFO root: upload {}: stored a.jpg", "x".repeat(65)),
+            format!("{TS} INFO root: GET / from M upload X (1/1): stored /etc/passwd"),
+            format!("{TS} INFO root: upload X (0/1): stored a.jpg"),
+            format!("{TS} INFO root: upload X (2/1): stored a.jpg"),
+            format!("{TS} INFO root: upload X (1/513): stored a.jpg"),
+            format!("{TS} INFO root: upload X (01/2): stored a.jpg"),
+            format!("{TS} INFO root: upload X ( 1/2): stored a.jpg"),
+            format!("{TS} INFO root: upload X (1/2) : stored a.jpg"),
+            format!("{TS} INFO root: upload X  (1/2): stored a.jpg"),
+            format!("{TS} INFO root: upload X (+1/2): stored a.jpg"),
+            format!("{TS} INFO root: upload X (1/2: stored a.jpg"),
             format!("{TS} INFO root: link stored as ../a.url -> https://e.x/"),
             format!("{TS} INFO root: link stored as a.url -> file:///etc/passwd"),
             format!("{TS} INFO root: link stored as a.webloc -> https://e.x/"),
@@ -1257,25 +1403,40 @@ mod tests {
         std::fs::create_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/c.png"), "x").unwrap();
 
-        let names = ArrivalNames::Stored("a.jpg, two, parts.txt, b.png".into());
-        let (found, missing) = resolve_arrivals(&dir, &names);
-        assert_eq!(
-            found,
-            vec![
-                dir.join("a.jpg"),
-                dir.join("two, parts.txt"),
-                dir.join("b.png")
-            ]
-        );
-        assert!(missing.is_empty(), "{missing:?}");
-
-        let forged = ArrivalNames::Stored(format!(
-            "{}, link.png, .hidden, sub/c.png, sub, gone.jpg",
-            outside.display()
-        ));
-        let (found, missing) = resolve_arrivals(&dir, &forged);
+        for name in ["a.jpg", "two, parts.txt", "b.png"] {
+            let (found, missing) = resolve_arrivals(&dir, &stored("T", name, true));
+            assert_eq!(found, [dir.join(name)]);
+            assert!(missing.is_empty(), "{missing:?}");
+        }
+        // The remainder is one name, never split on ", ": a file named like
+        // its first piece is not what arrived (hume, on plugin #106).
+        std::fs::write(dir.join("private.png, sent.txt"), "x").unwrap();
+        std::fs::write(dir.join("private.png"), "x").unwrap();
+        let (found, missing) = resolve_arrivals(&dir, &stored("T", "private.png, sent.txt", true));
+        assert_eq!(found, [dir.join("private.png, sent.txt")]);
+        assert!(missing.is_empty());
+        let (found, missing) = resolve_arrivals(&dir, &stored("T", "a.jpg, b.png", true));
         assert!(found.is_empty(), "{found:?}");
-        assert_eq!(missing.len(), 6, "{missing:?}");
+        assert_eq!(missing, ["a.jpg, b.png"]);
+        // No name: nothing found, nothing missing.
+        assert_eq!(
+            resolve_arrivals(&dir, &stored("T", "", true)),
+            (Vec::new(), Vec::new())
+        );
+
+        let outside = outside.display().to_string();
+        for name in [
+            outside.as_str(),
+            "link.png",
+            ".hidden",
+            "sub/c.png",
+            "sub",
+            "gone.jpg",
+        ] {
+            let (found, missing) = resolve_arrivals(&dir, &stored("T", name, true));
+            assert!(found.is_empty(), "{found:?}");
+            assert_eq!(missing, [name]);
+        }
 
         let (found, _) = resolve_arrivals(&dir, &ArrivalNames::Link("link.png".into()));
         assert!(found.is_empty());

@@ -25,8 +25,8 @@ Proven live against a Mac and an iPhone (October 2026):
 
 Libraries:
 
-- `omdrop-identity`: the [identity contract](https://github.com/netmojo-systems/omdrop-awdl/blob/main/docs/identity-contract.md), the kernel-keyring cache, the disk and self-signed identities, and the 1Password lifecycle. Passes the shared `identity-vectors.json`.
-- `omdrop-proto`: TLS, DVZip and cpio, HTTP framing, bounded plist parsing, the Contacts Only policy, and debug dumps.
+- `omdrop-identity`: the [identity contract](https://github.com/netmojo-systems/omdrop-awdl/blob/main/docs/identity-contract.md), the kernel-keyring cache, the disk and self-signed identities, the 1Password lifecycle, and bounded plist parsing (`safeplist`) for every crate that reads a plist it did not write. Passes the shared `identity-vectors.json`.
+- `omdrop-proto`: TLS, DVZip and cpio, HTTP framing, the Contacts Only policy, and debug dumps.
 
 What changes for users, compared with the Python and bash programs:
 

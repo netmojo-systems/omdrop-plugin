@@ -730,14 +730,17 @@ struct OdcFields {
 
 /// Path separators, NUL, C0/C1 controls and the format characters a name could
 /// use to lie about itself: bidi overrides (`"gpj.<U+202E>exe"` renders as
-/// `"exe.jpg"`), isolates, zero-width characters and the BOM. Shared by
-/// received file names and the receiver name we advertise.
+/// `"exe.jpg"`), isolates, zero-width characters and the BOM; and the line
+/// and paragraph separators, which the receiver's log escapes, so a name
+/// holding one would be logged as a name no file has and never announced.
+/// Shared by received file names and the receiver name we advertise.
 pub fn is_unsafe_char(c: char) -> bool {
     matches!(c,
         '/' | '\\' | '\0'
         | '\u{202a}'..='\u{202e}'
         | '\u{2066}'..='\u{2069}'
         | '\u{200b}'..='\u{200f}'
+        | '\u{2028}' | '\u{2029}'
         | '\u{feff}'
         | '\u{01}'..='\u{1f}'
         | '\u{7f}'..='\u{9f}')
@@ -1782,6 +1785,7 @@ mod tests {
             ("a\u{0}b\u{7}c\u{9b}d", "abcd"),
             ("bidi\u{202e}txt.exe", "biditxt.exe"),
             ("zw\u{200b}j\u{feff}", "zwj"),
+            ("line\u{2028}para\u{2029}.txt", "linepara.txt"),
             ("", "fallback"),
             (" .x", "x"),
             (". .x", " .x"),

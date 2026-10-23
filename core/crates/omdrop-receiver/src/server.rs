@@ -213,6 +213,8 @@ pub struct Server {
     live: Mutex<HashMap<u64, Live>>,
     next_id: AtomicU64,
     uploads: AtomicUsize,
+    /// Held by a links Ask from its budget check through its last write.
+    links: Mutex<()>,
 }
 
 /// The peer's address as Python printed it: link-local with its zone.
@@ -326,6 +328,25 @@ impl ReceiveBudget {
     }
 }
 
+/// The longest URL a `links` Ask may have stored. Browsers handle a few
+/// kilobytes; a longer item is skipped like a non-http one.
+pub const MAX_LINK_URL_BYTES: usize = 8192;
+/// What each stored link costs against the receive budget beyond its own
+/// bytes: the filesystem block a small file takes.
+const LINK_FILE_OVERHEAD: u64 = 4096;
+
+/// The bytes [`store_link`] writes for `url`.
+fn link_file(url: &str) -> String {
+    format!("[InternetShortcut]\nURL={url}\n")
+}
+
+/// What storing `urls` costs against a [`ReceiveBudget`].
+fn links_cost(urls: &[&str]) -> u64 {
+    urls.iter()
+        .map(|u| link_file(u).len() as u64 + LINK_FILE_OVERHEAD)
+        .sum()
+}
+
 /// The URL a `links` Ask carries, stored in `dest` as an inert `.url`
 /// shortcut; returns the stored name. INI form (`[InternetShortcut]`) because
 /// it is plain text, needs no execute bit, and is what browsers and file
@@ -354,7 +375,7 @@ pub fn store_link(url: &str, dest: &Path) -> io::Result<String> {
         base.pop();
     }
     let (name, mut file) = open_new(dest, &format!("{base}.url"))?;
-    file.write_all(format!("[InternetShortcut]\nURL={url}\n").as_bytes())?;
+    file.write_all(link_file(url).as_bytes())?;
     Ok(name)
 }
 
@@ -376,29 +397,28 @@ pub fn transfer_label(header: &str) -> String {
     }
 }
 
-/// Longest list of stored names on one log line. 512 names of 255 bytes
-/// would pass journald's 48 KiB `LineMax`, which splits a line; the watcher
-/// takes each `stored` line on its own, so the list is spread over several.
-const MAX_STORED_LINE_BYTES: usize = 16 * 1024;
-
-/// The stored names, joined with `, ` into lines of at most
-/// [`MAX_STORED_LINE_BYTES`].
-pub fn stored_lines(names: &[String]) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for name in names {
-        if !line.is_empty() && line.len() + 2 + name.len() > MAX_STORED_LINE_BYTES {
-            lines.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push_str(", ");
-        }
-        line.push_str(name);
+/// The records naming what an upload stored, as `omdrop watch` reads them:
+/// `upload TID: stored ` for none, `upload TID: stored NAME` for one, and
+/// one `upload TID (K/N): stored NAME` per file, K = 1..N, in order, for
+/// more. One name per record: names joined with `, ` were ambiguous, since a
+/// name may hold `, ` itself, and a file named `a.png, b.txt` beside an
+/// `a.png` had the watcher announce `a.png`. `(K/N)` sits where no file name
+/// can, between the TID (no spaces) and the colon, and tells the watcher
+/// which record completes the transfer: a `--once` window closes only after
+/// the last. A record is at most a 255-byte name (log-escaped) and its
+/// prefix, well under the log's cap. The Python receiver writes the same
+/// records.
+pub fn stored_records(tid: &str, names: &[String]) -> Vec<String> {
+    let n = names.len();
+    if n <= 1 {
+        let name = names.first().map_or("", String::as_str);
+        return vec![format!("upload {tid}: stored {name}")];
     }
-    if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
-    }
-    lines
+    names
+        .iter()
+        .enumerate()
+        .map(|(k, name)| format!("upload {tid} ({}/{n}): stored {name}", k + 1))
+        .collect()
 }
 
 /// `str()` of a plist value, as the Python receiver's f-strings printed it.
@@ -557,6 +577,7 @@ impl Server {
             live: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             uploads: AtomicUsize::new(0),
+            links: Mutex::new(()),
         }
     }
 
@@ -1145,6 +1166,7 @@ impl Conn<'_> {
         // Everyone mode any device in range could make this machine visit an
         // arbitrary URL. A file the user clicks is all we offer.
         if types.iter().any(|t| t == "links") {
+            let mut urls: Vec<&str> = Vec::new();
             for item in items {
                 let url = match item.as_string() {
                     Some(u) if u.starts_with("http://") || u.starts_with("https://") => u,
@@ -1170,6 +1192,40 @@ impl Conn<'_> {
                     );
                     continue;
                 }
+                if url.len() > MAX_LINK_URL_BYTES {
+                    let shown = py_repr(url);
+                    warning!(
+                        "ask: ignoring item longer than {MAX_LINK_URL_BYTES} bytes {}",
+                        shown.chars().take(80).collect::<String>()
+                    );
+                    continue;
+                }
+                urls.push(url);
+            }
+            // The links are the whole transfer, so they get the budget an
+            // upload would: nothing is stored unless all of them fit. The
+            // check and the writes are one step across connections: two
+            // Asks checked against the same free bytes could together write
+            // past MIN_FREE_BYTES. Writing a few small files is quick.
+            let _reserving = (!urls.is_empty())
+                .then(|| self.server.links.lock().unwrap_or_else(|e| e.into_inner()));
+            if !urls.is_empty() {
+                let s = self.settings();
+                let cost = links_cost(&urls);
+                match ReceiveBudget::of(&s.dest, s.max_receive_percent, s.min_free_bytes) {
+                    Ok(Ok(b)) if cost <= b.byte_limit => {}
+                    Ok(Ok(b)) => {
+                        let reason = format!(
+                            "links need {cost} bytes; {}% of {} free bytes allows {}",
+                            b.percent, b.free_bytes, b.byte_limit
+                        );
+                        return self.reject(io, req, 507, &reason);
+                    }
+                    Ok(Err(e)) => return self.reject(io, req, 507, &e),
+                    Err(e) => return self.reject(io, req, 507, &format!("storage failed: {e}")),
+                }
+            }
+            for url in urls {
                 match store_link(url, &self.settings().dest) {
                     Ok(stored) => info!("link stored as {stored} -> {url}"),
                     // Answering 200 would tell the sender a lost link arrived.
@@ -1290,8 +1346,8 @@ impl Conn<'_> {
                     done.decoded_bytes,
                     py_bytes_repr(&done.magic)
                 );
-                for names in stored_lines(&done.names) {
-                    info!("upload {tid}: stored {names}");
+                for record in stored_records(&tid, &done.names) {
+                    info!("{record}");
                 }
                 // A finished transfer ends its connection (plugin #69): an
                 // iPhone stays on "Sending" while the connection is open, so

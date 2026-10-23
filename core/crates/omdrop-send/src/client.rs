@@ -180,6 +180,41 @@ fn plist_binary(dict: Dictionary) -> Vec<u8> {
     out
 }
 
+/// Longest peer name kept, in UTF-8 bytes, as for a file name.
+pub const PEER_NAME_MAX_BYTES: usize = 255;
+
+/// A peer's `ReceiverComputerName` as Omdrop shows it, or `None` when
+/// nothing is left. The name is whatever the device in range chose, and it is
+/// printed into `--list` rows, the panel's tiles and logs: a line break forges
+/// another row, an escape sequence drives the terminal, bidirectional and
+/// zero-width characters disguise one name as another, and nothing bounds
+/// its length. Removes C0 and C1 controls, DEL, the line and paragraph
+/// separators, bidi embeddings, overrides and isolates, and zero-width
+/// characters, then keeps at most [`PEER_NAME_MAX_BYTES`] bytes (whole
+/// characters) and trims surrounding whitespace. Omdrop's Python programs
+/// apply the same rules.
+pub fn clean_peer_name(raw: &str) -> Option<String> {
+    let mut name = String::new();
+    for c in raw.chars().filter(|&c| {
+        !matches!(
+            c,
+            '\u{0}'..='\u{1f}'
+                | '\u{7f}'..='\u{9f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
+    }) {
+        if name.len() + c.len_utf8() > PEER_NAME_MAX_BYTES {
+            break;
+        }
+        name.push(c);
+    }
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 /// One receiver and the connection to it.
 pub struct Client<'a> {
     pub sender: &'a Sender,
@@ -273,7 +308,8 @@ impl<'a> Client<'a> {
         Ok((status == 200, body))
     }
 
-    /// /Discover: the receiver's name, or `None` when it answered without one.
+    /// /Discover: the receiver's name, cleaned by [`clean_peer_name`], or
+    /// `None` when it answered without one.
     pub fn discover(&mut self) -> io::Result<Option<String>> {
         let mut body = Dictionary::new();
         body.insert(
@@ -304,7 +340,7 @@ impl<'a> Client<'a> {
             list_repr(&keys)
         ));
         Ok(match dict.get("ReceiverComputerName") {
-            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::String(s)) => clean_peer_name(s),
             Some(Value::Integer(i)) => Some(i.to_string()),
             _ => None,
         })
