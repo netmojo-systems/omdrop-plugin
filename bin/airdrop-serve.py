@@ -47,11 +47,14 @@ import safeplist  # noqa: E402
 identity.not_dumpable()
 
 
-# Path separators, NUL, control characters (Cc) and format characters (Cf:
-# bidi overrides, zero-width joiners) -- the last because a name like
-# "gpj.<U+202E>exe" renders as "exe.jpg" in a file manager. Used for received
-# file names and for the receiver name we advertise.
-UNSAFE_CHAR = re.compile(r'[/\\\x00]|[\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]|[\x01-\x1f\x7f-\x9f]')
+# Path separators, NUL, control characters (Cc), line and paragraph
+# separators, and format characters (Cf: bidi overrides, zero-width joiners)
+# -- the last because a name like "gpj.<U+202E>exe" renders as "exe.jpg" in a
+# file manager. Every character here is one the log escapes, so a stored name
+# is logged exactly as it is on disk and `omdrop watch` finds the file. Used
+# for received file names and for the receiver name we advertise.
+UNSAFE_CHAR = re.compile(r'[/\\\x00]|[\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]'
+                         r'|[\x01-\x1f\x7f-\x9f]')
 # The config file is the source of truth: ~/.config/airdrop/config.toml,
 # written by `omdrop setup` and the configuration commands in `omdrop`.
 # CLI flags override individual keys, so the file can be absent entirely.
@@ -701,6 +704,15 @@ def safe_name(name, fallback):
     return out
 
 
+def transfer_label(header):
+    """The TransferID as logged: ASCII letters, digits, '-', '_' and '.',
+    at most 64, no leading dot; 'upload' when nothing is left. The same as
+    core's transfer_label, and what `omdrop watch` accepts as an ID, so no
+    ID can carry the ': stored ' that starts an arrival record."""
+    label = ''.join(c for c in header if c.isascii() and (c.isalnum() or c in '-_.'))[:64]
+    return label.lstrip('.') or 'upload'
+
+
 def open_new(dest, name):
     """Create dest/name atomically without clobbering an existing file:
     name, then stem-1.ext, stem-2.ext, ..., the stem shortened so each still
@@ -800,31 +812,16 @@ def store_upload(raw, dest, tid, receive_budget):
     return written
 
 
-# Longest list of names in one `upload ...: stored ...` record, in UTF-8
-# bytes. Half the log cap: a longer list would be cut by it, and `omdrop
-# watch`, which reads names from these records, would miss the files cut.
-MAX_STORED_LINE_BYTES = 16 * 1024
-
-
 def arrival_records(tid, names):
-    """The `stored` log records for one upload, as in omdrop-core: one,
-    `upload TID: stored A, B`, when the names fit MAX_STORED_LINE_BYTES;
-    otherwise `upload TID (k/n): stored ...` for k = 1..n, each holding whole
-    names in order. A name is at most 255 bytes, so every one fits."""
-    joined = ', '.join(names)
-    if len(joined.encode('utf-8')) <= MAX_STORED_LINE_BYTES:
-        return [f'upload {tid}: stored {joined}']
-    chunks, chunk, size = [], [], 0
-    for name in names:
-        cost = len(name.encode('utf-8')) + (2 if chunk else 0)
-        if chunk and size + cost > MAX_STORED_LINE_BYTES:
-            chunks.append(chunk)
-            chunk, size, cost = [], 0, cost - 2
-        chunk.append(name)
-        size += cost
-    chunks.append(chunk)
-    return [f'upload {tid} ({k}/{len(chunks)}): stored {", ".join(c)}'
-            for k, c in enumerate(chunks, 1)]
+    """The `stored` log records for one upload, as in omdrop-core. One name
+    per record, so a name containing ", " can't be read as two: `upload TID:
+    stored NAME` for a single file (or none), and `upload TID (k/n): stored
+    NAME` for k = 1..n otherwise. A name is at most 255 bytes, so every
+    record fits the log cap."""
+    if len(names) <= 1:
+        return [f'upload {tid}: stored {names[0] if names else ""}']
+    return [f'upload {tid} ({k}/{len(names)}): stored {name}'
+            for k, name in enumerate(names, 1)]
 
 
 # Longest URL a links Ask may store, in UTF-8 bytes, as in omdrop-core.
@@ -1193,7 +1190,7 @@ class Handler(BaseHTTPRequestHandler):
         if not UPLOAD_SLOTS.acquire(blocking=False):
             self.reject(503, 'too many uploads in progress')
             return
-        tid = safe_name(self.headers.get('TransferID', ''), 'upload')
+        tid = transfer_label(self.headers.get('TransferID', ''))
         deadline = ReadDeadline()
         plan = None
         ended_early = False

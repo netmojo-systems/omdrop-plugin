@@ -313,7 +313,7 @@ class LinkRaceTests(LowDiskFixture):
 
 def arrival_namespace():
     source = SERVE.read_text()
-    start = source.index("MAX_STORED_LINE_BYTES = ")
+    start = source.index("def arrival_records(")
     end = source.index("\n# Longest URL a links Ask")
     namespace = {}
     exec(source[start:end], namespace)
@@ -322,35 +322,19 @@ def arrival_namespace():
 
 class ArrivalRecordTests(unittest.TestCase):
     """`omdrop watch` finds received files in `upload ...: stored ...` records,
-    so a list the log cap would cut is split across records of whole names."""
+    one name per record, so no name can be read as two."""
 
     def setUp(self):
         self.records = arrival_namespace()
 
-    def test_a_list_that_fits_is_one_record_as_before(self):
-        self.assertEqual(self.records("T1", ["a.txt", "b c.txt"]),
-                         ["upload T1: stored a.txt, b c.txt"])
+    def test_one_file_or_none_is_one_plain_record(self):
+        self.assertEqual(self.records("T1", ["private.png, sent.txt"]),
+                         ["upload T1: stored private.png, sent.txt"])
         self.assertEqual(self.records("T1", []), ["upload T1: stored "])
 
-    def test_a_list_past_16_kib_is_split_into_numbered_records_of_whole_names(self):
-        names = [f"{i:03}-" + "n" * 192 + ".txt" for i in range(200)]
-        records = self.records("T2", names)
-        self.assertEqual(len(records), 3)
-        seen = []
-        for k, record in enumerate(records, 1):
-            prefix = f"upload T2 ({k}/3): stored "
-            self.assertTrue(record.startswith(prefix), record[:40])
-            part = record[len(prefix):]
-            self.assertLessEqual(len(part.encode()), 16_384)
-            seen += part.split(", ")
-        self.assertEqual(seen, names)
-
-    def test_the_split_happens_one_byte_past_the_limit(self):
-        one = "a" * 16_382
-        self.assertEqual(len(self.records("T", [one[:16_380], "b"])), 1)   # 16 383 bytes
-        self.assertEqual(len(self.records("T", [one[:16_381], "b"])), 1)   # 16 384
-        self.assertEqual(self.records("T", [one, "b"]),                    # 16 385
-                         [f"upload T (1/2): stored {one}", "upload T (2/2): stored b"])
+    def test_several_files_are_numbered_records_of_one_name_each(self):
+        self.assertEqual(self.records("T2", ["a, b.txt", "c.txt"]),
+                         ["upload T2 (1/2): stored a, b.txt", "upload T2 (2/2): stored c.txt"])
 
 
 class ArrivalLogTests(ReceiverFixture):
@@ -362,10 +346,34 @@ class ArrivalLogTests(ReceiverFixture):
         self.assertEqual(status, 200)
         records = re.findall(r"INFO root: upload BIG \((\d+)/(\d+)\): stored (.*)$",
                              self.log.read_text(), re.M)
-        self.assertEqual([(k, n) for k, n, _ in records], [("1", "3"), ("2", "3"), ("3", "3")])
-        logged = [name for _, _, part in records for name in part.split(", ")]
-        self.assertEqual(sorted(logged), sorted(names))
+        self.assertEqual([(k, n) for k, n, _ in records],
+                         [(str(k), "200") for k in range(1, 201)])
+        self.assertEqual(sorted(name for _, _, name in records), sorted(names))
         self.assertNotIn("more bytes]", self.log.read_text())
+
+    def upload(self, tid, name):
+        status, _ = self.post(self.connection(), "/Upload", dvzip([(name, b"x")]),
+                              {"Content-Type": "application/x-dvzip", "TransferID": tid})
+        self.assertEqual(status, 200)
+
+    def test_the_transfer_id_is_logged_as_core_labels_it(self):
+        # `omdrop watch` takes `upload <id>: stored <names>` for an arrival.
+        # An ID with a colon or comma would let the budget line read as one,
+        # naming a file before the upload stores anything.
+        self.upload("X: stored existing.png, Z", "new.png")
+        ids = re.findall(r"INFO root: upload (\S+?)(?: \(\d+/\d+\))?: ", self.log.read_text())
+        self.assertTrue(ids)
+        for tid in ids:
+            self.assertRegex(tid, r"\A[A-Za-z0-9._-]{1,64}\Z")
+        self.assertIn("INFO root: upload Xstoredexisting.pngZ: stored new.png", self.log.read_text())
+        self.assertNotRegex(self.log.read_text(), r"INFO root: upload X: stored existing\.png")
+
+    def test_a_name_is_stored_as_the_log_names_it(self):
+        # The log escapes U+2028 and U+2029, so a name keeping them would be
+        # logged as something no file is called.
+        self.upload("SEP", "a\u2028b\u2029c.png")
+        self.assertTrue((self.out / "abc.png").is_file())
+        self.assertIn("INFO root: upload SEP: stored abc.png", self.log.read_text())
 
 
 if __name__ == "__main__":

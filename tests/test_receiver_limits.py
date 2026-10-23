@@ -47,7 +47,7 @@ def receiver_namespace():
         "unicodedata": unicodedata,
         "zlib": zlib,
         "UNSAFE_CHAR": re.compile(
-            r"[/\\\x00]|[\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]|[\x01-\x1f\x7f-\x9f]"
+            r"[/\\\x00]|[\u2028\u2029\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]|[\x01-\x1f\x7f-\x9f]"
         ),
     }
     exec(source[start:end], namespace)
