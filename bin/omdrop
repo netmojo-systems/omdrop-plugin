@@ -125,7 +125,7 @@ OMDROP_HOOKS="${OMDROP_HOOKS:-/usr/lib/omdrop/radio}"
 # happens. `status` is not on the list; the panel's refresh runs it.
 changes_panel() {
   case "${1:-}" in
-    on|start|off|stop|toggle|name|dir|sound|limit|visibility|vis|viz|senders) return 0 ;;
+    on|start|off|stop|toggle|name|dir|sound|limit|visibility|vis|viz|senders|identity) return 0 ;;
   esac
   return 1
 }
