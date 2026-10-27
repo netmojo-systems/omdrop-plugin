@@ -122,7 +122,8 @@ OMDROP_HOOKS="${OMDROP_HOOKS:-/usr/lib/omdrop/radio}"
 # it to look again once they finish, whichever implementation ran them, and
 # whether they succeeded or not: a failed `on` changes state too. Best effort:
 # no Omarchy shell, no panel, or an older panel without `refresh`, and nothing
-# happens. `status` is not on the list; the panel's refresh runs it.
+# happens. `identity` is on it because `identity lock` ends a window.
+# `status` is not on the list; the panel's refresh runs it.
 changes_panel() {
   case "${1:-}" in
     on|start|off|stop|toggle|name|dir|sound|limit|visibility|vis|viz|senders|identity) return 0 ;;

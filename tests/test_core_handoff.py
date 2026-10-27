@@ -211,6 +211,11 @@ class PanelRefreshTests(HandoffHarness):
         self.assert_handed_off(self.run_omdrop("status", "--json"))
         self.assertEqual(self.refreshes(), [])
 
+    def test_identity_lock_refreshes_the_panel(self):
+        # `identity lock` ends any window it finds, so the bar must catch up.
+        self.assert_handed_off(self.run_omdrop("identity", "lock"))
+        self.assertEqual(self.refreshes(), ["-q netmojo.omdrop refresh"])
+
     def test_a_state_change_in_the_bash_refreshes_the_panel(self):
         run = self.run_omdrop("name", OMDROP_IMPLEMENTATION="python")
         self.assertEqual(run.returncode, 0, run.stderr)
