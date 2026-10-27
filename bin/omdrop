@@ -116,6 +116,23 @@ core_version() {
 }
 OMDROP_CORE="${OMDROP_CORE:-/usr/lib/omdrop-core/omdrop}"
 OMDROP_HOOKS="${OMDROP_HOOKS:-/usr/lib/omdrop/radio}"
+
+# The panel polls every ten seconds, so a window opened or a setting changed
+# from a terminal could show the old state for that long. These commands tell
+# it to look again once they finish, whichever implementation ran them, and
+# whether they succeeded or not: a failed `on` changes state too. Best effort:
+# no Omarchy shell, no panel, or an older panel without `refresh`, and nothing
+# happens. `status` is not on the list; the panel's refresh runs it.
+changes_panel() {
+  case "${1:-}" in
+    on|start|off|stop|toggle|name|dir|sound|limit|visibility|vis|viz|senders) return 0 ;;
+  esac
+  return 1
+}
+panel_refresh() {
+  command -v omarchy-shell >/dev/null 2>&1 || return 0
+  timeout -k 1 2 omarchy-shell -q netmojo.omdrop refresh </dev/null >/dev/null 2>&1 || true
+}
 case "${OMDROP_IMPLEMENTATION:-}" in
   python) ;;
   rust|'')
@@ -131,6 +148,13 @@ case "${OMDROP_IMPLEMENTATION:-}" in
       else
         CORE_TOO_OLD=$(core_version)
         if [[ -n "$CORE_TOO_OLD" ]] && version_ge "$CORE_TOO_OLD" "$CORE_MIN"; then
+          if changes_panel "${1:-}"; then
+            # A subshell, so core still sees this script as $0.
+            (exec -a "$0" "$OMDROP_CORE" "$@")
+            rc=$?
+            panel_refresh
+            exit "$rc"
+          fi
           exec -a "$0" "$OMDROP_CORE" "$@"
         fi
         CORE_TOO_OLD=${CORE_TOO_OLD:-unknown}
@@ -3530,6 +3554,7 @@ systemctl --user status $UNIT"
 # has used systemctl reaches for start/stop, and someone who has used a peer
 # tool reaches for list. Accepting the near-miss costs one word here and saves
 # a person re-reading the help to learn a synonym we could simply have taken.
+changes_panel "${1:-}" && trap panel_refresh EXIT
 case "${1:-status}" in
   on|start)   shift; cmd_on "$@" ;;
   off|stop)   shift; cmd_off "$@" ;;
