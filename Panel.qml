@@ -995,11 +995,12 @@ Panel {
   }
 
   // The resync. Slower than the tick, and what notices a window that ended
-  // somewhere else -- an expiry we did not predict, or someone running
-  // `omdrop off` in a terminal. Every 3 s only while the open panel waits for
-  // the radio to come up, so it shows us visible soon after; otherwise every
-  // 10 s, since each poll is a few dozen processes and the panel's own
-  // commands ask for a fresh status when they finish.
+  // somewhere else -- an expiry we did not predict, or an `omdrop` command run
+  // in a terminal that did not reach the refresh call below. Every 3 s only
+  // while the open panel waits for the radio to come up, so it shows us
+  // visible soon after; otherwise every 10 s, since each poll is a few dozen
+  // processes and the panel's own commands ask for a fresh status when they
+  // finish.
   Timer {
     interval: root.opened && root.receiving && root.visibility !== 1 ? 3000 : 10000
     repeat: true
@@ -1020,10 +1021,15 @@ Panel {
     if (!opened && !sendProc.running && !pickingDir) radarOpen = false
   }
 
+  // `refresh` is how `omdrop on`, `off` and the settings commands, run from a
+  // terminal, show at once rather than at the next poll (bin/omdrop,
+  // panel_refresh). It asks for a status like any other; one already in
+  // flight is followed by another.
   IpcHandler {
     target: root.ipcTarget
     function toggle(): string { root.toggleOmdrop(); return "ok" }
     function status(): string { return root.stateText }
+    function refresh(): string { root.refreshStatus(); return "ok" }
   }
 
   BarIconButton {

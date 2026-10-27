@@ -33,7 +33,7 @@ def older(version):
     return ".".join(map(str, parts)) or "0"
 
 
-class CoreHandoffTests(unittest.TestCase):
+class HandoffHarness(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -71,6 +71,8 @@ class CoreHandoffTests(unittest.TestCase):
         self.assertTrue(run.stdout.startswith("omdrop "), run.stdout)
         self.assertNotIn("core argv0", run.stdout)
 
+
+class CoreHandoffTests(HandoffHarness):
     def test_installed_core_gets_the_command_and_its_args_untouched(self):
         run = self.run_omdrop("send", "--to", "a b", "x")
         self.assertEqual(run.returncode, 7, run.stderr)
@@ -165,6 +167,63 @@ class CoreHandoffTests(unittest.TestCase):
         number = lambda v: tuple(int(p) for p in v.split("."))
         self.assertGreaterEqual(number(workspace), number(CORE_MIN),
                                 f"core/ is {workspace}, CORE_MIN {CORE_MIN}")
+
+
+class PanelRefreshTests(HandoffHarness):
+    """Commands that change what the panel shows ask it to look again."""
+
+    def setUp(self):
+        super().setUp()
+        # omarchy-shell as the shell answers IPC: log the call.
+        bin_dir = Path(self.tmp.name) / "bin"
+        bin_dir.mkdir()
+        self.ipc_log = Path(self.tmp.name) / "ipc.log"
+        shell = bin_dir / "omarchy-shell"
+        shell.write_text(f'#!/bin/sh\necho "$*" >> {self.ipc_log}\n')
+        shell.chmod(0o755)
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(PATH=f"{bin_dir}:{os.environ['PATH']}", HOME=str(home),
+                        XDG_CONFIG_HOME=str(home / ".config"))
+
+    def refreshes(self):
+        return self.ipc_log.read_text().splitlines() if self.ipc_log.exists() else []
+
+    def test_a_state_change_through_core_refreshes_the_panel(self):
+        run = self.run_omdrop("on", "--everyone")
+        # Core's exit status and arguments are untouched.
+        self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertTrue(run.stdout.strip().endswith("args=[on][--everyone]"), run.stdout)
+        self.assertEqual(self.refreshes(), ["-q netmojo.omdrop refresh"])
+
+    def test_core_still_sees_this_script_as_argv0_for_a_state_change(self):
+        # As test_installed_core_sees_this_script_as_argv0, through the
+        # subshell that waits to refresh: `python3 on` runs the file "on".
+        (Path(self.tmp.name) / "version").write_text(f'print("omdrop-core {CORE_MIN}")\n')
+        (Path(self.tmp.name) / "on").write_text("import sys; print(sys.orig_argv[0])\n")
+        run = self.run_omdrop("on", OMDROP_CORE=str(Path(sys.executable).resolve()))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), str(OMDROP))
+        self.assertEqual(self.refreshes(), ["-q netmojo.omdrop refresh"])
+
+    def test_status_does_not_refresh(self):
+        # The panel's refresh runs `status`: refreshing from it would loop.
+        self.assert_handed_off(self.run_omdrop("status", "--json"))
+        self.assertEqual(self.refreshes(), [])
+
+    def test_identity_lock_refreshes_the_panel(self):
+        # `identity lock` ends any window it finds, so the bar must catch up.
+        self.assert_handed_off(self.run_omdrop("identity", "lock"))
+        self.assertEqual(self.refreshes(), ["-q netmojo.omdrop refresh"])
+
+    def test_a_state_change_in_the_bash_refreshes_the_panel(self):
+        run = self.run_omdrop("name", OMDROP_IMPLEMENTATION="python")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.refreshes(), ["-q netmojo.omdrop refresh"])
+
+    def test_no_omarchy_shell_is_not_an_error(self):
+        (Path(self.tmp.name) / "bin" / "omarchy-shell").unlink()
+        self.assert_handed_off(self.run_omdrop("off"))
 
 
 if __name__ == "__main__":
