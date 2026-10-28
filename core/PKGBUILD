@@ -11,7 +11,7 @@
 # --frozen, the omarchy-pkgs house pattern for Rust.
 
 pkgname=omdrop-core
-pkgver=0.1.9
+pkgver=0.1.10
 pkgrel=1
 pkgdesc="Omdrop core: send and receive with nearby Apple devices over AirDrop (CLI, receiver, sender, identity, root helper)"
 arch=('aarch64' 'x86_64')
