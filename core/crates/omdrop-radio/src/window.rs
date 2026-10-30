@@ -35,6 +35,9 @@ const REAP: Duration = Duration::from_secs(5);
 /// How long a `start` or a supervisor waits for `window.lock`. Its holders
 /// only read and write state files under it.
 const WINDOW_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How long a start waits for the driver's boot-time warm-up (awdl-warmup),
+/// which holds the start lock while its gate runs.
+const WARMUP_WAIT: Duration = Duration::from_secs(180);
 /// How long a `start` waits for a supervisor that is ending its window. Its
 /// teardown is bounded at about 75 s: a second between TERM and KILL for its
 /// children, REAP for them, then `down` (DOWN_TIMEOUT, plus the TERM grace,
@@ -274,6 +277,19 @@ fn until_live(ctx: &Ctx) -> bool {
         .filter(|d| is_uint(d))
         .and_then(|d| d.parse::<u64>().ok())
         .is_some_and(|d| d == 0 || now() < d)
+}
+
+/// Whether the driver's boot-time warm-up holds the start lock: it records its
+/// pid in `warmup` while it runs. Its comm is the interpreter's, so its command
+/// line is what names it; a reused pid fails this.
+fn warmup_running(ctx: &Ctx) -> bool {
+    ctx.state("warmup")
+        .and_then(|p| p.parse::<u32>().ok())
+        .is_some_and(|pid| {
+            proc::cmdline(pid)
+                .iter()
+                .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"awdl-warmup".as_slice()))
+        })
 }
 
 /// `window.lock`, held by a `start` while it looks at a window and extends
@@ -696,8 +712,26 @@ pub fn start(ctx: &mut Ctx, args: &[String]) -> Res {
     // SAFETY: the fd is valid for the lifetime of `lock`; the lock is released
     // when it closes. It is opened O_CLOEXEC, so the supervisor never holds it.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        ctx.log("another start is already in its gate; not racing it");
-        return Ok(5);
+        // The driver's boot-time warm-up holds the lock for its gate. A window
+        // opened right after login waits for it rather than failing; once it
+        // ends, this start's first probe passes.
+        if !warmup_running(ctx) {
+            ctx.log("another start is already in its gate; not racing it");
+            return Ok(5);
+        }
+        ctx.log("waiting for the boot-time warm-up to finish");
+        let end = Instant::now() + WARMUP_WAIT;
+        // SAFETY: as above.
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            if Instant::now() >= end {
+                ctx.log(&format!(
+                    "the warm-up held the start lock for {} s; not racing it",
+                    WARMUP_WAIT.as_secs()
+                ));
+                return Ok(5);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     proc::catch_termination();
 

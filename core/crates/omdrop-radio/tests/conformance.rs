@@ -591,6 +591,59 @@ fn only_one_start_at_a_time() {
     assert_eq!(fx.supervisors().len(), 1);
 }
 
+/// Holds the run directory's start lock from a process whose command line
+/// names the driver's boot-time warm-up, or some other process, and records
+/// its pid in `run/warmup` as the warm-up does.
+fn hold_start_lock(fx: &Fx, as_warmup: bool, seconds: &str) -> Child {
+    let name = if as_warmup {
+        "awdl-warmup"
+    } else {
+        "other-start"
+    };
+    let script = fx.path(name);
+    fs::write(
+        &script,
+        format!(
+            "#!/usr/bin/env bash\nexec 9>\"{run}/start.lock\"\nflock 9\necho $$ > \"{run}/warmup\"\nsleep {seconds}\n",
+            run = fx.path("run").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = Command::new(&script).spawn().unwrap();
+    assert!(wait_for(Duration::from_secs(5), || fx
+        .path("run/warmup")
+        .exists()));
+    child
+}
+
+#[test]
+fn a_start_during_the_boot_warmup_waits_for_it() {
+    let fx = Fx::new();
+    fs::create_dir_all(fx.path("run")).unwrap();
+    let mut warmup = hold_start_lock(&fx, true, "1.5");
+    let t = Instant::now();
+    let o = fx.run(&["start", "600"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stderr(&o).contains("waiting for the boot-time warm-up to finish"));
+    assert!(t.elapsed() >= Duration::from_secs(1), "{:?}", t.elapsed());
+    warmup.wait().unwrap();
+}
+
+#[test]
+fn a_start_held_by_anything_else_still_refuses_at_once() {
+    let fx = Fx::new();
+    fs::create_dir_all(fx.path("run")).unwrap();
+    let mut other = hold_start_lock(&fx, false, "5");
+    let t = Instant::now();
+    let o = fx.run(&["start", "600"]);
+    assert_eq!(o.status.code(), Some(5), "{}", stderr(&o));
+    assert!(stderr(&o).contains("another start is already in its gate; not racing it"));
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    other.kill().unwrap();
+    other.wait().unwrap();
+}
+
 #[test]
 fn hooks_and_children_get_only_the_fixed_environment() {
     let fx = Fx::new();
