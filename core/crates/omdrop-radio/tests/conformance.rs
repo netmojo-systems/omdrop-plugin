@@ -618,31 +618,57 @@ fn spawn_script(fx: &Fx, name: &str, body: &str, until: &str) -> Child {
     child
 }
 
+/// Shell that waits for the test to create `run/<name>`.
+fn until_released(name: &str) -> String {
+    format!("while [ ! -e \"$RUN/{name}\" ]; do sleep 0.02; done\n")
+}
+
 /// The driver's warm-up, as it takes and lets go of its locks: `warmup.lock`
-/// first and last, the start lock inside it, for its gate.
-fn warmup_script(gate_seconds: &str) -> String {
+/// first and last, the start lock inside it, for a gate that lasts until the
+/// test creates `run/gate-done`.
+fn warmup_script() -> String {
     format!(
         "exec 9>\"$RUN/warmup.lock\"\nflock 9\ntouch \"$RUN/warming\"\n\
          exec 8>\"$RUN/start.lock\"\nflock 8\ntouch \"$RUN/in-gate\"\n\
-         sleep {gate_seconds}\nflock -u 8\nflock -u 9\n"
+         {}flock -u 8\nflock -u 9\n",
+        until_released("gate-done")
     )
 }
 
-/// Another start: it holds the start lock and nothing else.
-fn other_start(seconds: &str) -> String {
-    format!("exec 8>\"$RUN/start.lock\"\nflock 8\ntouch \"$RUN/other-start\"\nsleep {seconds}\n")
+/// Another start: it holds the start lock, and nothing else, until the test
+/// creates `run/other-done`.
+fn other_start() -> String {
+    format!(
+        "exec 8>\"$RUN/start.lock\"\nflock 8\ntouch \"$RUN/other-start\"\n{}",
+        until_released("other-done")
+    )
+}
+
+/// Runs `start 600` in the background and returns once it logs that it is
+/// waiting for the warm-up.
+fn start_waiting_for_warmup(fx: &Fx) -> Child {
+    let start = fx.spawn(&["start", "600"]);
+    assert!(
+        wait_for(Duration::from_secs(10), || fx
+            .read("run/log")
+            .contains("waiting for the boot-time warm-up to finish")),
+        "start never waited for the warm-up: {}",
+        fx.read("run/log")
+    );
+    start
 }
 
 #[test]
 fn a_start_during_the_boot_warmup_waits_for_it() {
     let fx = Fx::new();
     fs::create_dir_all(fx.path("run")).unwrap();
-    let mut warmup = spawn_script(&fx, "awdl-warmup", &warmup_script("1.5"), "in-gate");
-    let t = Instant::now();
-    let o = fx.run(&["start", "600"]);
+    let mut warmup = spawn_script(&fx, "awdl-warmup", &warmup_script(), "in-gate");
+    let start = start_waiting_for_warmup(&fx);
+    assert!(!fx.called("up "), "start ran up during the warm-up's gate");
+    fs::write(fx.path("run/gate-done"), "").unwrap();
+    let o = start.wait_with_output().unwrap();
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert!(stderr(&o).contains("waiting for the boot-time warm-up to finish"));
-    assert!(t.elapsed() >= Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(fx.called("up "));
     warmup.wait().unwrap();
 }
 
@@ -650,13 +676,13 @@ fn a_start_during_the_boot_warmup_waits_for_it() {
 fn a_start_held_by_anything_else_still_refuses_at_once() {
     let fx = Fx::new();
     fs::create_dir_all(fx.path("run")).unwrap();
-    let mut other = spawn_script(&fx, "other-start", &other_start("8"), "other-start");
+    let mut other = spawn_script(&fx, "other-start", &other_start(), "other-start");
     let t = Instant::now();
     let o = fx.run(&["start", "600"]);
     assert_eq!(o.status.code(), Some(5), "{}", stderr(&o));
     assert!(stderr(&o).contains("another start is already in its gate; not racing it"));
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
-    other.kill().unwrap();
+    fs::write(fx.path("run/other-done"), "").unwrap();
     other.wait().unwrap();
 }
 
@@ -667,11 +693,13 @@ fn a_start_held_by_anything_else_still_refuses_at_once() {
 fn a_warmup_queued_behind_another_start_makes_a_start_wait() {
     let fx = Fx::new();
     fs::create_dir_all(fx.path("run")).unwrap();
-    let mut other = spawn_script(&fx, "other-start", &other_start("1"), "other-start");
-    let mut warmup = spawn_script(&fx, "awdl-warmup", &warmup_script("0.2"), "warming");
-    let o = fx.run(&["start", "600"]);
+    let mut other = spawn_script(&fx, "other-start", &other_start(), "other-start");
+    let mut warmup = spawn_script(&fx, "awdl-warmup", &warmup_script(), "warming");
+    let start = start_waiting_for_warmup(&fx);
+    fs::write(fx.path("run/other-done"), "").unwrap();
+    fs::write(fx.path("run/gate-done"), "").unwrap();
+    let o = start.wait_with_output().unwrap();
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert!(stderr(&o).contains("waiting for the boot-time warm-up to finish"));
     assert!(!stderr(&o).contains("not racing it"));
     other.wait().unwrap();
     warmup.wait().unwrap();
