@@ -682,6 +682,9 @@ fn a_start_held_by_anything_else_still_refuses_at_once() {
     assert_eq!(o.status.code(), Some(5), "{}", stderr(&o));
     assert!(stderr(&o).contains("another start is already in its gate; not racing it"));
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    // It found no warmup.lock and made one rather than reading its absence
+    // as "no warm-up": a warm-up could make it a moment later.
+    assert!(fx.path("run/warmup.lock").exists());
     fs::write(fx.path("run/other-done"), "").unwrap();
     other.wait().unwrap();
 }

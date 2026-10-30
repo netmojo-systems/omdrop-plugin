@@ -367,10 +367,12 @@ tested once, in Rust, for every backend:
   `start` during a live window moves its deadline (exit 5). The exception is
   the driver's boot-time warm-up. It holds `warmup.lock` whenever it holds
   `start.lock`, taking it first and letting go of it last. A start that finds
-  `start.lock` held and `warmup.lock` held too waits up to 180 s, and exits 3
-  if `start.lock` never comes free; with `warmup.lock` free it tries
-  `start.lock` once more, for a warm-up that let go of both in between, and
-  otherwise exits 5.
+  `start.lock` held opens `warmup.lock`, creating it if absent, and tries it
+  shared without waiting. Busy: it closes it, waits up to 180 s for
+  `start.lock`, and exits 3 if it never comes free. Free: it keeps it while it
+  tries `start.lock` once more, so no warm-up can take both in between, then
+  lets go; a holder then is another start (exit 5). A failure to open or lock
+  either file exits 3.
 - The supervisor decides to end its window (expiry, `stop`, the radio lost)
   under `flock` on `window.lock`, and removes `until` before anything else;
   on expiry it re-reads `until` under the lock, so a deadline a second
