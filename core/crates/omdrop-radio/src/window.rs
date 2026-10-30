@@ -35,6 +35,9 @@ const REAP: Duration = Duration::from_secs(5);
 /// How long a `start` or a supervisor waits for `window.lock`. Its holders
 /// only read and write state files under it.
 const WINDOW_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How long a start waits for the driver's boot-time warm-up (awdl-warmup),
+/// which holds the start lock while its gate runs.
+const WARMUP_WAIT: Duration = Duration::from_secs(180);
 /// How long a `start` waits for a supervisor that is ending its window. Its
 /// teardown is bounded at about 75 s: a second between TERM and KILL for its
 /// children, REAP for them, then `down` (DOWN_TIMEOUT, plus the TERM grace,
@@ -274,6 +277,67 @@ fn until_live(ctx: &Ctx) -> bool {
         .filter(|d| is_uint(d))
         .and_then(|d| d.parse::<u64>().ok())
         .is_some_and(|d| d == 0 || now() < d)
+}
+
+/// `flock` without waiting: `Ok(true)` when taken, `Ok(false)` when someone
+/// else holds it.
+fn lock_nb(f: &std::fs::File, op: libc::c_int) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: flock on a descriptor `f` owns; released when it closes.
+        if unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => return Ok(false),
+            Some(libc::EINTR) => {}
+            _ => return Err(e),
+        }
+    }
+}
+
+/// Who held the start lock when a `start` first tried it.
+#[derive(Debug, PartialEq, Eq)]
+enum Holder {
+    /// Nobody by the second try: this start has the lock.
+    Free,
+    /// The driver's boot-time warm-up, seen holding `warmup.lock`.
+    Warmup,
+    /// Another start: it held the start lock while no warm-up could have.
+    Other,
+    /// Could not tell; not proof of another start.
+    Unknown(String),
+}
+
+/// Called with `start` (the start lock) held by someone else, and `guard`
+/// opened on `warmup.lock`. The warm-up holds `warmup.lock`, taken first and
+/// let go of last, whenever it holds the start lock. Busy means the warm-up.
+/// Free, it is held shared through a second try for the start lock, so no
+/// warm-up can take both in between; a holder then is another start. Released
+/// before returning, so it is never held through a wait for the start lock.
+/// `between` runs at that point; tests use it to schedule other holders.
+fn start_lock_holder(
+    guard: std::io::Result<std::fs::File>,
+    start: &std::fs::File,
+    between: &mut dyn FnMut(),
+) -> Holder {
+    let guard = match guard {
+        Ok(g) => g,
+        Err(e) => return Holder::Unknown(format!("cannot open warmup.lock: {e}")),
+    };
+    match lock_nb(&guard, libc::LOCK_SH) {
+        Ok(true) => {}
+        Ok(false) => return Holder::Warmup,
+        Err(e) => return Holder::Unknown(format!("cannot lock warmup.lock: {e}")),
+    }
+    between();
+    let second = lock_nb(start, libc::LOCK_EX);
+    drop(guard);
+    match second {
+        Ok(true) => Holder::Free,
+        Ok(false) => Holder::Other,
+        Err(e) => Holder::Unknown(format!("cannot take the start lock: {e}")),
+    }
 }
 
 /// `window.lock`, held by a `start` while it looks at a window and extends
@@ -693,11 +757,54 @@ pub fn start(ctx: &mut Ctx, args: &[String]) -> Res {
         .transpose()
         .map_err(|e| exit(3, format!("cannot open the start lock: {e}")))?
         .ok_or_else(|| exit(3, "the run directory is not open"))?;
-    // SAFETY: the fd is valid for the lifetime of `lock`; the lock is released
-    // when it closes. It is opened O_CLOEXEC, so the supervisor never holds it.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        ctx.log("another start is already in its gate; not racing it");
-        return Ok(5);
+    // The lock is released when `lock` closes. It is opened O_CLOEXEC, so the
+    // supervisor never holds it. The warm-up's guard is created if absent: a
+    // missing file says nothing, since the warm-up may create it next.
+    let holder = match lock_nb(&lock, libc::LOCK_EX) {
+        Ok(true) => Holder::Free,
+        Ok(false) => {
+            let guard = ctx
+                .rd
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("the run directory is not open"))
+                .and_then(|rd| rd.append("warmup.lock"));
+            start_lock_holder(guard, &lock, &mut || {})
+        }
+        Err(e) => Holder::Unknown(format!("cannot take the start lock: {e}")),
+    };
+    match &holder {
+        Holder::Other => {
+            ctx.log("another start is already in its gate; not racing it");
+            return Ok(5);
+        }
+        // 3, not 5: no window opened, and nothing showed another start.
+        Holder::Unknown(why) => {
+            ctx.log(&format!("{why}; try again"));
+            return Ok(3);
+        }
+        Holder::Free | Holder::Warmup => {}
+    }
+    if holder == Holder::Warmup {
+        // The driver's boot-time warm-up holds the lock for its gate. A window
+        // opened right after login waits for it rather than failing; once it
+        // ends, this start's first probe passes. Not looked at again: the
+        // lock wait covers a warm-up that has just let go.
+        ctx.log("waiting for the boot-time warm-up to finish");
+        let end = Instant::now() + WARMUP_WAIT;
+        while !lock_nb(&lock, libc::LOCK_EX)
+            .map_err(|e| exit(3, format!("cannot take the start lock: {e}")))?
+        {
+            if Instant::now() >= end {
+                // 3, not 5: no window opened, and 5 reads as "already
+                // starting or visible" to callers.
+                ctx.log(&format!(
+                    "the boot-time warm-up held the start lock for {} s; try again",
+                    WARMUP_WAIT.as_secs()
+                ));
+                return Ok(3);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     proc::catch_termination();
 
@@ -1305,19 +1412,134 @@ pub fn status(ctx: &mut Ctx, args: &[String]) -> Res {
 mod tests {
     use super::*;
 
+    /// Two files in a fresh directory, each open as a separate process would
+    /// have it: `flock` locks belong to the open file, so they conflict.
+    struct Locks {
+        dir: tempfile::TempDir,
+    }
+
+    impl Locks {
+        fn new() -> Self {
+            Locks {
+                dir: tempfile::tempdir().unwrap(),
+            }
+        }
+        fn open(&self, name: &str) -> std::fs::File {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.dir.path().join(name))
+                .unwrap()
+        }
+        fn held(&self, name: &str, op: libc::c_int) -> std::fs::File {
+            let f = self.open(name);
+            assert!(lock_nb(&f, op).unwrap(), "{name} was already held");
+            f
+        }
+    }
+
+    #[test]
+    fn a_held_guard_is_the_warmup() {
+        let l = Locks::new();
+        let start = l.open("start.lock");
+        let _warmup = (
+            l.held("warmup.lock", libc::LOCK_EX),
+            l.held("start.lock", libc::LOCK_EX),
+        );
+        let holder = start_lock_holder(Ok(l.open("warmup.lock")), &start, &mut || {});
+        assert_eq!(holder, Holder::Warmup);
+    }
+
+    #[test]
+    fn a_start_lock_held_with_the_guard_free_is_another_start() {
+        let l = Locks::new();
+        let start = l.open("start.lock");
+        let _other = l.held("start.lock", libc::LOCK_EX);
+        let holder = start_lock_holder(Ok(l.open("warmup.lock")), &start, &mut || {});
+        assert_eq!(holder, Holder::Other);
+        // The guard was let go of: a warm-up can take it now.
+        drop(l.held("warmup.lock", libc::LOCK_EX));
+    }
+
+    /// Review 1029, schedule a: the warm-up let go of both locks after the
+    /// first try failed and before the guard was looked at.
+    #[test]
+    fn a_warmup_gone_before_the_look_leaves_the_lock_free() {
+        let l = Locks::new();
+        let start = l.open("start.lock");
+        let warmup = (
+            l.held("warmup.lock", libc::LOCK_EX),
+            l.held("start.lock", libc::LOCK_EX),
+        );
+        assert!(!lock_nb(&start, libc::LOCK_EX).unwrap());
+        drop(warmup);
+        let holder = start_lock_holder(Ok(l.open("warmup.lock")), &start, &mut || {});
+        assert_eq!(holder, Holder::Free);
+    }
+
+    /// Review 1029, schedule b: between the guard look and the second try,
+    /// the other start lets go without a window and one warm-up starts. The
+    /// guard held shared keeps it out, so the second try takes the lock.
+    #[test]
+    fn a_warmup_cannot_take_both_locks_between_the_looks() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let l = Locks::new();
+        let start = l.open("start.lock");
+        let mut other = Some(l.held("start.lock", libc::LOCK_EX));
+        let in_gate = Arc::new(AtomicBool::new(false));
+        let mut warmup = None;
+        let holder = start_lock_holder(Ok(l.open("warmup.lock")), &start, &mut || {
+            drop(other.take());
+            // The warm-up's order: warmup.lock, then the start lock, waiting
+            // for each.
+            let (guard, lock, flag) =
+                (l.open("warmup.lock"), l.open("start.lock"), in_gate.clone());
+            warmup = Some(std::thread::spawn(move || {
+                // SAFETY: blocking flock on descriptors this thread owns.
+                unsafe {
+                    libc::flock(guard.as_raw_fd(), libc::LOCK_EX);
+                    libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
+                }
+                flag.store(true, Ordering::SeqCst);
+            }));
+            // Long enough for an unblocked warm-up to take both.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !in_gate.load(Ordering::SeqCst),
+                "the warm-up got in between the looks"
+            );
+        });
+        assert_eq!(holder, Holder::Free);
+        drop(start);
+        warmup.unwrap().join().unwrap();
+        assert!(in_gate.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_guard_that_cannot_be_opened_is_not_another_start() {
+        let l = Locks::new();
+        let start = l.open("start.lock");
+        let _other = l.held("start.lock", libc::LOCK_EX);
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let holder = start_lock_holder(Err(err), &start, &mut || {});
+        assert!(matches!(holder, Holder::Unknown(_)), "{holder:?}");
+    }
+
     /// The backend contract promises callers that `start` returns within
-    /// 720 s, and the CLI waits that long (omdrop-cli RADIO_START_LIMIT).
+    /// 900 s, and the CLI waits that long (omdrop-cli RADIO_START_LIMIT).
     /// A caller that gives up sooner stops a start that would have worked.
     /// This is the slowest path through `start`: every wait and hook runs
     /// to its bound, and the supervisor then fails to start.
     #[test]
     fn start_returns_within_the_contracts_bound() {
-        const CONTRACT_START_BOUND: Duration = Duration::from_secs(720);
+        const CONTRACT_START_BOUND: Duration = Duration::from_secs(900);
         // proc::hook past a timeout: TERM, GRACE, KILL, up to REAP for the
         // exit, then DRAIN for the pipes.
         let killed = |t: Duration| t + proc::GRACE + proc::REAP + proc::DRAIN;
         let kill_children = Duration::from_secs(1) + REAP;
-        let worst = WINDOW_LOCK_WAIT
+        let worst = WARMUP_WAIT
+            + WINDOW_LOCK_WAIT
             + CLOSING_WAIT
             + Duration::from_secs(2) // kill_orphaned_hook
             + kill_children

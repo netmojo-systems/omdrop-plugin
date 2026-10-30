@@ -120,8 +120,9 @@ the hook's stdout or stderr open. Core stops reading a hook's output 1 s after
 the hook exits, whether or not the pipes have closed. `down` must stop any
 such process.
 
-`start` as a whole returns within **720 s**, its bound for callers: the
-window lock (10 s) and a wait for a closing window (90 s), then `probe`,
+`start` as a whole returns within **900 s**, its bound for callers: a wait
+for the driver's boot-time warm-up (180 s, only while it runs),
+the window lock (10 s) and a wait for a closing window (90 s), then `probe`,
 `up` and `identity` at their timeouts plus the kill grace above (8 s each),
 and on a failure `down`. A caller must wait at least that long (`omdrop`
 does), or it gives up on a start that was going to work. omdrop-radio's
@@ -336,6 +337,7 @@ process (through `pids`) or write a file anywhere (through a symlink).
 |`supervisor.token`, `start.lock`, `window.lock`, `pids.dying.*`, `hook.pgid`|core|Supervisor lifecycle. The token is mode 0600.|
 |`announce`|core|`up`'s announce settings, validated.|
 |`mdns.log`, `ble.log`, `peers.log`|core|Children's output.|
+|`warmup.lock`|backend|Held by the driver's boot-time warm-up while it runs. Core only takes it shared, for an instant, to look.|
 |`peerop.degraded`|backend|Present while registering a peer with the radio fails. `status` then reports `peer_op` `degraded`, and reason `peer_op_failed` instead of `ok`.|
 |anything else|backend|Backend state, for example omdrop-awdl's `election.*`, `*.bin`, `diag.*`, `read.*`, `advertisers.*`. Core never reads these files.|
 
@@ -362,7 +364,15 @@ tested once, in Rust, for every backend:
   `supervisor.token` (0600). Core passes the token in the child's
   environment, which pkexec strips from a direct call.
 - One start at a time (`flock` on `start.lock`, else exit 5). A second
-  `start` during a live window moves its deadline (exit 5).
+  `start` during a live window moves its deadline (exit 5). The exception is
+  the driver's boot-time warm-up. It holds `warmup.lock` whenever it holds
+  `start.lock`, taking it first and letting go of it last. A start that finds
+  `start.lock` held opens `warmup.lock`, creating it if absent, and tries it
+  shared without waiting. Busy: it closes it, waits up to 180 s for
+  `start.lock`, and exits 3 if it never comes free. Free: it keeps it while it
+  tries `start.lock` once more, so no warm-up can take both in between, then
+  lets go; a holder then is another start (exit 5). A failure to open or lock
+  either file exits 3.
 - The supervisor decides to end its window (expiry, `stop`, the radio lost)
   under `flock` on `window.lock`, and removes `until` before anything else;
   on expiry it re-reads `until` under the lock, so a deadline a second
