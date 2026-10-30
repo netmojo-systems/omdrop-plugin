@@ -120,8 +120,9 @@ the hook's stdout or stderr open. Core stops reading a hook's output 1 s after
 the hook exits, whether or not the pipes have closed. `down` must stop any
 such process.
 
-`start` as a whole returns within **900 s**, its bound for callers: a wait
-for the driver's boot-time warm-up (180 s, only while one holds the start lock),
+`start` as a whole returns within **900 s**, its bound for callers: a look
+for the driver's boot-time warm-up (2 s) and a wait for it (180 s), only while
+the start lock is held,
 the window lock (10 s) and a wait for a closing window (90 s), then `probe`,
 `up` and `identity` at their timeouts plus the kill grace above (8 s each),
 and on a failure `down`. A caller must wait at least that long (`omdrop`
@@ -363,7 +364,10 @@ tested once, in Rust, for every backend:
   `supervisor.token` (0600). Core passes the token in the child's
   environment, which pkexec strips from a direct call.
 - One start at a time (`flock` on `start.lock`, else exit 5). A second
-  `start` during a live window moves its deadline (exit 5).
+  `start` during a live window moves its deadline (exit 5). The exception is
+  the driver's boot-time warm-up, which names itself in `warmup` while it
+  holds the lock: a start that finds it, within 2 s, waits up to 180 s for it
+  and exits 3 if it never lets go.
 - The supervisor decides to end its window (expiry, `stop`, the radio lost)
   under `flock` on `window.lock`, and removes `until` before anything else;
   on expiry it re-reads `until` under the lock, so a deadline a second

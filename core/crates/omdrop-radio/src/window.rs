@@ -38,6 +38,11 @@ const WINDOW_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// How long a start waits for the driver's boot-time warm-up (awdl-warmup),
 /// which holds the start lock while its gate runs.
 const WARMUP_WAIT: Duration = Duration::from_secs(180);
+/// How long a start that finds the start lock held looks for the warm-up
+/// before taking the holder for another start. The warm-up writes `warmup`
+/// just after it takes the lock and removes it just before it lets go, so one
+/// look can miss it.
+const WARMUP_HANDOFF: Duration = Duration::from_secs(2);
 /// How long a `start` waits for a supervisor that is ending its window. Its
 /// teardown is bounded at about 75 s: a second between TERM and KILL for its
 /// children, REAP for them, then `down` (DOWN_TIMEOUT, plus the TERM grace,
@@ -290,6 +295,23 @@ fn warmup_running(ctx: &Ctx) -> bool {
                 .iter()
                 .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"awdl-warmup".as_slice()))
         })
+}
+
+/// Called with the start lock held by someone else: looks for the warm-up for
+/// up to [`WARMUP_HANDOFF`], or for the lock coming free. True when this start
+/// took the lock. It names itself in `warmup` only while it holds the lock, so
+/// a warm-up queued behind an ordinary start never makes a start wait for that
+/// one; the moments before it writes the file and after it removes it are
+/// what the look covers.
+fn warmup_handed_over(ctx: &Ctx, try_lock: &dyn Fn() -> bool) -> bool {
+    let end = Instant::now() + WARMUP_HANDOFF;
+    while !warmup_running(ctx) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        if try_lock() {
+            return true;
+        }
+    }
+    false
 }
 
 /// `window.lock`, held by a `start` while it looks at a window and extends
@@ -711,7 +733,8 @@ pub fn start(ctx: &mut Ctx, args: &[String]) -> Res {
         .ok_or_else(|| exit(3, "the run directory is not open"))?;
     // SAFETY: the fd is valid for the lifetime of `lock`; the lock is released
     // when it closes. It is opened O_CLOEXEC, so the supervisor never holds it.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let try_lock = || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !try_lock() && !warmup_handed_over(ctx, &try_lock) {
         // The driver's boot-time warm-up holds the lock for its gate. A window
         // opened right after login waits for it rather than failing; once it
         // ends, this start's first probe passes.
@@ -721,8 +744,7 @@ pub fn start(ctx: &mut Ctx, args: &[String]) -> Res {
         }
         ctx.log("waiting for the boot-time warm-up to finish");
         let end = Instant::now() + WARMUP_WAIT;
-        // SAFETY: as above.
-        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        while !try_lock() {
             if Instant::now() >= end {
                 // 3, not 5: no window opened, and 5 reads as "already
                 // starting or visible" to callers.
@@ -1353,7 +1375,8 @@ mod tests {
         // exit, then DRAIN for the pipes.
         let killed = |t: Duration| t + proc::GRACE + proc::REAP + proc::DRAIN;
         let kill_children = Duration::from_secs(1) + REAP;
-        let worst = WARMUP_WAIT
+        let worst = WARMUP_HANDOFF
+            + WARMUP_WAIT
             + WINDOW_LOCK_WAIT
             + CLOSING_WAIT
             + Duration::from_secs(2) // kill_orphaned_hook
