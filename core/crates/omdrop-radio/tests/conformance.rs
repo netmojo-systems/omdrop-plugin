@@ -581,9 +581,7 @@ fn stop_cancels_a_start_still_bringing_the_radio_up() {
 #[test]
 fn only_one_start_at_a_time() {
     let fx = Fx::new();
-    // Well past the second start's 2 s look for the warm-up, so the first is
-    // still in its gate when that look ends.
-    fx.mock("up.sleep", "6");
+    fx.mock("up.sleep", "2");
     let mut first = fx.spawn(&["start", "600"]);
     assert!(wait_for(Duration::from_secs(5), || fx.called("up ")));
     let o = fx.run(&["start", "600"]);
@@ -593,21 +591,23 @@ fn only_one_start_at_a_time() {
     assert_eq!(fx.supervisors().len(), 1);
 }
 
-/// Starts a process called `name` that takes the run directory's start lock,
-/// then runs `body` with `$RUN` set, and returns once `until` exists in the
-/// run directory. The driver's warm-up is a script called `awdl-warmup` that
-/// records its pid in `run/warmup` while it holds the lock.
-fn hold_start_lock(fx: &Fx, name: &str, body: &str, until: &str) -> Child {
+/// Starts a bash script called `name` with `$RUN` set to the run directory,
+/// and returns once `until` exists in it.
+fn spawn_script(fx: &Fx, name: &str, body: &str, until: &str) -> Child {
     let script = fx.path(name);
-    fs::write(
-        &script,
-        format!(
-            "#!/usr/bin/env bash\nRUN=\"{run}\"\nexec 9>\"$RUN/start.lock\"\nflock 9\ntouch \"$RUN/locked\"\n{body}\n",
-            run = fx.path("run").display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    {
+        // Written as `install` copies: no fork may inherit it open; see FORK.
+        let _only_writer = FORK.write().unwrap_or_else(PoisonError::into_inner);
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nRUN=\"{run}\"\n{body}\n",
+                run = fx.path("run").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let child = spawn_quietly(&mut Command::new(&script)).unwrap();
     assert!(
         wait_for(Duration::from_secs(5), || fx
@@ -618,16 +618,26 @@ fn hold_start_lock(fx: &Fx, name: &str, body: &str, until: &str) -> Child {
     child
 }
 
+/// The driver's warm-up, as it takes and lets go of its locks: `warmup.lock`
+/// first and last, the start lock inside it, for its gate.
+fn warmup_script(gate_seconds: &str) -> String {
+    format!(
+        "exec 9>\"$RUN/warmup.lock\"\nflock 9\ntouch \"$RUN/warming\"\n\
+         exec 8>\"$RUN/start.lock\"\nflock 8\ntouch \"$RUN/in-gate\"\n\
+         sleep {gate_seconds}\nflock -u 8\nflock -u 9\n"
+    )
+}
+
+/// Another start: it holds the start lock and nothing else.
+fn other_start(seconds: &str) -> String {
+    format!("exec 8>\"$RUN/start.lock\"\nflock 8\ntouch \"$RUN/other-start\"\nsleep {seconds}\n")
+}
+
 #[test]
 fn a_start_during_the_boot_warmup_waits_for_it() {
     let fx = Fx::new();
     fs::create_dir_all(fx.path("run")).unwrap();
-    let mut warmup = hold_start_lock(
-        &fx,
-        "awdl-warmup",
-        "echo $$ > \"$RUN/warmup\"\nsleep 1.5\nrm -f \"$RUN/warmup\"",
-        "warmup",
-    );
+    let mut warmup = spawn_script(&fx, "awdl-warmup", &warmup_script("1.5"), "in-gate");
     let t = Instant::now();
     let o = fx.run(&["start", "600"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
@@ -636,91 +646,35 @@ fn a_start_during_the_boot_warmup_waits_for_it() {
     warmup.wait().unwrap();
 }
 
-/// The warm-up has the lock and has not named itself yet (review 1029, R2).
 #[test]
-fn a_start_before_the_warmup_names_itself_waits_for_it() {
+fn a_start_held_by_anything_else_still_refuses_at_once() {
     let fx = Fx::new();
     fs::create_dir_all(fx.path("run")).unwrap();
-    let mut warmup = hold_start_lock(
-        &fx,
-        "awdl-warmup",
-        "sleep 0.5\necho $$ > \"$RUN/warmup\"\nsleep 1\nrm -f \"$RUN/warmup\"",
-        "locked",
-    );
-    assert!(!fx.path("run/warmup").exists());
-    let o = fx.run(&["start", "600"]);
-    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert!(stderr(&o).contains("waiting for the boot-time warm-up to finish"));
-    assert!(fx.called("up "));
-    warmup.wait().unwrap();
-}
-
-/// The warm-up's EXIT trap has removed `warmup` and the lock is not free yet
-/// (review 1029, R2).
-#[test]
-fn a_start_after_the_warmup_unnames_itself_takes_the_lock() {
-    let fx = Fx::new();
-    fs::create_dir_all(fx.path("run")).unwrap();
-    let mut warmup = hold_start_lock(
-        &fx,
-        "awdl-warmup",
-        "rm -f \"$RUN/warmup\"\ntouch \"$RUN/unnamed\"\nsleep 1",
-        "unnamed",
-    );
-    let o = fx.run(&["start", "600"]);
-    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert!(!stderr(&o).contains("not racing it"));
-    assert!(fx.called("up "));
-    warmup.wait().unwrap();
-}
-
-#[test]
-fn a_start_held_by_anything_else_still_refuses() {
-    let fx = Fx::new();
-    fs::create_dir_all(fx.path("run")).unwrap();
-    let mut other = hold_start_lock(
-        &fx,
-        "other-start",
-        "echo $$ > \"$RUN/warmup\"\nsleep 8",
-        "warmup",
-    );
+    let mut other = spawn_script(&fx, "other-start", &other_start("8"), "other-start");
     let t = Instant::now();
     let o = fx.run(&["start", "600"]);
     assert_eq!(o.status.code(), Some(5), "{}", stderr(&o));
     assert!(stderr(&o).contains("another start is already in its gate; not racing it"));
-    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     other.kill().unwrap();
     other.wait().unwrap();
 }
 
-/// An ordinary start holds the lock and the warm-up waits for it. The warm-up
-/// names itself only once the lock is its own, so a second start still refuses
-/// rather than waiting out the first (review 1029).
+/// A warm-up waiting behind another start holds `warmup.lock`, so a start then
+/// waits too rather than refusing, and opens its window once both are done
+/// (review 1029).
 #[test]
-fn a_warmup_queued_behind_another_start_does_not_make_it_wait() {
+fn a_warmup_queued_behind_another_start_makes_a_start_wait() {
     let fx = Fx::new();
     fs::create_dir_all(fx.path("run")).unwrap();
-    let mut other = hold_start_lock(&fx, "other-start", "sleep 8", "locked");
-    let warmup = fx.path("awdl-warmup");
-    fs::write(
-        &warmup,
-        format!(
-            "#!/usr/bin/env bash\nexec 9>\"{run}/start.lock\"\nflock 9\necho $$ > \"{run}/warmup\"\n",
-            run = fx.path("run").display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&warmup, fs::Permissions::from_mode(0o755)).unwrap();
-    let mut queued = spawn_quietly(&mut Command::new(&warmup)).unwrap();
-    let t = Instant::now();
+    let mut other = spawn_script(&fx, "other-start", &other_start("1"), "other-start");
+    let mut warmup = spawn_script(&fx, "awdl-warmup", &warmup_script("0.2"), "warming");
     let o = fx.run(&["start", "600"]);
-    assert_eq!(o.status.code(), Some(5), "{}", stderr(&o));
-    assert!(stderr(&o).contains("another start is already in its gate; not racing it"));
-    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
-    for child in [&mut other, &mut queued] {
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stderr(&o).contains("waiting for the boot-time warm-up to finish"));
+    assert!(!stderr(&o).contains("not racing it"));
+    other.wait().unwrap();
+    warmup.wait().unwrap();
 }
 
 #[test]

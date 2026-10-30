@@ -38,11 +38,6 @@ const WINDOW_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// How long a start waits for the driver's boot-time warm-up (awdl-warmup),
 /// which holds the start lock while its gate runs.
 const WARMUP_WAIT: Duration = Duration::from_secs(180);
-/// How long a start that finds the start lock held looks for the warm-up
-/// before taking the holder for another start. The warm-up writes `warmup`
-/// just after it takes the lock and removes it just before it lets go, so one
-/// look can miss it.
-const WARMUP_HANDOFF: Duration = Duration::from_secs(2);
 /// How long a `start` waits for a supervisor that is ending its window. Its
 /// teardown is bounded at about 75 s: a second between TERM and KILL for its
 /// children, REAP for them, then `down` (DOWN_TIMEOUT, plus the TERM grace,
@@ -284,48 +279,52 @@ fn until_live(ctx: &Ctx) -> bool {
         .is_some_and(|d| d == 0 || now() < d)
 }
 
-/// Whether the driver's boot-time warm-up holds the start lock: it records its
-/// pid in `warmup` while it runs. Its comm is the interpreter's, so its command
-/// line is what names it; a reused pid fails this.
+/// Whether the driver's boot-time warm-up (awdl-warmup) is running: it holds
+/// `warmup.lock` for as long as it holds the start lock, and a little longer.
+/// Looked at with a shared lock taken and dropped at once, which the warm-up's
+/// own wait for it allows. Identity is the lock itself, so a stalled,
+/// killed or reused pid cannot be mistaken for it.
 fn warmup_running(ctx: &Ctx) -> bool {
-    ctx.state("warmup")
-        .and_then(|p| p.parse::<u32>().ok())
-        .is_some_and(|pid| {
-            proc::cmdline(pid)
-                .iter()
-                .any(|a| a.rsplit(|&b| b == b'/').next() == Some(b"awdl-warmup".as_slice()))
-        })
+    let Some(rd) = ctx.rd.as_ref() else {
+        return false;
+    };
+    if !rd.exists("warmup.lock") {
+        return false;
+    }
+    let Ok(f) = rd.append("warmup.lock") else {
+        return false;
+    };
+    // SAFETY: flock on a descriptor we own; released when `f` closes.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
 /// Who held the start lock when a `start` first tried it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Holder {
-    /// Nobody, or nobody by the end of the look: this start has the lock.
+    /// Nobody, or nobody by the second look: this start has the lock.
     Free,
-    /// The driver's boot-time warm-up, seen naming itself.
+    /// The driver's boot-time warm-up, seen holding `warmup.lock`.
     Warmup,
     /// Another start, or anything else.
     Other,
 }
 
-/// Called with the start lock held by someone else: looks for the warm-up for
-/// up to [`WARMUP_HANDOFF`], or for the lock coming free. The warm-up names
-/// itself in `warmup` only while it holds the lock, so one queued behind an
-/// ordinary start never makes a start wait for that one; the moments before
-/// it writes the file and after it removes it are what the look covers.
+/// Called with the start lock held by someone else. The warm-up holds
+/// `warmup.lock` whenever it holds the start lock, and lets go of the start
+/// lock first, so a holder seen with `warmup.lock` free is another start,
+/// unless the warm-up let go of both between the two looks: the start lock is
+/// tried once more for that. A warm-up still queued for the start lock holds
+/// `warmup.lock` too, which makes a start wait rather than refuse.
 fn start_lock_holder(ctx: &Ctx, try_lock: &dyn Fn() -> bool) -> Holder {
-    let end = Instant::now() + WARMUP_HANDOFF;
-    loop {
-        if warmup_running(ctx) {
-            return Holder::Warmup;
-        }
-        if Instant::now() >= end {
-            return Holder::Other;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        if try_lock() {
-            return Holder::Free;
-        }
+    if warmup_running(ctx) {
+        Holder::Warmup
+    } else if try_lock() {
+        Holder::Free
+    } else {
+        Holder::Other
     }
 }
 
@@ -761,8 +760,8 @@ pub fn start(ctx: &mut Ctx, args: &[String]) -> Res {
     if holder == Holder::Warmup {
         // The driver's boot-time warm-up holds the lock for its gate. A window
         // opened right after login waits for it rather than failing; once it
-        // ends, this start's first probe passes. Not looked at again: it may
-        // already have stopped naming itself, and the lock wait covers that.
+        // ends, this start's first probe passes. Not looked at again: the
+        // lock wait covers a warm-up that has just let go.
         ctx.log("waiting for the boot-time warm-up to finish");
         let end = Instant::now() + WARMUP_WAIT;
         while !try_lock() {
@@ -1396,8 +1395,7 @@ mod tests {
         // exit, then DRAIN for the pipes.
         let killed = |t: Duration| t + proc::GRACE + proc::REAP + proc::DRAIN;
         let kill_children = Duration::from_secs(1) + REAP;
-        let worst = WARMUP_HANDOFF
-            + WARMUP_WAIT
+        let worst = WARMUP_WAIT
             + WINDOW_LOCK_WAIT
             + CLOSING_WAIT
             + Duration::from_secs(2) // kill_orphaned_hook
