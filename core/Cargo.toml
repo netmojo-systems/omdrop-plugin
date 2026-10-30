@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 # The oldest toolchain that builds the workspace and its tests with the locked
 # dependencies: `if let ... && ...` chains need 1.88 (1.87 fails with E0658).
