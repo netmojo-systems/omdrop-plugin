@@ -297,21 +297,36 @@ fn warmup_running(ctx: &Ctx) -> bool {
         })
 }
 
+/// Who held the start lock when a `start` first tried it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Holder {
+    /// Nobody, or nobody by the end of the look: this start has the lock.
+    Free,
+    /// The driver's boot-time warm-up, seen naming itself.
+    Warmup,
+    /// Another start, or anything else.
+    Other,
+}
+
 /// Called with the start lock held by someone else: looks for the warm-up for
-/// up to [`WARMUP_HANDOFF`], or for the lock coming free. True when this start
-/// took the lock. It names itself in `warmup` only while it holds the lock, so
-/// a warm-up queued behind an ordinary start never makes a start wait for that
-/// one; the moments before it writes the file and after it removes it are
-/// what the look covers.
-fn warmup_handed_over(ctx: &Ctx, try_lock: &dyn Fn() -> bool) -> bool {
+/// up to [`WARMUP_HANDOFF`], or for the lock coming free. The warm-up names
+/// itself in `warmup` only while it holds the lock, so one queued behind an
+/// ordinary start never makes a start wait for that one; the moments before
+/// it writes the file and after it removes it are what the look covers.
+fn start_lock_holder(ctx: &Ctx, try_lock: &dyn Fn() -> bool) -> Holder {
     let end = Instant::now() + WARMUP_HANDOFF;
-    while !warmup_running(ctx) && Instant::now() < end {
+    loop {
+        if warmup_running(ctx) {
+            return Holder::Warmup;
+        }
+        if Instant::now() >= end {
+            return Holder::Other;
+        }
         std::thread::sleep(Duration::from_millis(50));
         if try_lock() {
-            return true;
+            return Holder::Free;
         }
     }
-    false
 }
 
 /// `window.lock`, held by a `start` while it looks at a window and extends
@@ -734,14 +749,20 @@ pub fn start(ctx: &mut Ctx, args: &[String]) -> Res {
     // SAFETY: the fd is valid for the lifetime of `lock`; the lock is released
     // when it closes. It is opened O_CLOEXEC, so the supervisor never holds it.
     let try_lock = || unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !try_lock() && !warmup_handed_over(ctx, &try_lock) {
+    let holder = if try_lock() {
+        Holder::Free
+    } else {
+        start_lock_holder(ctx, &try_lock)
+    };
+    if holder == Holder::Other {
+        ctx.log("another start is already in its gate; not racing it");
+        return Ok(5);
+    }
+    if holder == Holder::Warmup {
         // The driver's boot-time warm-up holds the lock for its gate. A window
         // opened right after login waits for it rather than failing; once it
-        // ends, this start's first probe passes.
-        if !warmup_running(ctx) {
-            ctx.log("another start is already in its gate; not racing it");
-            return Ok(5);
-        }
+        // ends, this start's first probe passes. Not looked at again: it may
+        // already have stopped naming itself, and the lock wait covers that.
         ctx.log("waiting for the boot-time warm-up to finish");
         let end = Instant::now() + WARMUP_WAIT;
         while !try_lock() {

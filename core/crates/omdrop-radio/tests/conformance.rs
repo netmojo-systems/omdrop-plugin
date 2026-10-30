@@ -581,7 +581,9 @@ fn stop_cancels_a_start_still_bringing_the_radio_up() {
 #[test]
 fn only_one_start_at_a_time() {
     let fx = Fx::new();
-    fx.mock("up.sleep", "2");
+    // Well past the second start's 2 s look for the warm-up, so the first is
+    // still in its gate when that look ends.
+    fx.mock("up.sleep", "6");
     let mut first = fx.spawn(&["start", "600"]);
     assert!(wait_for(Duration::from_secs(5), || fx.called("up ")));
     let o = fx.run(&["start", "600"]);
