@@ -610,7 +610,7 @@ fn hold_start_lock(fx: &Fx, as_warmup: bool, seconds: &str) -> Child {
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    let child = Command::new(&script).spawn().unwrap();
+    let child = spawn_quietly(&mut Command::new(&script)).unwrap();
     assert!(wait_for(Duration::from_secs(5), || fx
         .path("run/warmup")
         .exists()));

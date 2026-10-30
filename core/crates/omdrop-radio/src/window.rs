@@ -724,11 +724,13 @@ pub fn start(ctx: &mut Ctx, args: &[String]) -> Res {
         // SAFETY: as above.
         while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             if Instant::now() >= end {
+                // 3, not 5: no window opened, and 5 reads as "already
+                // starting or visible" to callers.
                 ctx.log(&format!(
-                    "the warm-up held the start lock for {} s; not racing it",
+                    "the boot-time warm-up held the start lock for {} s; try again",
                     WARMUP_WAIT.as_secs()
                 ));
-                return Ok(5);
+                return Ok(3);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1340,18 +1342,19 @@ mod tests {
     use super::*;
 
     /// The backend contract promises callers that `start` returns within
-    /// 720 s, and the CLI waits that long (omdrop-cli RADIO_START_LIMIT).
+    /// 900 s, and the CLI waits that long (omdrop-cli RADIO_START_LIMIT).
     /// A caller that gives up sooner stops a start that would have worked.
     /// This is the slowest path through `start`: every wait and hook runs
     /// to its bound, and the supervisor then fails to start.
     #[test]
     fn start_returns_within_the_contracts_bound() {
-        const CONTRACT_START_BOUND: Duration = Duration::from_secs(720);
+        const CONTRACT_START_BOUND: Duration = Duration::from_secs(900);
         // proc::hook past a timeout: TERM, GRACE, KILL, up to REAP for the
         // exit, then DRAIN for the pipes.
         let killed = |t: Duration| t + proc::GRACE + proc::REAP + proc::DRAIN;
         let kill_children = Duration::from_secs(1) + REAP;
-        let worst = WINDOW_LOCK_WAIT
+        let worst = WARMUP_WAIT
+            + WINDOW_LOCK_WAIT
             + CLOSING_WAIT
             + Duration::from_secs(2) // kill_orphaned_hook
             + kill_children

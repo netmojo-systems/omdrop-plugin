@@ -120,8 +120,9 @@ the hook's stdout or stderr open. Core stops reading a hook's output 1 s after
 the hook exits, whether or not the pipes have closed. `down` must stop any
 such process.
 
-`start` as a whole returns within **720 s**, its bound for callers: the
-window lock (10 s) and a wait for a closing window (90 s), then `probe`,
+`start` as a whole returns within **900 s**, its bound for callers: a wait
+for the driver's boot-time warm-up (180 s, only while one holds the start lock),
+the window lock (10 s) and a wait for a closing window (90 s), then `probe`,
 `up` and `identity` at their timeouts plus the kill grace above (8 s each),
 and on a failure `down`. A caller must wait at least that long (`omdrop`
 does), or it gives up on a start that was going to work. omdrop-radio's

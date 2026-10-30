@@ -361,7 +361,7 @@ pub fn cmd_on(args: &[String]) -> i32 {
 /// going to work, such as one waiting for a closing window and then a slow
 /// `up`. The identity lock is held meanwhile, so without a bound a hung
 /// helper would hang every `off` too.
-pub const RADIO_START_LIMIT: Duration = Duration::from_secs(720);
+pub const RADIO_START_LIMIT: Duration = Duration::from_secs(900);
 
 enum Radio {
     Up,
