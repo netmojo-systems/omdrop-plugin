@@ -127,6 +127,10 @@ class RadioBackendTests(unittest.TestCase):
     def test_install_on_an_intel_mac_builds_nothing(self):
         self.command("omdrop-discoverable", helper(None))
         self.intel_mac("0x43ba")
+        # No driver installed, whatever this machine has: with a current one
+        # and the receiver's packages, install-driver says "Nothing to do"
+        # before it looks at the hardware.
+        self.command("pacman", "#!/bin/sh\nexit 1\n")
         result = self.omdrop("install-driver")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("omdrop-owl", result.stderr)
