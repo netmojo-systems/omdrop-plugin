@@ -962,18 +962,50 @@ cmd_setup() {
 # installed the plugin before the driver.
 # Each line is "id<TAB>sentence": the id is for the panel, which offers to fix
 # the one thing it can, and the sentence is for the person reading it.
-# Broadcom (vendor 0x14e4) network hardware on PCI, which is where Apple's
-# Wi-Fi sits on Apple Silicon. Without it the driver cannot help: a VM such as
-# Try Omarchy, or another laptop, has no AWDL-capable radio to configure, and
-# building a kernel module there only fails.
-apple_broadcom_wifi() {
+# The device ID of the first Broadcom (vendor 0x14e4) network controller on
+# PCI, or nothing. OMDROP_SYSFS lets the tests describe the hardware instead of
+# depending on the machine they run on.
+broadcom_wifi_device() {
   local d
-  # OMDROP_SYSFS lets the tests describe the hardware instead of depending on
-  # the machine they run on.
   for d in "${OMDROP_SYSFS:-/sys}"/bus/pci/devices/*; do
-    [[ "$(cat "$d/vendor" 2>/dev/null)" == 0x14e4 && "$(cat "$d/class" 2>/dev/null)" == 0x0280* ]] && return 0
+    if [[ "$(cat "$d/vendor" 2>/dev/null)" == 0x14e4 && "$(cat "$d/class" 2>/dev/null)" == 0x0280* ]]; then
+      cat "$d/device" 2>/dev/null || echo unknown
+      return 0
+    fi
   done
   return 1
+}
+
+# Apple Silicon, by its device tree: the root node is compatible with
+# "apple,<board>". Intel Macs have Broadcom Wi-Fi too, but neither the AWDL
+# firmware Asahi loads from macOS nor the Asahi kernel omdrop-awdl builds
+# against, so its package does not even build there (arch=aarch64).
+apple_silicon() {
+  tr '\0' '\n' 2>/dev/null <"${OMDROP_SYSFS:-/sys}/firmware/devicetree/base/compatible" \
+    | grep -q '^apple,'
+}
+
+# Broadcom network hardware on an Apple Silicon Mac, which is where Apple's
+# Wi-Fi sits. Without it the driver cannot help: a VM such as Try Omarchy, an
+# Intel Mac, or another laptop has no radio it can configure, and building a
+# kernel module there only fails.
+apple_broadcom_wifi() {
+  apple_silicon && broadcom_wifi_device >/dev/null
+}
+
+# Why apple_broadcom_wifi said no, and where to go instead.
+no_apple_broadcom_say() {
+  case "$(broadcom_wifi_device)" in
+    0x43a0)
+      printf '%s' "This computer's Wi-Fi is a Broadcom BCM4360, which Omdrop's own driver cannot drive: it runs only on Apple Silicon Macs. Install omdrop-bcm4360 for it (https://github.com/bydash-xyz/omdrop-bcm4360)."
+      ;;
+    '')
+      printf '%s' "This computer has no Apple Broadcom Wi-Fi, which Omdrop's own driver needs: it runs only on Apple Silicon Macs, not in a virtual machine. Other Wi-Fi cards need a different radio backend (docs/radio-backend.md)."
+      ;;
+    *)
+      printf '%s' "This computer's Broadcom Wi-Fi is not one Omdrop can drive: Omdrop's own driver runs only on Apple Silicon Macs, and omdrop-bcm4360 only on the BCM4360. A USB Wi-Fi adapter that Owly supports can work instead, with omdrop-owl (docs/radio-backend.md)."
+      ;;
+  esac
 }
 
 # The radio half is a separate package: omdrop-awdl for Apple's Broadcom Wi-Fi,
@@ -1124,7 +1156,7 @@ prereqs_missing() {
   fi
   # First, and alone: nothing else on this list can be fixed on this machine.
   if ! apple_broadcom_wifi; then
-    printf 'hardware\t%s\n' "This computer has no Apple Broadcom Wi-Fi, which Omdrop's own driver needs: it runs only on Apple Silicon Macs, not in a virtual machine. Other Wi-Fi cards need a different radio backend (docs/radio-backend.md)."
+    printf 'hardware\t%s\n' "$(no_apple_broadcom_say)"
     return 0
   fi
   receiver_libs_installed \
@@ -1257,8 +1289,7 @@ cmd_install_driver() {
     echo "The driver and the Python library the receiver needs are both installed and current. Nothing to do."
     return 0
   fi
-  apple_broadcom_wifi \
-    || die "This computer has no Apple Broadcom Wi-Fi, which Omdrop's own driver needs: it runs only on Apple Silicon Macs, not in a virtual machine. Other Wi-Fi cards need a different radio backend (docs/radio-backend.md)."
+  apple_broadcom_wifi || die "$(no_apple_broadcom_say)"
   # Into the cache directory, not a temp dir. Three reasons: someone who has
   # just installed a kernel module as root should still have the source they
   # built afterwards, /tmp is tmpfs on this hardware so the clone and the built
