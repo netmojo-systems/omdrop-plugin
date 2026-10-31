@@ -105,6 +105,34 @@ class RadioBackendTests(unittest.TestCase):
         self.assertEqual([m["id"] for m in missing], ["hardware"])
         self.assertIn(BROADCOM_SAYS, missing[0]["say"])
 
+    def intel_mac(self, device):
+        # Broadcom Wi-Fi on PCI, but no Apple Silicon device tree: an Intel
+        # MacBook, where omdrop-awdl's package does not even build.
+        dev = Path(self.tmp.name) / "sys" / "bus" / "pci" / "devices" / "0000:03:00.0"
+        dev.mkdir(exist_ok=True)
+        (dev / "vendor").write_text("0x14e4\n")
+        (dev / "device").write_text(device + "\n")
+        (dev / "class").write_text("0x028000\n")
+
+    def test_an_intel_mac_is_pointed_at_the_backend_for_its_chip(self):
+        self.command("omdrop-discoverable", helper(None))
+        for device, backend in (("0x43a0", "omdrop-bcm4360"), ("0x43ba", "omdrop-owl")):
+            with self.subTest(device=device):
+                self.intel_mac(device)
+                missing = self.doctor()["missing"]
+                self.assertEqual([m["id"] for m in missing], ["hardware"])
+                self.assertIn(backend, missing[0]["say"])
+                self.assertIn("Apple Silicon", missing[0]["say"])
+
+    def test_install_on_an_intel_mac_builds_nothing(self):
+        self.command("omdrop-discoverable", helper(None))
+        self.intel_mac("0x43ba")
+        result = self.omdrop("install-driver")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("omdrop-owl", result.stderr)
+        for broadcom in ("brcmfmac-awdl-dkms", "makepkg", "omdrop-awdl"):
+            self.assertNotIn(broadcom, result.stdout)
+
     def test_install_with_a_probing_backend_never_builds_the_broadcom_driver(self):
         self.command("omdrop-discoverable", helper({
             "backend": "owl", "version": "0.1.0", "hardware": True, "missing": []}))

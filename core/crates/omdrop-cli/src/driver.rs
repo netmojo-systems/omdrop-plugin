@@ -3,7 +3,7 @@
 //! and the one firewall rule Omdrop needs.
 
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -52,8 +52,6 @@ const PLUGIN_ITEM_IDS: [&str; 3] = ["driver", "library", "service"];
 /// A probe is a few hundred bytes; anything past this is not an answer.
 const PROBE_MAX: usize = 1 << 20;
 
-/// The first and only finding on a machine the Broadcom driver cannot help.
-const NO_BROADCOM: &str = "This computer has no Apple Broadcom Wi-Fi, which Omdrop's own driver needs: it runs only on Apple Silicon Macs, not in a virtual machine. Other Wi-Fi cards need a different radio backend (docs/radio-backend.md).";
 const LAUNCHER: &str = "omarchy-launch-floating-terminal-with-presentation";
 
 /// UFW's default-drop policy sees AirDrop's TCP after the AWDL data path has
@@ -110,19 +108,54 @@ pub fn receiver_libs_installed() -> bool {
     ) == 0
 }
 
-/// Broadcom (vendor 0x14e4) network hardware on PCI, where Apple's Wi-Fi
-/// sits on Apple Silicon. A VM such as Try Omarchy has no AWDL-capable radio.
 /// OMDROP_SYSFS lets the tests describe the hardware instead of depending on
 /// the machine they run on.
-pub fn apple_broadcom_wifi() -> bool {
-    let sysfs = env_nonempty("OMDROP_SYSFS").unwrap_or_else(|| "/sys".to_string());
-    let Ok(entries) = std::fs::read_dir(Path::new(&sysfs).join("bus/pci/devices")) else {
-        return false;
-    };
-    entries.flatten().any(|e| {
+fn sysfs() -> PathBuf {
+    PathBuf::from(env_nonempty("OMDROP_SYSFS").unwrap_or_else(|| "/sys".to_string()))
+}
+
+/// The device ID of the first Broadcom (vendor 0x14e4) network controller
+/// on PCI, empty when it cannot be read.
+fn broadcom_wifi_device() -> Option<String> {
+    let entries = std::fs::read_dir(sysfs().join("bus/pci/devices")).ok()?;
+    entries.flatten().find_map(|e| {
         let read = |n: &str| crate::util::read_trimmed(&e.path().join(n)).unwrap_or_default();
-        read("vendor") == "0x14e4" && read("class").starts_with("0x0280")
+        (read("vendor") == "0x14e4" && read("class").starts_with("0x0280")).then(|| read("device"))
     })
+}
+
+/// Apple Silicon, by its device tree: the root node is compatible with
+/// "apple,<board>". Intel Macs have Broadcom Wi-Fi too, but neither the AWDL
+/// firmware Asahi loads from macOS nor the Asahi kernel omdrop-awdl builds
+/// against, so its package does not even build there (arch=aarch64).
+fn apple_silicon() -> bool {
+    std::fs::read(sysfs().join("firmware/devicetree/base/compatible")).is_ok_and(|c| {
+        c.split(|&b| b == 0)
+            .any(|entry| entry.starts_with(b"apple,"))
+    })
+}
+
+/// Broadcom network hardware on an Apple Silicon Mac, which is where Apple's
+/// Wi-Fi sits. A VM such as Try Omarchy, an Intel Mac, or another laptop
+/// has no radio the driver can configure.
+pub fn apple_broadcom_wifi() -> bool {
+    apple_silicon() && broadcom_wifi_device().is_some()
+}
+
+/// The first and only finding on a machine the Broadcom driver cannot help:
+/// why apple_broadcom_wifi said no, and where to go instead.
+fn no_apple_broadcom_say() -> &'static str {
+    match broadcom_wifi_device().as_deref() {
+        Some("0x43a0") => {
+            "This computer's Wi-Fi is a Broadcom BCM4360, which Omdrop's own driver cannot drive: it runs only on Apple Silicon Macs. Install omdrop-bcm4360 for it (https://github.com/bydash-xyz/omdrop-bcm4360)."
+        }
+        None => {
+            "This computer has no Apple Broadcom Wi-Fi, which Omdrop's own driver needs: it runs only on Apple Silicon Macs, not in a virtual machine. Other Wi-Fi cards need a different radio backend (docs/radio-backend.md)."
+        }
+        Some(_) => {
+            "This computer's Broadcom Wi-Fi is not one Omdrop can drive: Omdrop's own driver runs only on Apple Silicon Macs, and omdrop-bcm4360 only on the BCM4360. A USB Wi-Fi adapter that Owly supports can work instead, with omdrop-owl (docs/radio-backend.md)."
+        }
+    }
 }
 
 // The radio half is a separate package: omdrop-awdl for Apple's Broadcom
@@ -667,7 +700,7 @@ pub fn prereqs_missing() -> Vec<(String, String)> {
     }
     // First, and alone: nothing else on this list can be fixed here.
     if !apple_broadcom_wifi() {
-        missing.push(("hardware".to_string(), NO_BROADCOM.to_string()));
+        missing.push(("hardware".to_string(), no_apple_broadcom_say().to_string()));
         return missing;
     }
     if !receiver_libs_installed() {
@@ -862,7 +895,7 @@ pub fn cmd_install_driver() -> i32 {
         return 0;
     }
     if !awdl && !apple_broadcom_wifi() {
-        die(NO_BROADCOM);
+        die(no_apple_broadcom_say());
     }
     let libs_missing = !receiver_libs_installed();
     let driver_needed = !helper || !driver_current();
