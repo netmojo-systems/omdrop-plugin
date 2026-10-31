@@ -69,6 +69,9 @@ exit 0
         self.broadcom.mkdir(parents=True)
         (self.broadcom / "vendor").write_text("0x14e4\n")
         (self.broadcom / "class").write_text("0x028000\n")
+        self.devicetree = tmp / "sys" / "firmware" / "devicetree" / "base" / "compatible"
+        self.devicetree.parent.mkdir(parents=True)
+        self.devicetree.write_bytes(b"apple,j293\0apple,t8103\0apple,arm-platform\0")
         self.backend(None)
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("OMDROP_IMPLEMENTATION", "CORE_INSTALLED", "CORE_REPO",
@@ -91,6 +94,10 @@ exit 0
 
     def no_broadcom(self):
         (self.broadcom / "vendor").write_text("0x8086\n")
+
+    def intel_mac(self):
+        # Broadcom Wi-Fi, but no Apple Silicon device tree.
+        self.devicetree.unlink()
 
     def omdrop(self, *args):
         return subprocess.run([OMDROP, *args], env=self.env, capture_output=True, text=True)
@@ -128,6 +135,9 @@ exit 0
         self.assertEqual(self.doctor()["offers"], [])
         self.backend(None)
         self.no_broadcom()
+        self.assertEqual(self.doctor()["offers"], [])
+        self.broadcom.joinpath("vendor").write_text("0x14e4\n")
+        self.intel_mac()
         self.assertEqual(self.doctor()["offers"], [])
 
     def test_core_is_not_offered_to_someone_who_chose_python(self):
@@ -315,15 +325,19 @@ exit 0
         self.assertNotIn("makepkg", out)
 
     def test_it_refuses_where_core_is_untested(self):
-        for setup in ("owl", "awdl-no-hardware", "no-broadcom"):
+        for setup in ("owl", "awdl-no-hardware", "no-broadcom", "intel-mac"):
             with self.subTest(setup=setup):
                 if setup == "owl":
                     self.backend("owl")
                 elif setup == "awdl-no-hardware":
                     self.backend("awdl", hardware=False)
-                else:
+                elif setup == "no-broadcom":
                     self.backend(None)
                     self.no_broadcom()
+                else:
+                    self.backend(None)
+                    (self.broadcom / "vendor").write_text("0x14e4\n")
+                    self.intel_mac()
                 code, out = self.install()
                 self.assertNotEqual(code, 0, out)
                 self.assertNotIn("makepkg", out)

@@ -1765,6 +1765,38 @@ fn install_refuses_when_the_probe_hangs() {
 }
 
 #[test]
+fn an_intel_mac_is_pointed_at_the_backend_for_its_chip() {
+    for (device, backend) in [("0x43a0", "omdrop-bcm4360"), ("0x43ba", "omdrop-owl")] {
+        let r = Radio::new();
+        r.helper(&backend_helper(None));
+        on_an_intel_mac(&r, device);
+        let doctor = r.doctor();
+        assert_eq!(r.ids(), ["hardware"], "{device}");
+        let say = doctor["missing"][0]["say"].as_str().unwrap();
+        assert!(say.contains(backend), "{device}: {say}");
+        assert!(say.contains("Apple Silicon"), "{device}: {say}");
+    }
+}
+
+#[test]
+fn install_on_an_intel_mac_builds_nothing() {
+    let r = Radio::new();
+    r.helper(&backend_helper(None));
+    on_an_intel_mac(&r, "0x43ba");
+    let out = r.run(&["install-driver"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("omdrop-owl"),
+        "{}",
+        text(&out.stderr)
+    );
+    let stdout = text(&out.stdout);
+    for broadcom in ["brcmfmac-awdl-dkms", "makepkg", "omdrop-awdl"] {
+        assert!(!stdout.contains(broadcom), "{broadcom}: {stdout}");
+    }
+}
+
+#[test]
 fn install_without_a_probe_still_refuses_a_machine_with_no_broadcom() {
     let r = Radio::new();
     r.helper(&backend_helper(None));
@@ -1942,11 +1974,28 @@ fn with_ufw_active(r: &Radio) {
     write_exec(&r.f.root.join("bin/systemctl"), "#!/bin/sh\nexit 0\n");
 }
 
-/// Apple's Broadcom Wi-Fi on PCI.
+/// Apple's Broadcom Wi-Fi on PCI, on an Apple Silicon device tree.
 fn on_a_mac(r: &Radio) {
     let dev = r.f.root.join("sys/bus/pci/devices/0000:01:00.0");
     std::fs::create_dir_all(&dev).unwrap();
     std::fs::write(dev.join("vendor"), "0x14e4\n").unwrap();
+    std::fs::write(dev.join("class"), "0x028000\n").unwrap();
+    let dt = r.f.root.join("sys/firmware/devicetree/base");
+    std::fs::create_dir_all(&dt).unwrap();
+    std::fs::write(
+        dt.join("compatible"),
+        b"apple,j293\0apple,t8103\0apple,arm-platform\0",
+    )
+    .unwrap();
+}
+
+/// Broadcom Wi-Fi on PCI, but no Apple Silicon device tree: an Intel
+/// MacBook, where omdrop-awdl's package does not even build.
+fn on_an_intel_mac(r: &Radio, device: &str) {
+    let dev = r.f.root.join("sys/bus/pci/devices/0000:03:00.0");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::write(dev.join("vendor"), "0x14e4\n").unwrap();
+    std::fs::write(dev.join("device"), format!("{device}\n")).unwrap();
     std::fs::write(dev.join("class"), "0x028000\n").unwrap();
 }
 
