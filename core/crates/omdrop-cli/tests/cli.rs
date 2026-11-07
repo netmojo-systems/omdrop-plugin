@@ -482,24 +482,29 @@ fn an_off_during_a_resume_does_not_wait_for_the_radio() {
 #[test]
 fn a_window_opened_again_during_a_resume_keeps_its_radio() {
     // `off` then `on` while the radio was coming back: the watcher running
-    // afterwards is the new window's, and so is the radio.
-    let f = Fixture::new();
-    let flag = f.root.join("watching");
-    std::fs::write(&flag, "first").unwrap();
-    let mut resuming = f.command(&["resume"]);
-    resuming
-        .env("ACTIVE", "active")
-        .env("WATCH_FLAG", &flag)
-        .env("WATCH_ARGS", "")
-        .env("RADIO_SLEEP", "2");
-    let resuming = resuming.spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(700));
-    std::fs::write(&flag, "second").unwrap();
-    let out = resuming.wait_with_output().unwrap();
-    let ev = std::fs::read_to_string(&f.capture).unwrap();
-    assert_eq!(out.status.code(), Some(0), "{ev}");
-    assert!(!ev.contains("restart"), "{ev}");
-    assert!(!ev.contains(" stop\n"), "{ev}");
+    // afterwards is the new window's, and so are the radio and receiver,
+    // whether the old resume's start came up or failed.
+    for radio_rc in ["0", "1"] {
+        let f = Fixture::new();
+        let flag = f.root.join("watching");
+        std::fs::write(&flag, "first").unwrap();
+        let mut resuming = f.command(&["resume"]);
+        resuming
+            .env("ACTIVE", "active")
+            .env("WATCH_FLAG", &flag)
+            .env("WATCH_ARGS", "")
+            .env("RADIO_RC", radio_rc)
+            .env("RADIO_SLEEP", "2");
+        let resuming = resuming.spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        std::fs::write(&flag, "second").unwrap();
+        let out = resuming.wait_with_output().unwrap();
+        let ev = std::fs::read_to_string(&f.capture).unwrap();
+        assert_eq!(out.status.code(), Some(0), "RADIO_RC={radio_rc}\n{ev}");
+        assert!(!ev.contains("restart"), "{ev}");
+        assert!(!ev.contains(" stop"), "{ev}");
+        assert!(!ev.contains("identity stop-"), "{ev}");
+    }
 }
 
 #[test]
