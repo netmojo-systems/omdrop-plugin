@@ -709,6 +709,23 @@ pub fn cmd_resume() -> i32 {
     };
     let before = crate::status::suspended_secs();
     let helper = is_executable(&c.discoverable);
+    // Which watcher this window has: an `off` and then an `on` during the
+    // radio's wait leave a watcher running, but a different one.
+    let invocation = || {
+        crate::proc::capture_ok(
+            "systemctl",
+            &[
+                "--user",
+                "show",
+                &format!("{WATCH}.service"),
+                "-p",
+                "InvocationID",
+                "--value",
+            ],
+        )
+        .unwrap_or_default()
+    };
+    let window = invocation();
     let radio_stop = || {
         if helper {
             run_quiet("pkexec", &[c.discoverable.as_os_str(), "stop".as_ref()]);
@@ -726,10 +743,13 @@ pub fn cmd_resume() -> i32 {
         crate::proc::cancelled(None)
     }
     let lock = identity_lock();
-    // An `off` ran during the wait: it may have stopped the radio before
+    // An `off` ran during the wait. It may have stopped the radio before
     // this start finished, so stop it again, and leave the rest to the off.
-    if !ours() {
-        radio_stop();
+    // If an `on` followed, the radio is that window's: leave it alone.
+    if !ours() || invocation() != window {
+        if !active(WATCH) {
+            radio_stop();
+        }
         return 0;
     }
     // The receiver restarts only once awdl0 is back: its unit waits for
