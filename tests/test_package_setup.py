@@ -2,9 +2,9 @@
 
 The omdrop package installs the plugin under /usr/share/omdrop, and the shell
 loads third-party plugins only from ~/.config/omarchy/plugins. setup links one
-to the other for each user. A previous installation there is replaced only
-when the user agrees, which needs a terminal, and a replaced clone is moved
-aside, not deleted. A copy that isn't packaged never links itself.
+when the user agrees, which needs a terminal, and a replaced clone goes to
+the trash, or is moved aside where that fails; it is never deleted. A copy
+that isn't packaged never links itself.
 OMDROP_PACKAGE_ROOT stands in for /usr.
 """
 import json
@@ -43,6 +43,11 @@ class PackageSetupTests(unittest.TestCase):
         self.command("omarchy-plugin-enable", log + 'exit "${ENABLE_RC:-0}"\n')
         # The receiver's unit installs; nothing is active.
         self.command("systemctl", '#!/bin/sh\ncase "$*" in *is-active*) exit 3 ;; esac\nexit 0\n')
+        # `gio trash` moves its argument into the user's trash; GIO_RC makes
+        # it fail and leave it, as gio does without a trash it can use.
+        self.command("gio", log + '[ "$1" = trash ] && [ "${GIO_RC:-0}" = 0 ] || exit "${GIO_RC:-1}"\n'
+                     'mkdir -p "$HOME/.local/share/Trash/files" && '
+                     'mv "$2" "$HOME/.local/share/Trash/files/"\n')
         self.env = {k: v for k, v in os.environ.items() if k != "OMDROP_IMPLEMENTATION"}
         self.env.update(PATH=f"{self.bin}:{self.env['PATH']}", HOME=str(self.home),
                         XDG_CONFIG_HOME=str(self.home / ".config"),
@@ -93,26 +98,39 @@ class PackageSetupTests(unittest.TestCase):
         self.assertIn("Run omdrop setup in a terminal to replace it", run.stderr)
         self.assertNotIn("omarchy-plugin-enable", self.calls_made())
 
-    def terminal_setup(self, answer):
+    def terminal_setup(self, answer, **env):
         # script(1) gives setup the terminal its question needs.
         return subprocess.run([SCRIPT, "-qec", f"{self.plugin}/bin/omdrop setup", "/dev/null"],
-                              env=self.env, input=answer, capture_output=True, text=True,
-                              timeout=120)
+                              env={**self.env, **env}, input=answer, capture_output=True,
+                              text=True, timeout=120)
 
     def asides(self):
         return [p for p in self.target.parent.iterdir()
                 if p.name.startswith(".netmojo.omdrop.replaced-")]
 
     @unittest.skipUnless(SCRIPT, "needs script(1)")
-    def test_a_previous_installation_is_moved_aside_when_the_user_agrees(self):
+    def test_a_previous_installation_goes_to_the_trash_when_the_user_agrees(self):
         self.previous_clone()
         run = self.terminal_setup("\n")
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertIn("Previous Omdrop plugin installation detected", run.stdout)
         self.assertIn(f"will replace it with a newer version (0.0.1 → {self.packaged_version()})",
                       run.stdout)
+        self.assertIn("Moved the previous installation to the trash. Restore it from Files if needed.",
+                      run.stdout)
+        self.assertEqual(Path(os.readlink(self.target)), self.plugin)
+        trashed = self.home / ".local" / "share" / "Trash" / "files" / "netmojo.omdrop"
+        self.assertEqual((trashed / "marker").read_text(), "git clone")
+        self.assertEqual(self.asides(), [])
+
+    @unittest.skipUnless(SCRIPT, "needs script(1)")
+    def test_a_previous_installation_the_trash_refuses_is_moved_aside(self):
+        self.previous_clone()
+        run = self.terminal_setup("\n", GIO_RC="1")
+        self.assertEqual(run.returncode, 0, run.stdout)
         self.assertEqual(Path(os.readlink(self.target)), self.plugin)
         [aside] = self.asides()
+        self.assertIn(f"Moved the previous installation to {aside}.", run.stdout)
         self.assertEqual((aside / "marker").read_text(), "git clone")
 
     @unittest.skipUnless(SCRIPT, "needs script(1)")

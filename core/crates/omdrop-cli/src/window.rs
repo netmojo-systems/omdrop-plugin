@@ -1104,8 +1104,10 @@ fn plugin_packaged(plugin: &Path) -> bool {
 /// A previous installation (a git or marketplace clone, or a link to another
 /// copy) is replaced only after the user agrees, which needs a terminal; the
 /// panel's first `omdrop on` runs setup without one, so it is left in place
-/// with a warning. A replaced clone is moved aside to a hidden directory,
-/// which the shell ignores, not deleted. Same as the plugin's bash.
+/// with a warning. A replaced clone goes to the trash with `gio trash`, where
+/// Files shows it (#87); without gio, or if that fails, it is moved aside to a
+/// hidden directory, which the shell ignores. It is never deleted. Same as the
+/// plugin's bash.
 /// OMDROP_PACKAGE_ROOT moves /usr for tests; it only decides whether setup
 /// links the plugin into the user's own home, so it grants nothing.
 fn link_plugin(plugin: &Path) -> bool {
@@ -1164,6 +1166,14 @@ fn link_plugin(plugin: &Path) -> bool {
                 errln!("omdrop could not remove the link {}.", target.display());
                 return false;
             }
+        } else if crate::util::have("gio") && {
+            // Judged by the result: a copy that is gone went to the trash.
+            run_quiet("gio", &[std::ffi::OsStr::new("trash"), target.as_os_str()]);
+            !lexists(&target)
+        } {
+            outln!(
+                "Moved the previous installation to the trash. Restore it from Files if needed."
+            );
         } else {
             let (_, stamp) = crate::proc::capture("date", &["+%Y%m%d-%H%M%S"]);
             let stamp = String::from_utf8_lossy(&stamp).trim().to_string();
