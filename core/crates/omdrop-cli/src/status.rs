@@ -77,17 +77,35 @@ pub fn window_remaining() -> Option<i64> {
         return None;
     }
     let us = span_microseconds(&span)?;
+    let now = clock_secs(libc::CLOCK_MONOTONIC)?;
+    let secs = (us as f64 / 1e6 - now) as i64;
+    (secs > 0).then_some(secs)
+}
+
+fn clock_secs(clock: libc::clockid_t) -> Option<f64> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: `ts` is a valid timespec for clock_gettime to fill.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+    if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
         return None;
     }
-    let now = ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9;
-    let secs = (us as f64 / 1e6 - now) as i64;
-    (secs > 0).then_some(secs)
+    Some(ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9)
+}
+
+/// Seconds this computer has spent asleep since it booted. CLOCK_BOOTTIME
+/// counts a suspend and CLOCK_MONOTONIC does not, so the difference grows by
+/// the length of each sleep and holds still otherwise.
+pub fn suspended_secs() -> Option<f64> {
+    Some(clock_secs(libc::CLOCK_BOOTTIME)? - clock_secs(libc::CLOCK_MONOTONIC)?)
+}
+
+/// Whether the computer has slept since `before`, a `suspended_secs` reading.
+/// A second is far above what two clock reads can drift apart while awake,
+/// and far below any real suspend.
+pub fn slept_since(before: f64) -> Option<bool> {
+    suspended_secs().map(|now| now - before >= 1.0)
 }
 
 /// The µs line of `systemd-analyze timespan`, skipping the first line, which

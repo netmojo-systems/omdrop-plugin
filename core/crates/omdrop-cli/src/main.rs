@@ -183,6 +183,7 @@ fn main() {
         "firewall" => driver::cmd_firewall(&s),
         "act" => links::cmd_act(rest),
         "watch" => links::cmd_watch(&s),
+        "resume" => window::cmd_resume(),
         "handle" => links::cmd_handle(rest),
         identity::IDENTITY_SUBCOMMAND => identity::cmd_identity_child(&s),
         "-V" | "--version" | "version" => cmd_version(),

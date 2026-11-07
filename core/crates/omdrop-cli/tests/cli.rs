@@ -86,10 +86,14 @@ impl Fixture {
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_omdrop"), &omdrop).unwrap();
 
         let log = r#"printf '%s\n' "$(basename "$0") $*" >> "$CAPTURE""#;
+        // Every unit answers is-active with $ACTIVE, except the watcher
+        // ($WATCHING) and the services of a window's two deadlines
+        // ($CLOSING). With $WATCHING set, the watcher runs `watch
+        // $WATCH_ARGS`; $WINDOW_LEFT is the seconds left on the window's timer.
         write_exec(
             &bin.join("systemctl"),
             &format!(
-                "#!/bin/sh\n{log}\ncase \"$*\" in\n  *\" is-active \"*) echo \"${{ACTIVE:-inactive}}\"; [ \"$ACTIVE\" = active ] ;;\n  *\" start \"*) exit \"${{START_RC:-0}}\" ;;\n  *) exit 0 ;;\nesac\n"
+                "#!/bin/sh\n{log}\ncase \"$*\" in\n  *\" is-active \"*omdrop-watch.service*) s=${{WATCHING:-inactive}} ;;\n  *\" is-active \"*omdrop-window.service*|*\" is-active \"*omdrop-identity-expiry.service*) s=${{CLOSING:-inactive}} ;;\n  *\" is-active \"*) s=${{ACTIVE:-inactive}} ;;\n  *\" show omdrop-watch.service \"*) [ -n \"$WATCHING\" ] && echo \"{{ argv[]=/x/omdrop watch $WATCH_ARGS ; }}\"; exit 0 ;;\n  *\" show omdrop-window.timer \"*) [ -n \"$WINDOW_LEFT\" ] && python3 -c \"import time; print(int(time.monotonic()) + $WINDOW_LEFT)\"; exit 0 ;;\n  *\" start \"*) exit \"${{START_RC:-0}}\" ;;\n  *) exit 0 ;;\nesac\necho \"$s\"\n[ \"$s\" = active ]\n"
             ),
         );
         write_exec(
@@ -283,10 +287,23 @@ fn a_1password_window_arms_its_hard_expiry_before_anything_starts() {
         &["on", "10m"],
         &[("IDENTITY", "source=1password\nexpiry_in=3600")],
     );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(ev.contains("--on-active=3600s "), "{ev}");
+    // And on the wall clock, which keeps counting while the computer sleeps.
+    let at: u64 = ev
+        .split("--on-calendar=@")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no calendar time in:\n{ev}"));
     assert!(
-        ev.contains("--on-active=3600s --unit=omdrop-identity-expiry"),
-        "{ev}"
+        (now + 3595..=now + 3600).contains(&at),
+        "{at} vs {now}\n{ev}"
     );
+    assert!(ev.contains(" --unit=omdrop-identity-expiry "), "{ev}");
     assert!(
         first(&ev, "omdrop-identity-expiry") < first(&ev, "pkexec"),
         "{ev}"
@@ -307,6 +324,111 @@ fn a_window_whose_hard_expiry_cannot_be_armed_never_starts() {
     assert!(ev.contains("identity stop-end"), "{ev}");
     assert!(!ev.contains("pkexec"), "{ev}");
     assert!(!ev.contains("--user start"), "{ev}");
+}
+
+/// `resume` with the receiver up and the watcher running `watch ARGS`.
+fn resume(f: &Fixture, watch_args: &str, env: &[(&str, &str)]) -> (Output, String) {
+    let mut all = vec![
+        ("ACTIVE", "active"),
+        ("WATCHING", "active"),
+        ("WATCH_ARGS", watch_args),
+    ];
+    all.extend_from_slice(env);
+    f.run(&["resume"], &all)
+}
+
+/// The seconds the radio was asked for, in order.
+fn radio_starts(ev: &str) -> Vec<String> {
+    ev.lines()
+        .filter_map(|l| l.strip_prefix("pkexec "))
+        .filter_map(|l| l.split_once(" start "))
+        .map(|(_, secs)| secs.to_string())
+        .collect()
+}
+
+#[test]
+fn a_window_the_sleep_ended_comes_back_radio_first() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(radio_starts(&ev), ["0"], "{ev}");
+    // The old receiver listened on the awdl0 the sleep removed.
+    assert!(
+        first(&ev, " start 0") < first(&ev, "--user restart airdrop-receiver.service"),
+        "{ev}"
+    );
+    // The window keeps its watcher, its deadlines and its identity.
+    assert!(!ev.contains(" stop "), "{ev}");
+    assert!(!ev.contains("identity stop-"), "{ev}");
+    assert!(!ev.contains("systemd-run"), "{ev}");
+}
+
+#[test]
+fn a_timed_window_comes_back_for_what_is_left_of_it() {
+    let f = Fixture::new();
+    let (_, ev) = resume(&f, "--window 10m", &[("WINDOW_LEFT", "300")]);
+    let starts = radio_starts(&ev);
+    assert!(!starts.is_empty(), "{ev}");
+    for secs in &starts {
+        let secs: i64 = secs.parse().unwrap();
+        assert!((295..=300).contains(&secs), "{ev}");
+    }
+}
+
+#[test]
+fn a_timed_window_with_nothing_left_is_turned_off_not_reopened() {
+    let f = Fixture::new();
+    let (_, ev) = resume(&f, "--window 10m", &[]);
+    assert!(radio_starts(&ev).is_empty(), "{ev}");
+    assert!(ev.contains("identity stop-end"), "{ev}");
+    assert!(ev.contains("--user stop airdrop-receiver.service"), "{ev}");
+}
+
+#[test]
+fn a_window_turned_off_before_its_resume_ran_stays_off() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("WATCHING", "")]);
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    assert!(radio_starts(&ev).is_empty(), "{ev}");
+    assert!(!ev.contains("restart"), "{ev}");
+}
+
+#[test]
+fn a_deadline_that_passed_in_sleep_closes_the_window_instead() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("CLOSING", "active")]);
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    assert!(radio_starts(&ev).is_empty(), "{ev}");
+    assert!(!ev.contains("restart"), "{ev}");
+}
+
+#[test]
+fn a_window_the_backend_kept_through_sleep_is_left_alone() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("VISIBLE", "1")]);
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    assert!(radio_starts(&ev).is_empty(), "{ev}");
+    assert!(!ev.contains("restart"), "{ev}");
+}
+
+#[test]
+fn a_window_that_cannot_come_back_is_turned_off() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("RADIO_RC", "1")]);
+    assert_eq!(out.status.code(), Some(1), "{ev}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("supervisor did not start"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!ev.contains("restart"), "{ev}");
+    assert!(ev.contains("--user stop airdrop-receiver.service"), "{ev}");
+    assert!(ev.contains("stop omdrop-watch.service"), "{ev}");
+    assert!(ev.contains("identity stop-end"), "{ev}");
 }
 
 #[test]

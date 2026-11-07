@@ -220,14 +220,31 @@ pub fn cmd_on(args: &[String]) -> i32 {
     // The 1Password cache's hard expiry is absolute: a window still open then
     // is turned off, because a kernel timeout cannot reach a key the receiver
     // has already loaded. A window that cannot arm it does not start.
+    //
+    // On the wall clock: an --on-active timer is monotonic and stops while the
+    // computer sleeps, so a window that slept through its expiry stayed open,
+    // its receiver holding the expired key, for as long as it had slept (31
+    // hours on 2026-11-07). The monotonic span stays beside it, because
+    // systemd never fires a calendar time already in the past.
     if let Some(exp) = expiry.filter(|e| source == "1password" && !e.is_empty()) {
-        let n = exp.trim().parse::<i64>().unwrap_or(0);
-        let on_active = format!("--on-active={}s", if n > 0 { n } else { 1 });
+        let n = exp.trim().parse::<i64>().unwrap_or(0).max(1);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let on_active = format!("--on-active={n}s");
+        let on_calendar = format!("--on-calendar=@{}", now + n);
         let unit = format!("--unit={ID_EXPIRY}");
         if run(
             "systemd-run",
             &[
-                "--user", "--quiet", &on_active, &unit, &self_exe, "off", "--force",
+                "--user",
+                "--quiet",
+                &on_active,
+                &on_calendar,
+                &unit,
+                &self_exe,
+                "off",
+                "--force",
             ],
         ) != 0
         {
@@ -285,7 +302,7 @@ pub fn cmd_on(args: &[String]) -> i32 {
         crate::proc::cancelled(None)
     };
     if awdl_link_local() {
-        if !start_receiver() {
+        if !start_receiver(false) {
             cancel_window();
             identity_abort();
             die("The AirDrop receiver would not start.");
@@ -314,7 +331,7 @@ pub fn cmd_on(args: &[String]) -> i32 {
                 radio_failed(err);
             }
         }
-        if !start_receiver() {
+        if !start_receiver(false) {
             cancel_window();
             radio_stop();
             identity_abort();
@@ -533,7 +550,8 @@ pub fn last_radio_line(out: &str) -> String {
 /// refused with no attempt made -- the morning after a receiver could not
 /// rebind 8771. Clearing the latch costs nothing. The unit and identity are
 /// brought up to date first, so a plugin update needs no separate setup.
-fn start_receiver() -> bool {
+/// `restart` replaces a receiver that is already running.
+fn start_receiver(restart: bool) -> bool {
     let c = ctx();
     let Some(plugin) = c.plugin_dir() else {
         errln!("omdrop cannot tell where it is installed.");
@@ -550,7 +568,8 @@ fn start_receiver() -> bool {
     // cannot create the directory.
     let _ = crate::util::mkdir_private(&c.state_dir().join("debug"));
     run_quiet("systemctl", &["--user", "reset-failed", UNIT]);
-    run("systemctl", &["--user", "start", UNIT]) == 0
+    let verb = if restart { "restart" } else { "start" };
+    run("systemctl", &["--user", verb, UNIT]) == 0
 }
 
 /// Sends in progress, one marker per `omdrop send` process naming where it
@@ -623,8 +642,14 @@ pub fn cmd_off(args: &[String]) -> i32 {
 /// publish into this window; the receiver stops before the identity it
 /// loaded is released; the window file goes last.
 fn off_under_lock() {
-    let c = ctx();
     let lock = identity_lock();
+    off_locked();
+    drop(lock);
+}
+
+/// `off_under_lock`'s steps, for a caller already holding the lock.
+fn off_locked() {
+    let c = ctx();
     id(&["stop-begin"], Out::Inherit, true);
     if run("systemctl", &["--user", "stop", UNIT]) != 0 {
         die("The AirDrop receiver would not stop.");
@@ -636,7 +661,101 @@ fn off_under_lock() {
         run_quiet("pkexec", &[c.discoverable.as_os_str(), "stop".as_ref()]);
     }
     id(&["stop-end"], Out::Inherit, true);
+}
+
+/// Bring back the window that was open when the computer went to sleep.
+///
+/// A radio backend may end a window before the computer sleeps: omdrop-awdl's
+/// sleep hook stops it and removes awdl0, because an awdl0 left in place
+/// across a suspend kept Wi-Fi from reconnecting (omdrop-awdl #67). Nothing
+/// brought the window back, so after a sleep a window opened until you turn
+/// it off still read as on, its receiver listening on an interface that was
+/// gone, and nobody could see it (2026-11-07). `omdrop watch` runs this, in a
+/// unit of its own, when it sees that the computer has slept.
+///
+/// The window keeps what it had: its watcher, its identity and its
+/// deadlines. The radio comes up again, for what is left of a timed window,
+/// and the receiver restarts on the new awdl0. A window that cannot come back
+/// is turned off, so that it never reads as on while nobody can see it.
+pub fn cmd_resume() -> i32 {
+    let c = ctx();
+    let lock = identity_lock();
+    // `off` ran first, or a deadline that passed during the sleep is turning
+    // the window off and waits for this lock. Either way it is not ours.
+    let active = |unit: &str| {
+        run_quiet(
+            "systemctl",
+            &["--user", "is-active", &format!("{unit}.service")],
+        ) == 0
+    };
+    if !active(WATCH) || active(WINDOW) || active(ID_EXPIRY) {
+        return 0;
+    }
+    // The backend kept the window through the sleep.
+    if receiving() && crate::status::radio_status().is_some_and(|r| r.visible) {
+        return 0;
+    }
+    let secs = match crate::status::watch_mode() {
+        Some("timed") => match crate::status::window_remaining() {
+            Some(left) => left,
+            // Its time is up; its timer's `off` may be on the way.
+            None => {
+                off_locked();
+                return 0;
+            }
+        },
+        _ => 0,
+    };
+    let before = crate::status::suspended_secs();
+    let helper = is_executable(&c.discoverable);
+    // The receiver stays up meanwhile, so the panel says the radio is coming
+    // up. It restarts only once awdl0 is back: its unit waits for awdl0's
+    // address, and the one it was listening on went with the old awdl0.
+    let failed = match radio_up(&secs.to_string()) {
+        Radio::Up if start_receiver(true) => None,
+        Radio::Up => Some("The AirDrop receiver would not start.".to_string()),
+        Radio::Failed(err) if err.is_empty() => {
+            Some("The AirDrop radio could not be started.".to_string())
+        }
+        Radio::Failed(err) => Some(err),
+        Radio::Cancelled => {
+            // A start abandoned partway may still finish.
+            if helper {
+                run_quiet("pkexec", &[c.discoverable.as_os_str(), "stop".as_ref()]);
+            }
+            drop(lock);
+            crate::proc::cancelled(None)
+        }
+    };
+    if let Some(err) = failed {
+        // Asleep again before it was back: the sleep hook ends a start in
+        // flight. The window stays as it was, and the next resume retries.
+        if before.and_then(crate::status::slept_since).unwrap_or(false) {
+            errln!("omdrop resume: {err}");
+            errln!(
+                "omdrop resume: the computer slept again meanwhile, so the window stays and comes back when it wakes."
+            );
+            return 1;
+        }
+        errln!("omdrop resume: {err}");
+        errln!("omdrop resume: the window could not come back, so Omdrop is turning off.");
+        off_locked();
+        return 1;
+    }
+    // As `on` does: the radio came up counting down from what was left when
+    // it started, so ask it again with what is left now.
+    if helper && let Some(left) = crate::status::window_remaining() {
+        run_quiet(
+            "pkexec",
+            &[
+                c.discoverable.as_os_str(),
+                "start".as_ref(),
+                left.to_string().as_ref(),
+            ],
+        );
+    }
     drop(lock);
+    crate::status::cmd_status(&[])
 }
 
 pub fn cmd_toggle(args: &[String]) -> i32 {
