@@ -89,13 +89,13 @@ impl Fixture {
         // Every unit answers is-active with $ACTIVE, except the watcher
         // ($WATCHING, or while the file $WATCH_FLAG exists, which stopping
         // the watcher removes; its text is the watcher's InvocationID) and the
-        // services of a window's two deadlines ($CLOSING). With $WATCHING
-        // set, the watcher runs `watch $WATCH_ARGS`; $WINDOW_LEFT is the
-        // seconds left on the window's timer.
+        // services of a window's two deadlines ($CLOSING). The watcher runs
+        // `watch $WATCH_ARGS`, or `watch` and the text of $WATCH_FLAG.args;
+        // $WINDOW_LEFT is the seconds left on the window's timer.
         write_exec(
             &bin.join("systemctl"),
             &format!(
-                "#!/bin/sh\n{log}\ncase \"$*\" in\n  *\" is-active \"*omdrop-watch.service*) s=${{WATCHING:-inactive}}; [ -n \"$WATCH_FLAG\" ] && {{ [ -e \"$WATCH_FLAG\" ] && s=active || s=inactive; }} ;;\n  *\" is-active \"*omdrop-window.service*|*\" is-active \"*omdrop-identity-expiry.service*) s=${{CLOSING:-inactive}} ;;\n  *\" is-active \"*) s=${{ACTIVE:-inactive}} ;;\n  *\" stop omdrop-watch.service\"*) [ -n \"$WATCH_FLAG\" ] && rm -f \"$WATCH_FLAG\"; exit 0 ;;\n  *\" show omdrop-watch.service -p InvocationID \"*) [ -n \"$WATCH_FLAG\" ] && cat \"$WATCH_FLAG\" 2>/dev/null; exit 0 ;;\n  *\" show omdrop-watch.service \"*) [ -n \"$WATCHING\" ] && echo \"{{ argv[]=/x/omdrop watch $WATCH_ARGS ; }}\"; exit 0 ;;\n  *\" show omdrop-window.timer \"*) [ -n \"$WINDOW_LEFT\" ] && python3 -c \"import time; print(int(time.monotonic()) + $WINDOW_LEFT)\"; exit 0 ;;\n  *\" start \"*) exit \"${{START_RC:-0}}\" ;;\n  *\" restart \"*) exit \"${{RESTART_RC:-0}}\" ;;\n  *) exit 0 ;;\nesac\necho \"$s\"\n[ \"$s\" = active ]\n"
+                "#!/bin/sh\n{log}\ncase \"$*\" in\n  *\" is-active \"*omdrop-watch.service*) s=${{WATCHING:-inactive}}; [ -n \"$WATCH_FLAG\" ] && {{ [ -e \"$WATCH_FLAG\" ] && s=active || s=inactive; }} ;;\n  *\" is-active \"*omdrop-window.service*|*\" is-active \"*omdrop-identity-expiry.service*) s=${{CLOSING:-inactive}} ;;\n  *\" is-active \"*) s=${{ACTIVE:-inactive}} ;;\n  *\" stop omdrop-watch.service\"*) [ -n \"$WATCH_FLAG\" ] && rm -f \"$WATCH_FLAG\"; exit 0 ;;\n  *\" show omdrop-watch.service -p InvocationID \"*) [ -n \"$WATCH_FLAG\" ] && cat \"$WATCH_FLAG\" 2>/dev/null; exit 0 ;;\n  *\" show omdrop-watch.service \"*) a=$WATCH_ARGS; [ -n \"$WATCH_FLAG\" ] && [ -e \"$WATCH_FLAG.args\" ] && a=$(cat \"$WATCH_FLAG.args\"); {{ [ -n \"$WATCHING\" ] || [ -e \"$WATCH_FLAG\" ]; }} && echo \"{{ argv[]=/x/omdrop watch $a ; }}\"; exit 0 ;;\n  *\" show omdrop-window.timer \"*) [ -n \"$WINDOW_LEFT\" ] && python3 -c \"import time; print(int(time.monotonic()) + $WINDOW_LEFT)\"; exit 0 ;;\n  *\" start \"*) exit \"${{START_RC:-0}}\" ;;\n  *\" restart \"*) exit \"${{RESTART_RC:-0}}\" ;;\n  *) exit 0 ;;\nesac\necho \"$s\"\n[ \"$s\" = active ]\n"
             ),
         );
         write_exec(
@@ -480,30 +480,37 @@ fn an_off_during_a_resume_does_not_wait_for_the_radio() {
 }
 
 #[test]
-fn a_window_opened_again_during_a_resume_keeps_its_radio() {
-    // `off` then `on` while the radio was coming back: the watcher running
-    // afterwards is the new window's, and so are the radio and receiver,
-    // whether the old resume's start came up or failed.
+fn a_window_opened_again_during_a_resume_gets_its_own_span() {
+    // A timed window's resume is in the radio's gate when `off` and then
+    // `on forever` run. That `on`'s start found the gate busy (5) and left
+    // the radio on the timed span, or down if the old start failed; resume
+    // gives it the new window's span, and touches nothing else of it.
     for radio_rc in ["0", "1"] {
         let f = Fixture::new();
         let flag = f.root.join("watching");
+        let args = f.root.join("watching.args");
         std::fs::write(&flag, "first").unwrap();
+        std::fs::write(&args, "--window 10m").unwrap();
         let mut resuming = f.command(&["resume"]);
         resuming
             .env("ACTIVE", "active")
             .env("WATCH_FLAG", &flag)
-            .env("WATCH_ARGS", "")
+            .env("WINDOW_LEFT", "9")
             .env("RADIO_RC", radio_rc)
             .env("RADIO_SLEEP", "2");
         let resuming = resuming.spawn().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(700));
         std::fs::write(&flag, "second").unwrap();
+        std::fs::write(&args, "").unwrap();
         let out = resuming.wait_with_output().unwrap();
         let ev = std::fs::read_to_string(&f.capture).unwrap();
         assert_eq!(out.status.code(), Some(0), "RADIO_RC={radio_rc}\n{ev}");
+        let starts = radio_starts(&ev);
+        assert_eq!(starts.len(), 2, "{ev}");
+        assert_ne!(starts[0], "0", "{ev}");
+        assert_eq!(starts[1], "0", "{ev}");
         assert!(!ev.contains("restart"), "{ev}");
         assert!(!ev.contains(" stop"), "{ev}");
-        assert!(!ev.contains("identity stop-"), "{ev}");
     }
 }
 

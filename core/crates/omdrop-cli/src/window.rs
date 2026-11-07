@@ -745,11 +745,28 @@ pub fn cmd_resume() -> i32 {
     let lock = identity_lock();
     // An `off` ran during the wait. It may have stopped the radio before
     // this start finished, so stop it again, and leave the rest to the off.
-    // If an `on` followed, the radio is that window's: leave it alone.
-    if !ours() || invocation() != window {
-        if !active(WATCH) {
-            radio_stop();
+    if !active(WATCH) {
+        radio_stop();
+        return 0;
+    }
+    // An `on` followed it. Its start found this one in its gate (5, which
+    // `on` takes as up) and left the radio with this start's deadline, or
+    // with none if this start failed. That `on` has finished, as it holds the
+    // lock until it has, so give the radio its window's span now.
+    if invocation() != window {
+        let span = match crate::status::watch_mode() {
+            Some("timed") => crate::status::window_remaining(),
+            _ => Some(0),
+        };
+        if let Some(span) = span
+            && let Radio::Failed(err) = radio_up(&span.to_string())
+        {
+            errln!("omdrop resume: the window opened meanwhile: {err}");
         }
+        return 0;
+    }
+    // A deadline that came due during the wait is turning the window off.
+    if !ours() {
         return 0;
     }
     // The receiver restarts only once awdl0 is back: its unit waits for
