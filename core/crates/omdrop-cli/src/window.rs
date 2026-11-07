@@ -688,7 +688,8 @@ pub fn cmd_resume() -> i32 {
             &["--user", "is-active", &format!("{unit}.service")],
         ) == 0
     };
-    if !active(WATCH) || active(WINDOW) || active(ID_EXPIRY) {
+    let ours = || active(WATCH) && !active(WINDOW) && !active(ID_EXPIRY);
+    if !ours() {
         return 0;
     }
     // The backend kept the window through the sleep.
@@ -708,24 +709,39 @@ pub fn cmd_resume() -> i32 {
     };
     let before = crate::status::suspended_secs();
     let helper = is_executable(&c.discoverable);
-    // The receiver stays up meanwhile, so the panel says the radio is coming
-    // up. It restarts only once awdl0 is back: its unit waits for awdl0's
-    // address, and the one it was listening on went with the old awdl0.
-    let failed = match radio_up(&secs.to_string()) {
+    let radio_stop = || {
+        if helper {
+            run_quiet("pkexec", &[c.discoverable.as_os_str(), "stop".as_ref()]);
+        }
+    };
+    // Not under the lock, unlike `on`: the old receiver still holds the
+    // identity's key, and a hard expiry that comes due during the radio's
+    // wait (up to RADIO_START_LIMIT) must be able to stop it at once. The
+    // receiver stays up meanwhile, so the panel says the radio is coming up.
+    drop(lock);
+    let radio = radio_up(&secs.to_string());
+    if matches!(radio, Radio::Cancelled) {
+        // A start abandoned partway may still finish.
+        radio_stop();
+        crate::proc::cancelled(None)
+    }
+    let lock = identity_lock();
+    // An `off` ran during the wait: it may have stopped the radio before
+    // this start finished, so stop it again, and leave the rest to the off.
+    if !ours() {
+        radio_stop();
+        return 0;
+    }
+    // The receiver restarts only once awdl0 is back: its unit waits for
+    // awdl0's address, and the one it was listening on went with the old awdl0.
+    let failed = match radio {
         Radio::Up if start_receiver(true) => None,
         Radio::Up => Some("The AirDrop receiver would not start.".to_string()),
         Radio::Failed(err) if err.is_empty() => {
             Some("The AirDrop radio could not be started.".to_string())
         }
         Radio::Failed(err) => Some(err),
-        Radio::Cancelled => {
-            // A start abandoned partway may still finish.
-            if helper {
-                run_quiet("pkexec", &[c.discoverable.as_os_str(), "stop".as_ref()]);
-            }
-            drop(lock);
-            crate::proc::cancelled(None)
-        }
+        Radio::Cancelled => unreachable!("a cancelled start exits above"),
     };
     if let Some(err) = failed {
         // Asleep again before it was back: the sleep hook ends a start in

@@ -87,13 +87,14 @@ impl Fixture {
 
         let log = r#"printf '%s\n' "$(basename "$0") $*" >> "$CAPTURE""#;
         // Every unit answers is-active with $ACTIVE, except the watcher
-        // ($WATCHING) and the services of a window's two deadlines
+        // ($WATCHING, or while the file $WATCH_FLAG exists, which stopping
+        // the watcher removes) and the services of a window's two deadlines
         // ($CLOSING). With $WATCHING set, the watcher runs `watch
         // $WATCH_ARGS`; $WINDOW_LEFT is the seconds left on the window's timer.
         write_exec(
             &bin.join("systemctl"),
             &format!(
-                "#!/bin/sh\n{log}\ncase \"$*\" in\n  *\" is-active \"*omdrop-watch.service*) s=${{WATCHING:-inactive}} ;;\n  *\" is-active \"*omdrop-window.service*|*\" is-active \"*omdrop-identity-expiry.service*) s=${{CLOSING:-inactive}} ;;\n  *\" is-active \"*) s=${{ACTIVE:-inactive}} ;;\n  *\" show omdrop-watch.service \"*) [ -n \"$WATCHING\" ] && echo \"{{ argv[]=/x/omdrop watch $WATCH_ARGS ; }}\"; exit 0 ;;\n  *\" show omdrop-window.timer \"*) [ -n \"$WINDOW_LEFT\" ] && python3 -c \"import time; print(int(time.monotonic()) + $WINDOW_LEFT)\"; exit 0 ;;\n  *\" start \"*) exit \"${{START_RC:-0}}\" ;;\n  *) exit 0 ;;\nesac\necho \"$s\"\n[ \"$s\" = active ]\n"
+                "#!/bin/sh\n{log}\ncase \"$*\" in\n  *\" is-active \"*omdrop-watch.service*) s=${{WATCHING:-inactive}}; [ -n \"$WATCH_FLAG\" ] && {{ [ -e \"$WATCH_FLAG\" ] && s=active || s=inactive; }} ;;\n  *\" is-active \"*omdrop-window.service*|*\" is-active \"*omdrop-identity-expiry.service*) s=${{CLOSING:-inactive}} ;;\n  *\" is-active \"*) s=${{ACTIVE:-inactive}} ;;\n  *\" stop omdrop-watch.service\"*) [ -n \"$WATCH_FLAG\" ] && rm -f \"$WATCH_FLAG\"; exit 0 ;;\n  *\" show omdrop-watch.service \"*) [ -n \"$WATCHING\" ] && echo \"{{ argv[]=/x/omdrop watch $WATCH_ARGS ; }}\"; exit 0 ;;\n  *\" show omdrop-window.timer \"*) [ -n \"$WINDOW_LEFT\" ] && python3 -c \"import time; print(int(time.monotonic()) + $WINDOW_LEFT)\"; exit 0 ;;\n  *\" start \"*) exit \"${{START_RC:-0}}\" ;;\n  *\" restart \"*) exit \"${{RESTART_RC:-0}}\" ;;\n  *) exit 0 ;;\nesac\necho \"$s\"\n[ \"$s\" = active ]\n"
             ),
         );
         write_exec(
@@ -429,6 +430,52 @@ fn a_window_that_cannot_come_back_is_turned_off() {
     assert!(ev.contains("--user stop airdrop-receiver.service"), "{ev}");
     assert!(ev.contains("stop omdrop-watch.service"), "{ev}");
     assert!(ev.contains("identity stop-end"), "{ev}");
+}
+
+#[test]
+fn a_receiver_that_will_not_restart_ends_the_window() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("RESTART_RC", "1")]);
+    assert_eq!(out.status.code(), Some(1), "{ev}");
+    let restart = first(&ev, "--user restart airdrop-receiver.service");
+    assert!(
+        last(&ev, "--user stop airdrop-receiver.service") > restart,
+        "{ev}"
+    );
+    assert!(ev.contains("stop omdrop-watch.service"), "{ev}");
+    assert!(last(&ev, " stop\n") > restart, "{ev}");
+    assert!(ev.contains("identity stop-end"), "{ev}");
+}
+
+#[test]
+fn an_off_during_a_resume_does_not_wait_for_the_radio() {
+    // A hard expiry that comes due while the radio is coming back must
+    // stop the receiver, which still holds the key, at once.
+    let f = Fixture::new();
+    let flag = f.root.join("watching");
+    std::fs::write(&flag, "").unwrap();
+    let mut resuming = f.command(&["resume"]);
+    resuming
+        .env("ACTIVE", "active")
+        .env("WATCH_FLAG", &flag)
+        .env("WATCH_ARGS", "")
+        .env("RADIO_SLEEP", "3");
+    let resuming = resuming.spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let t0 = std::time::Instant::now();
+    let (off, _) = f.run(
+        &["off", "--force"],
+        &[("ACTIVE", "active"), ("WATCH_FLAG", flag.to_str().unwrap())],
+    );
+    let took = t0.elapsed();
+    assert!(off.status.success());
+    let out = resuming.wait_with_output().unwrap();
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}\n{ev}");
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    // The off may have stopped the radio before the resume's start ended.
+    assert!(last(&ev, " stop\n") > first(&ev, " start 0"), "{ev}");
+    assert!(!ev.contains("restart"), "{ev}");
 }
 
 #[test]
