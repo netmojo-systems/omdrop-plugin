@@ -86,10 +86,16 @@ impl Fixture {
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_omdrop"), &omdrop).unwrap();
 
         let log = r#"printf '%s\n' "$(basename "$0") $*" >> "$CAPTURE""#;
+        // Every unit answers is-active with $ACTIVE, except the watcher
+        // ($WATCHING, or while the file $WATCH_FLAG exists, which stopping
+        // the watcher removes; its text is the watcher's InvocationID) and the
+        // services of a window's two deadlines ($CLOSING). The watcher runs
+        // `watch $WATCH_ARGS`, or `watch` and the text of $WATCH_FLAG.args;
+        // $WINDOW_LEFT is the seconds left on the window's timer.
         write_exec(
             &bin.join("systemctl"),
             &format!(
-                "#!/bin/sh\n{log}\ncase \"$*\" in\n  *\" is-active \"*) echo \"${{ACTIVE:-inactive}}\"; [ \"$ACTIVE\" = active ] ;;\n  *\" start \"*) exit \"${{START_RC:-0}}\" ;;\n  *) exit 0 ;;\nesac\n"
+                "#!/bin/sh\n{log}\ncase \"$*\" in\n  *\" is-active \"*omdrop-watch.service*) s=${{WATCHING:-inactive}}; [ -n \"$WATCH_FLAG\" ] && {{ [ -e \"$WATCH_FLAG\" ] && s=active || s=inactive; }} ;;\n  *\" is-active \"*omdrop-window.service*|*\" is-active \"*omdrop-identity-expiry.service*) s=${{CLOSING:-inactive}} ;;\n  *\" is-active \"*) s=${{ACTIVE:-inactive}} ;;\n  *\" stop omdrop-watch.service\"*) [ -n \"$WATCH_FLAG\" ] && rm -f \"$WATCH_FLAG\"; exit 0 ;;\n  *\" show omdrop-watch.service -p InvocationID \"*) [ -n \"$WATCH_FLAG\" ] && cat \"$WATCH_FLAG\" 2>/dev/null; exit 0 ;;\n  *\" show omdrop-watch.service \"*) a=$WATCH_ARGS; [ -n \"$WATCH_FLAG\" ] && [ -e \"$WATCH_FLAG.args\" ] && a=$(cat \"$WATCH_FLAG.args\"); {{ [ -n \"$WATCHING\" ] || [ -e \"$WATCH_FLAG\" ]; }} && echo \"{{ argv[]=/x/omdrop watch $a ; }}\"; exit 0 ;;\n  *\" show omdrop-window.timer \"*) [ -n \"$WINDOW_LEFT\" ] && python3 -c \"import time; print(int(time.monotonic()) + $WINDOW_LEFT)\"; exit 0 ;;\n  *\" start \"*) exit \"${{START_RC:-0}}\" ;;\n  *\" restart \"*) exit \"${{RESTART_RC:-0}}\" ;;\n  *) exit 0 ;;\nesac\necho \"$s\"\n[ \"$s\" = active ]\n"
             ),
         );
         write_exec(
@@ -283,10 +289,23 @@ fn a_1password_window_arms_its_hard_expiry_before_anything_starts() {
         &["on", "10m"],
         &[("IDENTITY", "source=1password\nexpiry_in=3600")],
     );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(ev.contains("--on-active=3600s "), "{ev}");
+    // And on the wall clock, which keeps counting while the computer sleeps.
+    let at: u64 = ev
+        .split("--on-calendar=@")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no calendar time in:\n{ev}"));
     assert!(
-        ev.contains("--on-active=3600s --unit=omdrop-identity-expiry"),
-        "{ev}"
+        (now + 3595..=now + 3600).contains(&at),
+        "{at} vs {now}\n{ev}"
     );
+    assert!(ev.contains(" --unit=omdrop-identity-expiry "), "{ev}");
     assert!(
         first(&ev, "omdrop-identity-expiry") < first(&ev, "pkexec"),
         "{ev}"
@@ -307,6 +326,235 @@ fn a_window_whose_hard_expiry_cannot_be_armed_never_starts() {
     assert!(ev.contains("identity stop-end"), "{ev}");
     assert!(!ev.contains("pkexec"), "{ev}");
     assert!(!ev.contains("--user start"), "{ev}");
+}
+
+/// `resume` with the receiver up and the watcher running `watch ARGS`.
+fn resume(f: &Fixture, watch_args: &str, env: &[(&str, &str)]) -> (Output, String) {
+    let mut all = vec![
+        ("ACTIVE", "active"),
+        ("WATCHING", "active"),
+        ("WATCH_ARGS", watch_args),
+    ];
+    all.extend_from_slice(env);
+    f.run(&["resume"], &all)
+}
+
+/// The seconds the radio was asked for, in order.
+fn radio_starts(ev: &str) -> Vec<String> {
+    ev.lines()
+        .filter_map(|l| l.strip_prefix("pkexec "))
+        .filter_map(|l| l.split_once(" start "))
+        .map(|(_, secs)| secs.to_string())
+        .collect()
+}
+
+#[test]
+fn a_window_the_sleep_ended_comes_back_radio_first() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(radio_starts(&ev), ["0"], "{ev}");
+    // The old receiver listened on the awdl0 the sleep removed.
+    assert!(
+        first(&ev, " start 0") < first(&ev, "--user restart airdrop-receiver.service"),
+        "{ev}"
+    );
+    // The window keeps its watcher, its deadlines and its identity.
+    assert!(!ev.contains(" stop "), "{ev}");
+    assert!(!ev.contains("identity stop-"), "{ev}");
+    assert!(!ev.contains("systemd-run"), "{ev}");
+}
+
+#[test]
+fn a_timed_window_comes_back_for_what_is_left_of_it() {
+    let f = Fixture::new();
+    let (_, ev) = resume(&f, "--window 10m", &[("WINDOW_LEFT", "300")]);
+    let starts = radio_starts(&ev);
+    assert!(!starts.is_empty(), "{ev}");
+    for secs in &starts {
+        let secs: i64 = secs.parse().unwrap();
+        assert!((295..=300).contains(&secs), "{ev}");
+    }
+}
+
+#[test]
+fn a_timed_window_with_nothing_left_is_turned_off_not_reopened() {
+    let f = Fixture::new();
+    let (_, ev) = resume(&f, "--window 10m", &[]);
+    assert!(radio_starts(&ev).is_empty(), "{ev}");
+    assert!(ev.contains("identity stop-end"), "{ev}");
+    assert!(ev.contains("--user stop airdrop-receiver.service"), "{ev}");
+}
+
+#[test]
+fn a_window_turned_off_before_its_resume_ran_stays_off() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("WATCHING", "")]);
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    assert!(radio_starts(&ev).is_empty(), "{ev}");
+    assert!(!ev.contains("restart"), "{ev}");
+}
+
+#[test]
+fn a_deadline_that_passed_in_sleep_closes_the_window_instead() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("CLOSING", "active")]);
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    assert!(radio_starts(&ev).is_empty(), "{ev}");
+    assert!(!ev.contains("restart"), "{ev}");
+}
+
+#[test]
+fn a_window_the_backend_kept_through_sleep_is_left_alone() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("VISIBLE", "1")]);
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    assert!(radio_starts(&ev).is_empty(), "{ev}");
+    assert!(!ev.contains("restart"), "{ev}");
+}
+
+#[test]
+fn a_window_that_cannot_come_back_is_turned_off() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("RADIO_RC", "1")]);
+    assert_eq!(out.status.code(), Some(1), "{ev}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("supervisor did not start"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!ev.contains("restart"), "{ev}");
+    assert!(ev.contains("--user stop airdrop-receiver.service"), "{ev}");
+    assert!(ev.contains("stop omdrop-watch.service"), "{ev}");
+    assert!(ev.contains("identity stop-end"), "{ev}");
+}
+
+#[test]
+fn a_receiver_that_will_not_restart_ends_the_window() {
+    let f = Fixture::new();
+    let (out, ev) = resume(&f, "", &[("RESTART_RC", "1")]);
+    assert_eq!(out.status.code(), Some(1), "{ev}");
+    let restart = first(&ev, "--user restart airdrop-receiver.service");
+    assert!(
+        last(&ev, "--user stop airdrop-receiver.service") > restart,
+        "{ev}"
+    );
+    assert!(ev.contains("stop omdrop-watch.service"), "{ev}");
+    assert!(last(&ev, " stop\n") > restart, "{ev}");
+    assert!(ev.contains("identity stop-end"), "{ev}");
+}
+
+#[test]
+fn an_off_during_a_resume_does_not_wait_for_the_radio() {
+    // A hard expiry that comes due while the radio is coming back must
+    // stop the receiver, which still holds the key, at once.
+    let f = Fixture::new();
+    let flag = f.root.join("watching");
+    std::fs::write(&flag, "").unwrap();
+    let mut resuming = f.command(&["resume"]);
+    resuming
+        .env("ACTIVE", "active")
+        .env("WATCH_FLAG", &flag)
+        .env("WATCH_ARGS", "")
+        .env("RADIO_SLEEP", "3");
+    let resuming = resuming.spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let t0 = std::time::Instant::now();
+    let (off, _) = f.run(
+        &["off", "--force"],
+        &[("ACTIVE", "active"), ("WATCH_FLAG", flag.to_str().unwrap())],
+    );
+    let took = t0.elapsed();
+    assert!(off.status.success());
+    let out = resuming.wait_with_output().unwrap();
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}\n{ev}");
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    // The off may have stopped the radio before the resume's start ended.
+    assert!(last(&ev, " stop\n") > first(&ev, " start 0"), "{ev}");
+    assert!(!ev.contains("restart"), "{ev}");
+}
+
+#[test]
+fn a_window_opened_again_during_a_resume_gets_its_own_span() {
+    // A timed window's resume is in the radio's gate when `off` and then
+    // `on forever` run. That `on`'s start found the gate busy (5) and left
+    // the radio on the timed span, or down if the old start failed; resume
+    // brings it up with the new window's span. A replacement whose radio
+    // still will not come up is turned off rather than left on unseen.
+    for radio_rc in ["0", "1"] {
+        let f = Fixture::new();
+        let flag = f.root.join("watching");
+        let args = f.root.join("watching.args");
+        std::fs::write(&flag, "first").unwrap();
+        std::fs::write(&args, "--window 10m").unwrap();
+        let mut resuming = f.command(&["resume"]);
+        resuming
+            .env("ACTIVE", "active")
+            .env("WATCH_FLAG", &flag)
+            .env("WINDOW_LEFT", "9")
+            .env("RADIO_RC", radio_rc)
+            .env("RADIO_SLEEP", "2");
+        let resuming = resuming.spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        std::fs::write(&flag, "second").unwrap();
+        std::fs::write(&args, "").unwrap();
+        let out = resuming.wait_with_output().unwrap();
+        let ev = std::fs::read_to_string(&f.capture).unwrap();
+        let starts = radio_starts(&ev);
+        assert_eq!(starts.len(), 2, "{ev}");
+        assert_ne!(starts[0], "0", "{ev}");
+        assert_eq!(starts[1], "0", "{ev}");
+        // The replacement started its own receiver.
+        assert!(!ev.contains("restart"), "{ev}");
+        if radio_rc == "0" {
+            assert_eq!(out.status.code(), Some(0), "{ev}");
+            assert!(!ev.contains(" stop"), "{ev}");
+        } else {
+            assert_eq!(out.status.code(), Some(1), "{ev}");
+            assert!(ev.contains("identity stop-end"), "{ev}");
+        }
+    }
+}
+
+#[test]
+fn an_off_during_a_replacements_radio_wait_does_not_wait_for_it() {
+    // The replacement's span is applied without the identity lock too, so
+    // that window's hard expiry can still stop its receiver at once.
+    let f = Fixture::new();
+    let flag = f.root.join("watching");
+    std::fs::write(&flag, "first").unwrap();
+    let mut resuming = f.command(&["resume"]);
+    resuming
+        .env("ACTIVE", "active")
+        .env("WATCH_FLAG", &flag)
+        .env("RADIO_SLEEP", "3");
+    let t_spawn = std::time::Instant::now();
+    let resuming = resuming.spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    std::fs::write(&flag, "second").unwrap();
+    // Into the second start's sleep.
+    std::thread::sleep(std::time::Duration::from_millis(3800).saturating_sub(t_spawn.elapsed()));
+    let t0 = std::time::Instant::now();
+    let (off, _) = f.run(
+        &["off", "--force"],
+        &[("ACTIVE", "active"), ("WATCH_FLAG", flag.to_str().unwrap())],
+    );
+    let took = t0.elapsed();
+    let out = resuming.wait_with_output().unwrap();
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    assert!(off.status.success());
+    assert_eq!(radio_starts(&ev).len(), 2, "{ev}");
+    assert!(
+        took < std::time::Duration::from_millis(1500),
+        "{took:?}\n{ev}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    assert!(last(&ev, " stop\n") > last(&ev, " start 0"), "{ev}");
 }
 
 #[test]

@@ -86,6 +86,8 @@ Click the icon to open the panel:
 
 After a transfer, you can turn receiving off and on again without waiting for the sender's connection to close.
 
+If the computer sleeps while Omdrop is on, omdrop-core brings the window back when it wakes; the Python version leaves it for you to turn off and on again. On a Mac the radio takes from about 20 seconds to 2 minutes to return, and the panel shows **Waking the radio** until it does. A timed window doesn't count the time asleep. A window that can't come back turns off, and so does one whose 1Password identity expired during the sleep.
+
 Received files are saved, copied to the clipboard, and announced in a notification. Clicking the notification opens the file.
 
 A shared link arrives as a `.url` or `.webloc` file. Clicking its notification, or double-clicking it in Files, opens it in your browser. Only `http` and `https` links open; a link to anything else, such as `file://` or `smb://`, is refused with a notification, because it was chosen by whoever sent it.

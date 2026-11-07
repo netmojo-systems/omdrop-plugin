@@ -690,7 +690,17 @@ pub fn cmd_watch(args: &[String]) -> i32 {
     let mut handlers: Vec<Child> = Vec::new();
     // Transfers with an announced file, for --once.
     let mut announced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The radio backend may end the window before the computer sleeps, and
+    // nothing else brings it back (window::cmd_resume). This process lives
+    // exactly as long as the window, and it wakes every second.
+    let mut asleep = crate::status::suspended_secs();
     loop {
+        if let Some(before) = asleep
+            && crate::status::slept_since(before) == Some(true)
+        {
+            asleep = crate::status::suspended_secs();
+            resume_window();
+        }
         // Woken every second even without a record, so finished `handle`
         // children are reaped promptly rather than at the next arrival.
         let line = match reader.read_line(Some(
@@ -778,6 +788,24 @@ pub fn cmd_watch(args: &[String]) -> i32 {
     }
     let _ = journal.wait();
     0
+}
+
+/// `omdrop resume`, in a unit of its own like the `off` above: a resume that
+/// turns the window off stops this service, and systemd kills its whole
+/// cgroup, so it never runs in this process.
+fn resume_window() {
+    outln!("omdrop watch: the computer slept; bringing the window back");
+    let self_exe = ctx().command_path().as_os_str();
+    let args: [&OsStr; 5] = [
+        "--user".as_ref(),
+        "--quiet".as_ref(),
+        "--collect".as_ref(),
+        self_exe,
+        "resume".as_ref(),
+    ];
+    if run_quiet("systemd-run", &args) != 0 {
+        errln!("omdrop watch: `omdrop resume` could not be started; turn Omdrop off and on again");
+    }
 }
 
 /// What the receiver's `%(asctime)s %(levelname)s %(name)s: ` prefix
