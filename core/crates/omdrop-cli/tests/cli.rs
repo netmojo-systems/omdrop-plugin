@@ -128,12 +128,13 @@ impl Fixture {
         ] {
             write_exec(&bin.join(quiet), &format!("#!/bin/sh\n{log}\n"));
         }
-        // `gio trash` moves its argument into the user's trash; with $GIO_RC
-        // set it fails and leaves it, as gio does without a trash it can use.
+        // `gio trash` moves its argument into the user's trash. With $GIO_RC
+        // set it fails and leaves it, as gio does without a trash it can use;
+        // with $GIO_MOVED_RC it moves it and still exits with that status.
         write_exec(
             &bin.join("gio"),
             &format!(
-                "#!/bin/sh\n{log}\n[ \"$1\" = trash ] && [ \"${{GIO_RC:-0}}\" = 0 ] || exit \"${{GIO_RC:-1}}\"\nmkdir -p \"$HOME/.local/share/Trash/files\" && mv \"$2\" \"$HOME/.local/share/Trash/files/\"\n"
+                "#!/bin/sh\n{log}\n[ \"$1\" = trash ] && [ \"${{GIO_RC:-0}}\" = 0 ] || exit \"${{GIO_RC:-1}}\"\nmkdir -p \"$HOME/.local/share/Trash/files\" && mv \"$2\" \"$HOME/.local/share/Trash/files/\" && exit \"${{GIO_MOVED_RC:-0}}\"\n"
             ),
         );
         let helper = root.join("omdrop-discoverable");
@@ -2531,10 +2532,9 @@ fn asides(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-#[test]
-fn a_previous_installation_goes_to_the_trash_when_the_user_agrees() {
+fn assert_trashed(env: &[(&str, &str)]) {
     let f = Fixture::new();
-    let Some((stdout, _, dir)) = agree_to_replace(&f, &[]) else {
+    let Some((stdout, _, dir)) = agree_to_replace(&f, env) else {
         return;
     };
     assert!(
@@ -2549,6 +2549,16 @@ fn a_previous_installation_goes_to_the_trash_when_the_user_agrees() {
         "git clone"
     );
     assert!(asides(&dir).is_empty());
+}
+
+#[test]
+fn a_previous_installation_goes_to_the_trash_when_the_user_agrees() {
+    assert_trashed(&[]);
+}
+
+#[test]
+fn a_copy_the_trash_took_counts_even_when_gio_reports_failure() {
+    assert_trashed(&[("GIO_MOVED_RC", "1")]);
 }
 
 #[test]

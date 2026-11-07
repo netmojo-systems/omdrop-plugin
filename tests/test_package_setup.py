@@ -44,10 +44,11 @@ class PackageSetupTests(unittest.TestCase):
         # The receiver's unit installs; nothing is active.
         self.command("systemctl", '#!/bin/sh\ncase "$*" in *is-active*) exit 3 ;; esac\nexit 0\n')
         # `gio trash` moves its argument into the user's trash; GIO_RC makes
-        # it fail and leave it, as gio does without a trash it can use.
+        # it fail and leave it, as gio does without a trash it can use, and
+        # GIO_MOVED_RC makes it move it and still exit with that status.
         self.command("gio", log + '[ "$1" = trash ] && [ "${GIO_RC:-0}" = 0 ] || exit "${GIO_RC:-1}"\n'
                      'mkdir -p "$HOME/.local/share/Trash/files" && '
-                     'mv "$2" "$HOME/.local/share/Trash/files/"\n')
+                     'mv "$2" "$HOME/.local/share/Trash/files/" && exit "${GIO_MOVED_RC:-0}"\n')
         self.env = {k: v for k, v in os.environ.items() if k != "OMDROP_IMPLEMENTATION"}
         self.env.update(PATH=f"{self.bin}:{self.env['PATH']}", HOME=str(self.home),
                         XDG_CONFIG_HOME=str(self.home / ".config"),
@@ -110,8 +111,15 @@ class PackageSetupTests(unittest.TestCase):
 
     @unittest.skipUnless(SCRIPT, "needs script(1)")
     def test_a_previous_installation_goes_to_the_trash_when_the_user_agrees(self):
+        self.assert_trashed()
+
+    @unittest.skipUnless(SCRIPT, "needs script(1)")
+    def test_a_copy_the_trash_took_counts_even_when_gio_reports_failure(self):
+        self.assert_trashed(GIO_MOVED_RC="1")
+
+    def assert_trashed(self, **env):
         self.previous_clone()
-        run = self.terminal_setup("\n")
+        run = self.terminal_setup("\n", **env)
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertIn("Previous Omdrop plugin installation detected", run.stdout)
         self.assertIn(f"will replace it with a newer version (0.0.1 → {self.packaged_version()})",
