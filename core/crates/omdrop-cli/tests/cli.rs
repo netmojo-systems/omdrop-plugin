@@ -484,7 +484,8 @@ fn a_window_opened_again_during_a_resume_gets_its_own_span() {
     // A timed window's resume is in the radio's gate when `off` and then
     // `on forever` run. That `on`'s start found the gate busy (5) and left
     // the radio on the timed span, or down if the old start failed; resume
-    // gives it the new window's span, and touches nothing else of it.
+    // brings it up with the new window's span. A replacement whose radio
+    // still will not come up is turned off rather than left on unseen.
     for radio_rc in ["0", "1"] {
         let f = Fixture::new();
         let flag = f.root.join("watching");
@@ -504,14 +505,56 @@ fn a_window_opened_again_during_a_resume_gets_its_own_span() {
         std::fs::write(&args, "").unwrap();
         let out = resuming.wait_with_output().unwrap();
         let ev = std::fs::read_to_string(&f.capture).unwrap();
-        assert_eq!(out.status.code(), Some(0), "RADIO_RC={radio_rc}\n{ev}");
         let starts = radio_starts(&ev);
         assert_eq!(starts.len(), 2, "{ev}");
         assert_ne!(starts[0], "0", "{ev}");
         assert_eq!(starts[1], "0", "{ev}");
+        // The replacement started its own receiver.
         assert!(!ev.contains("restart"), "{ev}");
-        assert!(!ev.contains(" stop"), "{ev}");
+        if radio_rc == "0" {
+            assert_eq!(out.status.code(), Some(0), "{ev}");
+            assert!(!ev.contains(" stop"), "{ev}");
+        } else {
+            assert_eq!(out.status.code(), Some(1), "{ev}");
+            assert!(ev.contains("identity stop-end"), "{ev}");
+        }
     }
+}
+
+#[test]
+fn an_off_during_a_replacements_radio_wait_does_not_wait_for_it() {
+    // The replacement's span is applied without the identity lock too, so
+    // that window's hard expiry can still stop its receiver at once.
+    let f = Fixture::new();
+    let flag = f.root.join("watching");
+    std::fs::write(&flag, "first").unwrap();
+    let mut resuming = f.command(&["resume"]);
+    resuming
+        .env("ACTIVE", "active")
+        .env("WATCH_FLAG", &flag)
+        .env("RADIO_SLEEP", "3");
+    let t_spawn = std::time::Instant::now();
+    let resuming = resuming.spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    std::fs::write(&flag, "second").unwrap();
+    // Into the second start's sleep.
+    std::thread::sleep(std::time::Duration::from_millis(3800).saturating_sub(t_spawn.elapsed()));
+    let t0 = std::time::Instant::now();
+    let (off, _) = f.run(
+        &["off", "--force"],
+        &[("ACTIVE", "active"), ("WATCH_FLAG", flag.to_str().unwrap())],
+    );
+    let took = t0.elapsed();
+    let out = resuming.wait_with_output().unwrap();
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    assert!(off.status.success());
+    assert_eq!(radio_starts(&ev).len(), 2, "{ev}");
+    assert!(
+        took < std::time::Duration::from_millis(1500),
+        "{took:?}\n{ev}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{ev}");
+    assert!(last(&ev, " stop\n") > last(&ev, " start 0"), "{ev}");
 }
 
 #[test]

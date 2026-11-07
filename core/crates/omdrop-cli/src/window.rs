@@ -677,40 +677,25 @@ fn off_locked() {
 /// deadlines. The radio comes up again, for what is left of a timed window,
 /// and the receiver restarts on the new awdl0. A window that cannot come back
 /// is turned off, so that it never reads as on while nobody can see it.
+///
+/// An `off` and then an `on` can replace the window while the radio comes
+/// up. That `on`'s own start finds this one in the radio's gate and gets 5,
+/// which `on` takes as up, so its span was never applied: the radio keeps
+/// this start's, or stays down if this start failed. So the radio is then
+/// brought up again with the replacement's span, by the same steps.
 pub fn cmd_resume() -> i32 {
     let c = ctx();
-    let lock = identity_lock();
-    // `off` ran first, or a deadline that passed during the sleep is turning
-    // the window off and waits for this lock. Either way it is not ours.
     let active = |unit: &str| {
         run_quiet(
             "systemctl",
             &["--user", "is-active", &format!("{unit}.service")],
         ) == 0
     };
-    let ours = || active(WATCH) && !active(WINDOW) && !active(ID_EXPIRY);
-    if !ours() {
-        return 0;
-    }
-    // The backend kept the window through the sleep.
-    if receiving() && crate::status::radio_status().is_some_and(|r| r.visible) {
-        return 0;
-    }
-    let secs = match crate::status::watch_mode() {
-        Some("timed") => match crate::status::window_remaining() {
-            Some(left) => left,
-            // Its time is up; its timer's `off` may be on the way.
-            None => {
-                off_locked();
-                return 0;
-            }
-        },
-        _ => 0,
-    };
-    let before = crate::status::suspended_secs();
-    let helper = is_executable(&c.discoverable);
-    // Which watcher this window has: an `off` and then an `on` during the
-    // radio's wait leave a watcher running, but a different one.
+    // A deadline that came due (during the sleep, or since) is turning the
+    // window off, and waits for the identity lock.
+    let closing = || active(WINDOW) || active(ID_EXPIRY);
+    // Which window this is: an `off` and then an `on` leave a watcher
+    // running, but a different one.
     let invocation = || {
         crate::proc::capture_ok(
             "systemctl",
@@ -725,90 +710,110 @@ pub fn cmd_resume() -> i32 {
         )
         .unwrap_or_default()
     };
-    let window = invocation();
+    let helper = is_executable(&c.discoverable);
     let radio_stop = || {
         if helper {
             run_quiet("pkexec", &[c.discoverable.as_os_str(), "stop".as_ref()]);
         }
     };
-    // Not under the lock, unlike `on`: the old receiver still holds the
-    // identity's key, and a hard expiry that comes due during the radio's
-    // wait (up to RADIO_START_LIMIT) must be able to stop it at once. The
-    // receiver stays up meanwhile, so the panel says the radio is coming up.
-    drop(lock);
-    let radio = radio_up(&secs.to_string());
-    if matches!(radio, Radio::Cancelled) {
-        // A start abandoned partway may still finish.
-        radio_stop();
-        crate::proc::cancelled(None)
-    }
-    let lock = identity_lock();
-    // An `off` ran during the wait. It may have stopped the radio before
-    // this start finished, so stop it again, and leave the rest to the off.
-    if !active(WATCH) {
-        radio_stop();
+
+    let mut lock = identity_lock();
+    // `off` ran first, or a deadline is closing the window.
+    if !active(WATCH) || closing() {
         return 0;
     }
-    // An `on` followed it. Its start found this one in its gate (5, which
-    // `on` takes as up) and left the radio with this start's deadline, or
-    // with none if this start failed. That `on` has finished, as it holds the
-    // lock until it has, so give the radio its window's span now.
-    if invocation() != window {
+    // The backend kept the window through the sleep.
+    if receiving() && crate::status::radio_status().is_some_and(|r| r.visible) {
+        return 0;
+    }
+    let original = invocation();
+    let mut window = original.clone();
+    let before = crate::status::suspended_secs();
+    loop {
         let span = match crate::status::watch_mode() {
-            Some("timed") => crate::status::window_remaining(),
-            _ => Some(0),
+            Some("timed") => match crate::status::window_remaining() {
+                Some(left) => left,
+                // Its time is up; its timer's `off` may be on the way.
+                None => {
+                    off_locked();
+                    return 0;
+                }
+            },
+            _ => 0,
         };
-        if let Some(span) = span
-            && let Radio::Failed(err) = radio_up(&span.to_string())
-        {
-            errln!("omdrop resume: the window opened meanwhile: {err}");
+        // Not under the lock, unlike `on`: the receiver holds the identity's
+        // key, and a hard expiry that comes due during the radio's wait (up
+        // to RADIO_START_LIMIT) must be able to stop it at once. The receiver
+        // stays up meanwhile, so the panel says the radio is coming up.
+        drop(lock);
+        let radio = radio_up(&span.to_string());
+        if matches!(radio, Radio::Cancelled) {
+            // A start abandoned partway may still finish.
+            radio_stop();
+            crate::proc::cancelled(None)
         }
-        return 0;
-    }
-    // A deadline that came due during the wait is turning the window off.
-    if !ours() {
-        return 0;
-    }
-    // The receiver restarts only once awdl0 is back: its unit waits for
-    // awdl0's address, and the one it was listening on went with the old awdl0.
-    let failed = match radio {
-        Radio::Up if start_receiver(true) => None,
-        Radio::Up => Some("The AirDrop receiver would not start.".to_string()),
-        Radio::Failed(err) if err.is_empty() => {
-            Some("The AirDrop radio could not be started.".to_string())
+        lock = identity_lock();
+        // An `off` ran during the wait. It may have stopped the radio before
+        // this start finished, so stop it again, and leave the rest to it.
+        if !active(WATCH) {
+            radio_stop();
+            return 0;
         }
-        Radio::Failed(err) => Some(err),
-        Radio::Cancelled => unreachable!("a cancelled start exits above"),
-    };
-    if let Some(err) = failed {
-        // Asleep again before it was back: the sleep hook ends a start in
-        // flight. The window stays as it was, and the next resume retries.
-        if before.and_then(crate::status::slept_since).unwrap_or(false) {
+        // An `on` replaced the window during the wait, and has finished: it
+        // holds the lock until it has. Give the radio that window's span.
+        let now = invocation();
+        if now != window {
+            window = now;
+            continue;
+        }
+        if closing() {
+            return 0;
+        }
+        // A replacement started its own receiver. This window's restarts only
+        // once awdl0 is back: its unit waits for awdl0's address, and the one
+        // it was listening on went with the old awdl0.
+        let failed = match radio {
+            Radio::Up if window != original || start_receiver(true) => None,
+            Radio::Up => Some("The AirDrop receiver would not start.".to_string()),
+            Radio::Failed(err) if err.is_empty() => {
+                Some("The AirDrop radio could not be started.".to_string())
+            }
+            Radio::Failed(err) => Some(err),
+            Radio::Cancelled => unreachable!("a cancelled start exits above"),
+        };
+        if let Some(err) = failed {
+            // Asleep again before it was back: the sleep hook ends a start in
+            // flight. The window stays as it was, and the next resume retries.
+            if before.and_then(crate::status::slept_since).unwrap_or(false) {
+                errln!("omdrop resume: {err}");
+                errln!(
+                    "omdrop resume: the computer slept again meanwhile, so the window stays and comes back when it wakes."
+                );
+                return 1;
+            }
             errln!("omdrop resume: {err}");
-            errln!(
-                "omdrop resume: the computer slept again meanwhile, so the window stays and comes back when it wakes."
-            );
+            errln!("omdrop resume: the window could not come back, so Omdrop is turning off.");
+            off_locked();
             return 1;
         }
-        errln!("omdrop resume: {err}");
-        errln!("omdrop resume: the window could not come back, so Omdrop is turning off.");
-        off_locked();
-        return 1;
+        // As `on` does: a timed window's radio came up counting down from what
+        // was left when it started, so ask it again with what is left now.
+        if helper
+            && span > 0
+            && let Some(left) = crate::status::window_remaining()
+        {
+            run_quiet(
+                "pkexec",
+                &[
+                    c.discoverable.as_os_str(),
+                    "start".as_ref(),
+                    left.to_string().as_ref(),
+                ],
+            );
+        }
+        drop(lock);
+        return crate::status::cmd_status(&[]);
     }
-    // As `on` does: the radio came up counting down from what was left when
-    // it started, so ask it again with what is left now.
-    if helper && let Some(left) = crate::status::window_remaining() {
-        run_quiet(
-            "pkexec",
-            &[
-                c.discoverable.as_os_str(),
-                "start".as_ref(),
-                left.to_string().as_ref(),
-            ],
-        );
-    }
-    drop(lock);
-    crate::status::cmd_status(&[])
 }
 
 pub fn cmd_toggle(args: &[String]) -> i32 {
