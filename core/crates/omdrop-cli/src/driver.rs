@@ -567,12 +567,17 @@ fn core_wanted(plugin: &Path) -> Option<String> {
 }
 
 /// Where `omdrop install-core` installs: Apple's Broadcom Wi-Fi, with
-/// omdrop-awdl's helper or its hooks, on hardware that backend says it can
-/// drive, until core has run on other backends.
+/// omdrop-awdl's helper or its hooks, and omdrop-owl, on hardware the backend
+/// says it can drive. Core runs here only beside a backend's hooks, so an
+/// omdrop-owl without them (before 0.4.0) never gets this far.
 fn core_supported() -> bool {
     match radio_probe() {
         Probe::None => apple_broadcom_wifi(),
-        _ => awdl_backend() && probe_field("hardware") != "false",
+        Probe::Answer(_) => {
+            let backend = probe_field("backend");
+            (backend == "awdl" || backend == "owl") && probe_field("hardware") != "false"
+        }
+        _ => false,
     }
 }
 

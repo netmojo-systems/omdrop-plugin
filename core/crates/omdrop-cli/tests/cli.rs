@@ -1741,31 +1741,41 @@ fn awdl() -> serde_json::Value {
 
 #[test]
 fn an_installed_core_older_than_the_plugins_is_offered_an_update() {
-    let r = Radio::new();
-    r.helper(&backend_helper(Some(awdl())));
-    with_core(&r, "0.1.0-1");
-    let doctor = r.doctor();
-    let offers = doctor["offers"].as_array().unwrap();
-    assert_eq!(offers.len(), 1, "{doctor}");
-    assert_eq!(offers[0]["id"], "core");
-    let say = offers[0]["say"].as_str().unwrap();
-    assert!(
-        say.contains("0.1.0-1") && say.contains("0.2.0-1") && say.contains("omdrop install-core"),
-        "{say}"
-    );
-    assert!(!r.ids().contains(&"core".to_string()), "{doctor}");
-    let out = text(&r.run(&["doctor"]).stdout);
-    assert!(out.contains("\nTo do:\n  - omdrop-core 0.1.0-1"), "{out}");
+    for backend in [awdl(), owl(serde_json::json!([]))] {
+        let r = Radio::new();
+        r.helper(&backend_helper(Some(backend.clone())));
+        with_core(&r, "0.1.0-1");
+        let doctor = r.doctor();
+        let offers = doctor["offers"].as_array().unwrap();
+        assert_eq!(offers.len(), 1, "{backend} {doctor}");
+        assert_eq!(offers[0]["id"], "core");
+        let say = offers[0]["say"].as_str().unwrap();
+        assert!(
+            say.contains("0.1.0-1")
+                && say.contains("0.2.0-1")
+                && say.contains("omdrop install-core"),
+            "{say}"
+        );
+        assert!(!r.ids().contains(&"core".to_string()), "{doctor}");
+        let out = text(&r.run(&["doctor"]).stdout);
+        assert!(out.contains("\nTo do:\n  - omdrop-core 0.1.0-1"), "{out}");
+    }
 }
 
 #[test]
-fn a_current_core_or_an_untested_backend_is_offered_nothing() {
-    let mut no_hardware = awdl();
-    no_hardware["hardware"] = serde_json::json!(false);
+fn a_current_core_or_hardware_the_backend_cannot_drive_is_offered_nothing() {
+    let mut awdl_no_hardware = awdl();
+    awdl_no_hardware["hardware"] = serde_json::json!(false);
+    let mut owl_no_hardware = owl(serde_json::json!([]));
+    owl_no_hardware["hardware"] = serde_json::json!(false);
+    let mut other = awdl();
+    other["backend"] = serde_json::json!("bcm4360");
     for (backend, installed) in [
         (awdl(), "0.2.0-1"),
-        (owl(serde_json::json!([])), "0.1.0-1"),
-        (no_hardware, "0.1.0-1"),
+        (owl(serde_json::json!([])), "0.2.0-1"),
+        (awdl_no_hardware, "0.1.0-1"),
+        (owl_no_hardware, "0.1.0-1"),
+        (other, "0.1.0-1"),
     ] {
         let r = Radio::new();
         r.helper(&backend_helper(Some(backend.clone())));
