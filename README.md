@@ -42,7 +42,7 @@ omarchy pkg add omdrop      # plain Arch: sudo pacman -S omdrop
 /usr/bin/omdrop setup       # once per user: adds the widget to the bar
 ```
 
-The package puts the plugin in `/usr/share/omdrop`, and `setup` links it into `~/.config/omarchy/plugins`. Run it as `/usr/bin/omdrop` the first time: if you installed Omdrop before with `omarchy plugin add`, a plain `omdrop` may still run that copy, from `~/.local/bin`. `setup` asks before replacing that copy, and moves it aside to a hidden `.netmojo.omdrop.replaced-<date>` directory beside it rather than deleting it. Afterwards `omdrop` runs the package. The radio still comes from its own package: `brcmfmac-awdl-dkms` on an Apple Silicon Mac, `omdrop-bcm4360` on an Intel MacBook, `omdrop-owl` on other Wi-Fi cards.
+The package puts the plugin in `/usr/share/omdrop`, and `setup` links it into `~/.config/omarchy/plugins`. Run it as `/usr/bin/omdrop` the first time: if you installed Omdrop before with `omarchy plugin add`, a plain `omdrop` may still run that copy, from `~/.local/bin`. `setup` asks before replacing that copy, and moves it to the trash rather than deleting it, so you can restore it from Files. Without `gio`, or if the trash refuses it, it goes to a hidden `.netmojo.omdrop.replaced-<date>` directory beside it instead, and `setup` says where. Afterwards `omdrop` runs the package. The radio still comes from its own package: `brcmfmac-awdl-dkms` on an Apple Silicon Mac, `omdrop-bcm4360` on an Intel MacBook, `omdrop-owl` on other Wi-Fi cards.
 
 ### omdrop-core
 

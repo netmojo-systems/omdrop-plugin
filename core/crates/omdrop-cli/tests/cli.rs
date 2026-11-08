@@ -128,6 +128,15 @@ impl Fixture {
         ] {
             write_exec(&bin.join(quiet), &format!("#!/bin/sh\n{log}\n"));
         }
+        // `gio trash` moves its argument into the user's trash. With $GIO_RC
+        // set it fails and leaves it, as gio does without a trash it can use;
+        // with $GIO_MOVED_RC it moves it and still exits with that status.
+        write_exec(
+            &bin.join("gio"),
+            &format!(
+                "#!/bin/sh\n{log}\n[ \"$1\" = trash ] && [ \"${{GIO_RC:-0}}\" = 0 ] || exit \"${{GIO_RC:-1}}\"\nmkdir -p \"$HOME/.local/share/Trash/files\" && mv \"$2\" \"$HOME/.local/share/Trash/files/\" && exit \"${{GIO_MOVED_RC:-0}}\"\n"
+            ),
+        );
         let helper = root.join("omdrop-discoverable");
         write_exec(
             &helper,
@@ -2468,15 +2477,15 @@ fn a_previous_installation_is_kept_without_a_terminal() {
     assert!(!ev.contains("omarchy-plugin-enable"), "{ev}");
 }
 
-#[test]
-fn a_previous_installation_is_replaced_when_the_user_agrees() {
-    // script(1) gives setup the terminal its question needs; Enter is Yes.
+/// `setup` in the terminal script(1) gives it, answering Enter (Yes) to the
+/// question about a previous clone at the plugin's link: (stdout, link, the
+/// directory the link lives in).
+fn agree_to_replace(f: &Fixture, env: &[(&str, &str)]) -> Option<(String, PathBuf, PathBuf)> {
     let Ok(script) = which_script() else {
         eprintln!("skipped: no script(1)");
-        return;
+        return None;
     };
-    let f = Fixture::new();
-    let (plugin, target) = packaged(&f);
+    let (plugin, target) = packaged(f);
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("marker"), "git clone").unwrap();
     std::fs::write(target.join("manifest.json"), r#"{"version": "0.0.1"}"#).unwrap();
@@ -2488,7 +2497,8 @@ fn a_previous_installation_is_replaced_when_the_user_agrees() {
             "/dev/null",
         ],
     );
-    cmd.env("OMDROP_PACKAGE_ROOT", root_env(&f))
+    cmd.env("OMDROP_PACKAGE_ROOT", root_env(f))
+        .envs(env.iter().copied())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -2496,16 +2506,21 @@ fn a_previous_installation_is_replaced_when_the_user_agrees() {
     use std::io::Write;
     child.stdin.take().unwrap().write_all(b"\n").unwrap();
     let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
     assert!(
-        text(&out.stdout).contains("Previous Omdrop plugin installation detected at",)
-            && text(&out.stdout)
+        stdout.contains("Previous Omdrop plugin installation detected at")
+            && stdout
                 .contains("will replace it with a newer version (0.0.1 → 9.9.9). Continue? (Y/n)"),
-        "{}",
-        text(&out.stdout)
+        "{stdout}"
     );
     assert_eq!(std::fs::read_link(&target).unwrap(), plugin);
-    let aside: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+    let dir = target.parent().unwrap().to_path_buf();
+    Some((stdout, target, dir))
+}
+
+fn asides(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
         .unwrap()
         .filter_map(Result::ok)
         .filter(|e| {
@@ -2513,10 +2528,56 @@ fn a_previous_installation_is_replaced_when_the_user_agrees() {
                 .to_string_lossy()
                 .starts_with(".netmojo.omdrop.replaced-")
         })
-        .collect();
-    assert_eq!(aside.len(), 1);
+        .map(|e| e.path())
+        .collect()
+}
+
+fn assert_trashed(env: &[(&str, &str)]) {
+    let f = Fixture::new();
+    let Some((stdout, _, dir)) = agree_to_replace(&f, env) else {
+        return;
+    };
+    assert!(
+        stdout.contains(
+            "Moved the previous installation to the trash. Restore it from Files if needed."
+        ),
+        "{stdout}"
+    );
+    let trashed = f.root.join("home/.local/share/Trash/files/netmojo.omdrop");
     assert_eq!(
-        std::fs::read_to_string(aside[0].path().join("marker")).unwrap(),
+        std::fs::read_to_string(trashed.join("marker")).unwrap(),
+        "git clone"
+    );
+    assert!(asides(&dir).is_empty());
+}
+
+#[test]
+fn a_previous_installation_goes_to_the_trash_when_the_user_agrees() {
+    assert_trashed(&[]);
+}
+
+#[test]
+fn a_copy_the_trash_took_counts_even_when_gio_reports_failure() {
+    assert_trashed(&[("GIO_MOVED_RC", "1")]);
+}
+
+#[test]
+fn a_previous_installation_the_trash_refuses_is_moved_aside() {
+    let f = Fixture::new();
+    let Some((stdout, _, dir)) = agree_to_replace(&f, &[("GIO_RC", "1")]) else {
+        return;
+    };
+    let aside = asides(&dir);
+    assert_eq!(aside.len(), 1, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Moved the previous installation to {}.",
+            aside[0].display()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(aside[0].join("marker")).unwrap(),
         "git clone"
     );
 }

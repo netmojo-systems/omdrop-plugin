@@ -812,8 +812,10 @@ manifest_version() {
 # A previous installation -- a git or marketplace clone, or a link to another
 # copy -- is replaced only after the user says so, which needs a terminal. The
 # panel's first `omdrop on` runs setup without one; then it is left in place
-# with a warning, and the next `omdrop setup` asks. A replaced clone is moved
-# aside to a hidden directory, which the shell ignores, not deleted. Returns 0
+# with a warning, and the next `omdrop setup` asks. A replaced clone goes to
+# the trash with `gio trash`, where Files shows it (#87); without gio, or if
+# that fails, it is moved aside to a hidden directory, which the shell
+# ignores. It is never deleted. Returns 0
 # when it linked the plugin. OMDROP_PACKAGE_ROOT moves /usr for tests; it only
 # decides whether setup links the plugin into the user's own home.
 PLUGIN_ID=netmojo.omdrop
@@ -850,6 +852,9 @@ link_plugin() {
     esac
     if [[ -L "$target" ]]; then
       rm -f "$target" || { echo "omdrop could not remove the link $target." >&2; return 1; }
+    elif command -v gio >/dev/null 2>&1 \
+         && { gio trash "$target" >/dev/null 2>&1; [[ ! -e "$target" && ! -L "$target" ]]; }; then
+      echo "Moved the previous installation to the trash. Restore it from Files if needed."
     else
       aside="$dir/.$PLUGIN_ID.replaced-$(date +%Y%m%d-%H%M%S)"
       mv "$target" "$aside" || { echo "omdrop could not move $target aside, so it left it in place." >&2; return 1; }
