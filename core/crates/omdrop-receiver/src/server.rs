@@ -264,6 +264,8 @@ pub struct Server {
     live: Mutex<HashMap<u64, Live>>,
     next_id: AtomicU64,
     uploads: AtomicUsize,
+    consent_prompt: Mutex<()>,
+    approver: fn(&Dictionary) -> bool,
     /// Held by a links Ask from its budget check through its last write.
     links: Mutex<()>,
 }
@@ -606,6 +608,7 @@ struct Conn<'a> {
     /// Ask and Upload share one TLS session, so an Upload that never passed
     /// an accepted Ask has nothing vouching for it.
     contacts_ok: bool,
+    user_approved: bool,
     /// Set when an accepted Ask expects an Upload on this connection, and
     /// cleared when the next request's first byte arrives.
     awaiting_upload: bool,
@@ -628,6 +631,8 @@ impl Server {
             live: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             uploads: AtomicUsize::new(0),
+            consent_prompt: Mutex::new(()),
+            approver: crate::approval::request,
             links: Mutex::new(()),
         }
     }
@@ -838,6 +843,7 @@ impl Server {
             id,
             host: host.to_string(),
             contacts_ok: false,
+            user_approved: false,
             awaiting_upload: false,
         };
         loop {
@@ -1150,6 +1156,7 @@ impl Conn<'_> {
     /// same three keys, and what was asked for is logged: that line separates
     /// "the sender never uploaded" from "the upload failed on our side".
     fn ask(&mut self, io: &mut Io, req: &Request, body: &[u8]) -> io::Result<Flow> {
+        self.user_approved = false;
         write_debug(body, "receive_ask_request.plist");
         let ask = match safeplist::parse(body) {
             Ok(Value::Dictionary(d)) => d,
@@ -1227,6 +1234,19 @@ impl Conn<'_> {
             }
             info!("ask accepted: {}", outcome.why());
             self.contacts_ok = true;
+        }
+        if crate::approval::required(
+            &self
+                .settings()
+                .visibility_path
+                .with_file_name("receive-mode"),
+        ) {
+            let Ok(_prompt) = self.server.consent_prompt.try_lock() else {
+                return self.reject(io, req, 503, "another receive request is pending");
+            };
+            if !(self.server.approver)(&ask) {
+                return self.reject(io, req, 403, "receive request declined or timed out");
+            }
         }
         // A `links` transfer is Ask-only: with SUPPORTS_URL advertised, iOS
         // puts the URL in Items and sends no /Upload, so accepting the Ask IS
@@ -1316,12 +1336,23 @@ impl Conn<'_> {
         // A links Ask is the whole transfer; every other kind is followed by
         // an Upload on this connection.
         if !types.iter().any(|t| t == "links") {
+            self.user_approved = true;
             self.awaiting_upload = true;
         }
         Ok(flow)
     }
 
     fn upload(&mut self, io: &mut Io, req: &Request) -> io::Result<Flow> {
+        let approved = std::mem::take(&mut self.user_approved);
+        if crate::approval::required(
+            &self
+                .settings()
+                .visibility_path
+                .with_file_name("receive-mode"),
+        ) && !approved
+        {
+            return self.reject(io, req, 403, "upload requires an accepted receive request");
+        }
         // The Upload itself carries no validation record to judge.
         if self.visibility() == Visibility::Contacts && !self.contacts_ok {
             return self.reject(io, req, 403, "contacts-only upload has no accepted Ask");

@@ -111,7 +111,7 @@ version_ge() {
 # Hooks are enough for a core that is already installed to run, and
 # core_supported decides where it is offered: omdrop-awdl, and omdrop-owl with
 # its hooks. The check is one file test. OMDROP_HOOKS moves it for tests.
-CORE_MIN=0.1.17
+CORE_MIN=0.1.18
 CORE_TOO_OLD=
 CORE_NO_HOOKS=
 core_version() {

@@ -93,6 +93,8 @@ Panel {
   property string deviceName: ""
   property string downloadDir: ""
   property string blockedReason: ""
+  property string receiveMode: ""
+
   // Who may send: "everyone" or "contacts" (the saved `omdrop visibility`),
   // and how many people the Contacts Only allow-list holds.
   property string audience: "everyone"
@@ -947,9 +949,24 @@ Panel {
     onExited: { root.doctorText = ""; root.refreshStatus() }
   }
 
+  Process {
+    id: receiveModeProc
+    stderr: StdioCollector { id: receiveModeError }
+    onExited: function(code) {
+      if (code !== 0) root.lastError = receiveModeError.text.trim() || "Could not save receive mode"
+      root.refreshStatus()
+    }
+  }
+  function setReceiveMode(mode) {
+    if (receiveModeProc.running) return
+    receiveModeProc.command = [root.cli, "receive-mode", mode]
+    receiveModeProc.running = true
+  }
+
   function applyStatus(text) {
     try {
       var s = JSON.parse(text)
+      if (!receiveModeProc.running) receiveMode = s.receive_mode || ""
       installed = true
       receiving = !!s.receiving
       visibility = (s.visible === null || s.visible === undefined) ? -1 : (s.visible ? 1 : 0)
@@ -1220,6 +1237,25 @@ Panel {
               root.windowPicking = false
               root.rescheduleWindow()
             }
+          }
+        }
+
+        PanelSeparator { visible: root.receiveMode !== ""; foreground: root.foreground }
+        Row {
+          visible: root.receiveMode !== ""
+          width: parent.width
+          spacing: Style.space(18)
+          AudienceTab {
+            glyph: ""
+            label: "ASK FIRST"
+            selected: root.receiveMode === "ask"
+            onChosen: root.setReceiveMode("ask")
+          }
+          AudienceTab {
+            glyph: ""
+            label: "AUTO-ACCEPT"
+            selected: root.receiveMode === "auto"
+            onChosen: root.setReceiveMode("auto")
           }
         }
 
