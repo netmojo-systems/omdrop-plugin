@@ -9,6 +9,7 @@
 //! mDNS itself. Runs as the invoking user, never root: it needs no privilege,
 //! and received files belong to the user without a chown.
 
+mod approval;
 mod args;
 mod config;
 mod log;

@@ -2661,3 +2661,51 @@ fn a_packaged_setup_leaves_the_path_link_alone() {
         target.join("bin/omdrop")
     );
 }
+
+#[test]
+fn receive_mode_is_saved_atomically_and_reported_without_restarting() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let native = f.root.join("native");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_omdrop"), native.join("omdrop")).unwrap();
+    write_exec(&native.join("omdrop-receiver"), "#!/bin/sh\nexit 0\n");
+    std::fs::remove_file(&f.omdrop).unwrap();
+    std::os::unix::fs::symlink(native.join("omdrop"), &f.omdrop).unwrap();
+    let native_env = [("OMDROP_IMPLEMENTATION", "")];
+    let (out, _) = f.run(&["receive-mode"], &native_env);
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"auto\n");
+    let (out, ev) = f.run(&["receive-mode", "ask"], &native_env);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ask\n");
+    let path = f.root.join("home/.config/omdrop/receive-mode");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "ask\n");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!ev.contains("restart"));
+    let (out, _) = f.run(&["status", "--json"], &native_env);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["receive_mode"], "ask");
+    let (out, _) = f.run(&["receive-mode", "invalid"], &native_env);
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "ask\n");
+    let (out, _) = f.run(&["receive-mode", "auto"], &native_env);
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"auto\n");
+}
+
+#[test]
+fn receive_mode_cannot_offer_confirmation_with_the_python_fallback() {
+    let f = Fixture::new();
+    let (out, _) = f.run(&["receive-mode", "ask"], &[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Rust receiver"));
+    assert!(!f.root.join("home/.config/omdrop/receive-mode").exists());
+}

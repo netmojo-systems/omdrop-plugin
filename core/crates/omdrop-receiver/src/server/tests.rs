@@ -101,6 +101,14 @@ impl Fixture {
 }
 
 fn start(contacts_only: bool, tweak: impl FnOnce(&mut Settings)) -> Fixture {
+    start_with_approver(contacts_only, tweak, crate::approval::request)
+}
+
+fn start_with_approver(
+    contacts_only: bool,
+    tweak: impl FnOnce(&mut Settings),
+    approver: fn(&Dictionary) -> bool,
+) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("out")).unwrap();
     let visibility_path = root.path().join("visibility");
@@ -142,7 +150,9 @@ fn start(contacts_only: bool, tweak: impl FnOnce(&mut Settings)) -> Fixture {
     let apple = FakeApple {
         sender_der: chain[0].as_ref().to_vec(),
     };
-    let server = Arc::new(Server::with_apple(settings, config, Box::new(apple)));
+    let mut server = Server::with_apple(settings, config, Box::new(apple));
+    server.approver = approver;
+    let server = Arc::new(server);
     let listener = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).unwrap();
     let port = listener.local_addr().unwrap().port();
     let s = Arc::clone(&server);
@@ -1375,4 +1385,115 @@ fn a_sender_that_leaves_mid_ask_gets_no_answer() {
     }
     let mut c = connect(&fx, false);
     assert_eq!(post(&mut c, "/Ask", &ask_body(None)).0, 200);
+}
+
+fn approval_fixture(allow: bool) -> Fixture {
+    start_with_approver(
+        false,
+        |s| {
+            std::fs::write(s.visibility_path.with_file_name("receive-mode"), "ask\n").unwrap();
+        },
+        if allow { |_| true } else { |_| false },
+    )
+}
+
+#[test]
+fn receive_approval_accepts_one_transfer_on_its_tls_connection() {
+    let fx = approval_fixture(true);
+    let mut accepted = connect(&fx, false);
+    assert_eq!(post(&mut accepted, "/Ask", &ask_body(None)).0, 200);
+    let mut stranger = connect(&fx, false);
+    assert_eq!(upload(&mut stranger, &dvzip(&[("bypass.txt", b"no")])), 403);
+    assert!(fx.files().is_empty());
+    assert_eq!(
+        upload(&mut accepted, &dvzip(&[("accepted.txt", b"yes")])),
+        200
+    );
+    assert_eq!(
+        std::fs::read(fx.dest().join("accepted.txt")).unwrap(),
+        b"yes"
+    );
+}
+
+#[test]
+fn receive_approval_declines_files_and_links_before_any_disk_write() {
+    let fx = approval_fixture(false);
+    assert_eq!(
+        post(&mut connect(&fx, false), "/Ask", &ask_body(None)).0,
+        403
+    );
+    assert_eq!(
+        post(
+            &mut connect(&fx, false),
+            "/Ask",
+            &links_ask(&["https://example.com/"])
+        )
+        .0,
+        403
+    );
+    assert_eq!(
+        upload(&mut connect(&fx, false), &dvzip(&[("bypass.txt", b"no")])),
+        403
+    );
+    assert!(fx.files().is_empty());
+}
+
+#[test]
+fn an_accepted_link_does_not_authorise_a_file_upload() {
+    let fx = approval_fixture(true);
+    let mut c = connect(&fx, false);
+    assert_eq!(
+        post(&mut c, "/Ask", &links_ask(&["https://example.com/"])).0,
+        200
+    );
+    assert_eq!(upload(&mut c, &dvzip(&[("bypass.txt", b"no")])), 403);
+    assert!(!fx.dest().join("bypass.txt").exists());
+}
+
+#[test]
+fn concurrent_receive_requests_are_refused_without_queuing_prompts() {
+    let fx = approval_fixture(true);
+    let _held = fx.server.consent_prompt.lock().unwrap();
+    assert_eq!(
+        post(&mut connect(&fx, false), "/Ask", &ask_body(None)).0,
+        503
+    );
+    assert!(fx.files().is_empty());
+}
+
+#[test]
+fn receive_mode_changes_apply_to_the_running_receiver() {
+    let fx = approval_fixture(false);
+    let path = fx
+        .server
+        .settings
+        .visibility_path
+        .with_file_name("receive-mode");
+    std::fs::write(&path, "auto\n").unwrap();
+    assert_eq!(
+        upload(&mut connect(&fx, false), &dvzip(&[("auto.txt", b"yes")])),
+        200
+    );
+    std::fs::write(&path, "ask\n").unwrap();
+    assert_eq!(
+        upload(&mut connect(&fx, false), &dvzip(&[("bypass.txt", b"no")])),
+        403
+    );
+    assert!(!fx.dest().join("bypass.txt").exists());
+}
+
+#[test]
+fn contacts_only_refuses_unknown_senders_before_asking_for_consent() {
+    let fx = start_with_approver(
+        true,
+        |s| {
+            std::fs::write(s.visibility_path.with_file_name("receive-mode"), "ask\n").unwrap();
+        },
+        |_| panic!("unknown sender must not trigger a consent prompt"),
+    );
+    assert_eq!(
+        post(&mut connect(&fx, true), "/Ask", &ask_body(None)).0,
+        403
+    );
+    assert!(fx.files().is_empty());
 }

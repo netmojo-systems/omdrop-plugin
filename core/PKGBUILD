@@ -11,7 +11,7 @@
 # --frozen, the omarchy-pkgs house pattern for Rust.
 
 pkgname=omdrop-core
-pkgver=0.1.12
+pkgver=0.1.13
 pkgrel=1
 pkgdesc="Omdrop core: send and receive with nearby Apple devices over AirDrop (CLI, receiver, sender, identity, root helper)"
 arch=('aarch64' 'x86_64')
@@ -27,7 +27,8 @@ makedepends=('cargo')
 # dbus: the BlueZ and portal mocks. python: the command's tests for the
 # OMDROP_IMPLEMENTATION=python fallback, which runs the plugin's identity.py.
 checkdepends=('dbus' 'python')
-optdepends=('bluez: wake a nearby device over Bluetooth before sending or asking its name'
+optdepends=('libnotify: receive confirmation notifications (ask mode)'
+            'bluez: wake a nearby device over Bluetooth before sending or asking its name'
             '1password-cli: keep the Apple identity in 1Password'
             'ufw: the narrow firewall rule for the receiver'
             'wl-clipboard: copy a received link'

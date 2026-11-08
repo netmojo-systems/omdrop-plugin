@@ -111,7 +111,7 @@ version_ge() {
 # core_supported decides where it is offered, and that is only where it has
 # been tested: omdrop-awdl so far. The check is one file test. OMDROP_HOOKS
 # moves it for tests.
-CORE_MIN=0.1.11
+CORE_MIN=0.1.13
 CORE_TOO_OLD=
 CORE_NO_HOOKS=
 core_version() {
