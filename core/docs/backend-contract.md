@@ -185,6 +185,7 @@ plugin's `omdrop doctor` (omdrop-plugin PR #25, `docs/radio-backend.md`).
 |`contract`|string|The omdrop-awdl helper contract version the backend follows, compared by the plugin with `vercmp` (PR #25).|
 |`hooks`|integer, required|This contract's version. Core runs only a backend that says `1`.|
 |`hardware`|boolean, required|`false` when this machine has no radio the backend can drive.|
+|`module`|string, optional|omdrop-awdl only: `kernel` when the running kernel's own driver supplies AWDL (its DKMS build stands aside, so the package brings only userspace), `dkms` when AWDL needs the package's build, `unknown` when that cannot be read. Absent from omdrop-awdl before it was added, and treated as `unknown`.|
 |`missing`|array of `{"id","say"}`|Blockers, most fundamental first. `say` is one sentence for the person at the laptop. `driver`, `library` and `service` are reserved for the plugin.|
 
 Core relays the hook's JSON verbatim (after it parses as an object with a
@@ -196,7 +197,9 @@ the first `missing` sentence, or with a generic one.
 `omdrop doctor` and `omdrop install-driver` treat backend `awdl` as the
 Broadcom driver package that `install-driver` builds and updates. They add
 their own `driver` item when that package is older than the plugin's pin
-(`docs/radio-backend.md` in the plugin, "omdrop-awdl's hooks").
+(`docs/radio-backend.md` in the plugin, "omdrop-awdl's hooks"). With
+`module` `kernel`, that item and `install-driver` describe the update as
+AirDrop's helpers rather than the Wi-Fi driver, as no driver is built.
 
 ### `up`
 

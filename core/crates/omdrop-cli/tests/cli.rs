@@ -2131,6 +2131,41 @@ fn awdl_with_an_outdated_driver_offers_install_driver_which_builds_it() {
 }
 
 #[test]
+fn awdl_on_a_native_kernel_calls_the_update_helpers_not_a_driver() {
+    let r = Radio::new();
+    let mut hooks = awdl_hooks(serde_json::json!([]));
+    hooks["module"] = "kernel".into();
+    r.helper(&backend_helper(Some(hooks)));
+    with_driver(&r, Some("0.10.4-1"));
+    assert_eq!(
+        r.doctor()["missing"][0],
+        serde_json::json!({"id": "driver", "say": "AirDrop's helpers (omdrop-awdl 0.10.4-1) are older than the 0.10.5 this version of Omdrop needs. This kernel's own Wi-Fi driver does AirDrop, so updating them builds no driver. Update them with: omdrop install-driver"}),
+    );
+    let out = r.run(&["install-driver"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert!(
+        stdout.starts_with("Opening a terminal to install AirDrop's helpers.\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("patched"), "{stdout}");
+
+    // A DKMS kernel, or a backend too old to say, keeps the driver wording.
+    for module in [Some("dkms"), Some("unknown"), None] {
+        let mut hooks = awdl_hooks(serde_json::json!([]));
+        if let Some(m) = module {
+            hooks["module"] = m.into();
+        }
+        r.helper(&backend_helper(Some(hooks)));
+        let say = r.doctor()["missing"][0]["say"].to_string();
+        assert!(
+            say.contains("The Wi-Fi driver is older"),
+            "{module:?}: {say}"
+        );
+    }
+}
+
+#[test]
 fn awdl_with_a_current_driver_has_nothing_to_install() {
     let mut r = Radio::new();
     r.helper(&backend_helper(Some(awdl_hooks(serde_json::json!([])))));
