@@ -930,10 +930,17 @@ pub fn cmd_install_driver() -> i32 {
         repo_has_driver,
         ufw_active(),
     );
-    // On a kernel whose own driver does AWDL, the package's DKMS build stands
-    // aside and what installs is its userspace: say so, not "patched driver".
-    // The intro goes into the launcher inside single quotes: no apostrophes.
-    let (intro, what) = if awdl_native() {
+    // Say what the script installs. Without a driver update it is only the
+    // receiver's packages (and the firewall rule). On a kernel whose own
+    // driver does AWDL, the package's DKMS build stands aside and what
+    // installs is its userspace: say so, not "patched driver". The intro goes
+    // into the launcher inside single quotes: no apostrophes.
+    let (intro, what) = if !driver_needed {
+        (
+            "Omdrop needs a few packages for its receiver, which requires administrative privilege to install. You will be prompted for your password.",
+            "what the receiver needs",
+        )
+    } else if awdl_native() {
         (
             "Omdrop needs a newer omdrop-awdl for its AirDrop helpers. The Wi-Fi driver in this kernel does AirDrop, so no driver is built. Installing requires administrative privilege. You will be prompted for your password.",
             "AirDrop's helpers",
