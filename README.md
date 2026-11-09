@@ -105,7 +105,7 @@ Auto-Accept preserves the existing default. Ask First displays a desktop notific
 
 On Omarchy, Ask First uses `omarchy-notification-send` and its native action buttons, which remain visible under Do Not Disturb.
 
-Closing an Omarchy notification without choosing a button leaves the transfer unapproved until the 30-second deadline. Each button replies to a fresh private, one-use socket under `$XDG_RUNTIME_DIR/omdrop/receive-requests`; stale buttons cannot approve a later transfer.
+Closing an Omarchy notification without choosing a button declines the transfer immediately, allowing a short 500 ms grace period for an action command already launched by a button. Each button replies to a fresh private, one-use socket under `$XDG_RUNTIME_DIR/omdrop/receive-requests`; stale buttons cannot approve a later transfer.
 
 Other desktops use `notify-send` from `libnotify` and need a notification daemon supporting actions.
 

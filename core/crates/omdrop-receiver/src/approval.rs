@@ -1,6 +1,8 @@
 //! Bounded desktop consent. Peer text is never evaluated as a command.
+use futures_lite::{StreamExt, future};
 use omdrop_proto::{archive::is_unsafe_char, receive_answer};
 use plist::{Dictionary, Value};
+use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -121,6 +123,51 @@ enum Backend {
     },
 }
 
+const ACTION_REPLY_GRACE: Duration = Duration::from_millis(500);
+
+/// Subscribe before displaying the toast, so closing it immediately cannot
+/// race subscription setup. Only the notification daemon's signals count.
+struct ClosedSignals {
+    _connection: zbus::blocking::Connection,
+    stream: zbus::proxy::SignalStream<'static>,
+    early: VecDeque<u32>,
+}
+impl ClosedSignals {
+    fn new(connection: zbus::blocking::Connection) -> zbus::Result<Self> {
+        let proxy = zbus::blocking::Proxy::new(
+            &connection,
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+        )?;
+        let stream = future::block_on(proxy.inner().receive_signal("NotificationClosed"))?;
+        Ok(Self {
+            _connection: connection,
+            stream,
+            early: VecDeque::new(),
+        })
+    }
+    fn closed(&mut self, id: Option<u32>) -> bool {
+        // Bound unrelated desktop traffic and retain early signals while the
+        // notification helper is still printing its id.
+        for _ in 0..64 {
+            match future::block_on(future::poll_once(self.stream.next())) {
+                Some(Some(message)) => {
+                    if let Ok((id, _reason)) = message.body().deserialize::<(u32, u32)>() {
+                        if self.early.len() == 64 {
+                            self.early.pop_front();
+                        }
+                        self.early.push_back(id);
+                    }
+                }
+                Some(None) => return true, // lost daemon: refuse, never accept
+                None => break,
+            }
+        }
+        id.is_some_and(|id| self.early.contains(&id))
+    }
+}
+
 pub fn request(ask: &Dictionary, cancelled: &dyn Fn() -> bool) -> bool {
     let backend = if let Some(program) = which("omarchy-notification-send") {
         let Some(answer_command) = std::env::current_exe()
@@ -138,13 +185,28 @@ pub fn request(ask: &Dictionary, cancelled: &dyn Fn() -> bool) -> bool {
             program: PathBuf::from("notify-send"),
         }
     };
-    prompt(
-        &backend,
-        &description(ask),
-        Duration::from_secs(30),
-        cancelled,
-        &receive_answer::directory(),
-    )
+    if matches!(backend, Backend::Omarchy { .. }) {
+        let Ok(mut closed) = zbus::blocking::Connection::session().and_then(ClosedSignals::new)
+        else {
+            return false;
+        };
+        prompt_watching(
+            &backend,
+            &description(ask),
+            Duration::from_secs(30),
+            cancelled,
+            &receive_answer::directory(),
+            &mut |id| closed.closed(id),
+        )
+    } else {
+        prompt(
+            &backend,
+            &description(ask),
+            Duration::from_secs(30),
+            cancelled,
+            &receive_answer::directory(),
+        )
+    }
 }
 
 struct Reply {
@@ -205,6 +267,24 @@ fn prompt(
     timeout: Duration,
     cancelled: &dyn Fn() -> bool,
     directory: &Path,
+) -> bool {
+    prompt_watching(
+        backend,
+        description,
+        timeout,
+        cancelled,
+        directory,
+        &mut |_| false,
+    )
+}
+
+fn prompt_watching(
+    backend: &Backend,
+    description: &str,
+    timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
+    directory: &Path,
+    closed: &mut dyn FnMut(Option<u32>) -> bool,
 ) -> bool {
     if cancelled() {
         return false;
@@ -275,6 +355,7 @@ fn prompt(
         && unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0;
     let deadline = Instant::now() + timeout;
     let mut output = Vec::new();
+    let mut closed_deadline = None;
     let accepted = loop {
         if !nonblocking
             || cancelled()
@@ -285,6 +366,19 @@ fn prompt(
         }
         if let Some(answer) = reply.as_ref().and_then(Reply::answer) {
             break answer;
+        }
+        let id = String::from_utf8_lossy(&output)
+            .lines()
+            .next()
+            .and_then(|id| id.parse().ok());
+        if native && closed(id) && closed_deadline.is_none() {
+            // Omarchy also closes the toast when launching an action command.
+            // Give that in-flight one-use reply a short grace period; closing
+            // without a button never becomes an implicit acceptance.
+            closed_deadline = Some(Instant::now() + ACTION_REPLY_GRACE);
+        }
+        if closed_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break false;
         }
         match child.try_wait() {
             Ok(Some(status)) if !status.success() => break false,
@@ -443,6 +537,146 @@ mod tests {
             assert!(before.elapsed() < Duration::from_secs(2));
         }
     }
+    #[test]
+    fn closing_without_a_button_declines_promptly_and_revokes_the_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify");
+        helper(&path, "printf 'not-an-id\\n'");
+        let backend = Backend::Omarchy {
+            program: path,
+            answer_command: PathBuf::from("/installed/omdrop"),
+        };
+        let requests = dir.path().join("requests");
+        let before = Instant::now();
+        assert!(!prompt_watching(
+            &backend,
+            "test",
+            Duration::from_secs(30),
+            &|| false,
+            &requests,
+            &mut |_| true
+        ));
+        assert!(before.elapsed() < Duration::from_secs(2));
+        assert_eq!(std::fs::read_dir(&requests).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_accept_action_can_finish_after_the_toast_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify");
+        helper(&path, "printf 'not-an-id\\n'");
+        let backend = Backend::Omarchy {
+            program: path,
+            answer_command: PathBuf::from("/installed/omdrop"),
+        };
+        let requests = dir.path().join("requests");
+        std::thread::scope(|scope| {
+            let request = scope.spawn(|| {
+                prompt_watching(
+                    &backend,
+                    "test",
+                    Duration::from_secs(30),
+                    &|| false,
+                    &requests,
+                    &mut |_| true,
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let token = loop {
+                if let Ok(entries) = std::fs::read_dir(&requests)
+                    && let Some(entry) = entries.flatten().next()
+                {
+                    break entry
+                        .path()
+                        .file_stem()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            std::thread::sleep(Duration::from_millis(100));
+            receive_answer::send(&requests, &token, "accept").unwrap();
+            assert!(request.join().unwrap());
+        });
+        assert_eq!(std::fs::read_dir(&requests).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn close_signals_are_scoped_to_the_notification_daemon_and_request_id() {
+        use std::io::BufRead;
+        struct Bus(std::process::Child);
+        impl Drop for Bus {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut bus = Bus(Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap());
+        let mut address = String::new();
+        std::io::BufReader::new(bus.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+        let daemon = zbus::blocking::connection::Builder::address(address.trim())
+            .unwrap()
+            .name("org.freedesktop.Notifications")
+            .unwrap()
+            .build()
+            .unwrap();
+        let listener = zbus::blocking::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut watcher = ClosedSignals::new(listener).unwrap();
+        // A different sender cannot forge a closure of the active request.
+        let other = zbus::blocking::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .unwrap();
+        other
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "NotificationClosed",
+                &(42u32, 2u32),
+            )
+            .unwrap();
+        daemon
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "NotificationClosed",
+                &(7u32, 2u32),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!watcher.closed(Some(42)));
+        daemon
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "NotificationClosed",
+                &(42u32, 2u32),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !watcher.closed(None) && !watcher.early.contains(&42) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(watcher.closed(Some(42)));
+    }
+
     #[test]
     fn native_timeout_and_helper_failure_remove_the_pending_socket() {
         let dir = tempfile::tempdir().unwrap();

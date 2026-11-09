@@ -19,6 +19,8 @@ libc.workspace = true
 plist.workspace = true
 rustls.workspace = true
 toml_edit.workspace = true
+zbus.workspace = true
+futures-lite.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
