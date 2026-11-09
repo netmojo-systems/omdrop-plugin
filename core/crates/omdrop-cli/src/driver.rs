@@ -518,19 +518,37 @@ pub fn driver_current() -> bool {
     installed_pkg(DRIVER_PKG).is_some_and(|v| vercmp(&v, DRIVER_VERSION).is_ge())
 }
 
+/// Whether omdrop-awdl says the running kernel's own brcmfmac supplies
+/// AWDL (its probe's `module` is `kernel`). Its DKMS build stands aside for
+/// such a kernel, so the package brings only userspace. Never inferred here
+/// from module paths or kernel versions: a backend that does not say is not.
+fn awdl_native() -> bool {
+    awdl_backend() && probe_field("module") == "kernel"
+}
+
 /// With omdrop-awdl's hooks installed: a driver older than the one this
 /// release pins, as the `driver` item, whose button runs install-driver.
-/// The hooks' own probe cannot tell, as it is the installed package's.
+/// The hooks' own probe cannot tell, as it is the installed package's. On a
+/// kernel whose own driver does AWDL, the update is the package's helpers,
+/// and saying the Wi-Fi driver is old would send someone after a module
+/// that is not in use.
 fn driver_outdated() -> Option<(String, String)> {
-    (!driver_current()).then(|| {
-        (
-            "driver".to_string(),
-            format!(
-                "The Wi-Fi driver is older than the {DRIVER_VERSION} this version of Omdrop needs (installed: {}). Update it with: omdrop install-driver",
-                or_none(&installed_pkg(DRIVER_PKG).unwrap_or_default())
-            ),
+    if driver_current() {
+        return None;
+    }
+    let installed = installed_pkg(DRIVER_PKG).unwrap_or_default();
+    let say = if awdl_native() {
+        format!(
+            "AirDrop's helpers (omdrop-awdl {}) are older than the {DRIVER_VERSION} this version of Omdrop needs. This kernel's own Wi-Fi driver does AirDrop, so updating them builds no driver. Update them with: omdrop install-driver",
+            or_none(&installed)
         )
-    })
+    } else {
+        format!(
+            "The Wi-Fi driver is older than the {DRIVER_VERSION} this version of Omdrop needs (installed: {}). Update it with: omdrop install-driver",
+            or_none(&installed)
+        )
+    };
+    Some(("driver".to_string(), say))
 }
 
 const CORE_PKG: &str = "omdrop-core";
@@ -912,16 +930,36 @@ pub fn cmd_install_driver() -> i32 {
         repo_has_driver,
         ufw_active(),
     );
-    const INTRO: &str = "Omdrop requires a patched wifi driver, which requires administrative privilege to install. You will be prompted for your password.";
+    // Say what the script installs. Without a driver update it is only the
+    // receiver's packages (and the firewall rule). On a kernel whose own
+    // driver does AWDL, the package's DKMS build stands aside and what
+    // installs is its userspace: say so, not "patched driver". The intro goes
+    // into the launcher inside single quotes: no apostrophes.
+    let (intro, what) = if !driver_needed {
+        (
+            "Omdrop needs a few packages for its receiver, which requires administrative privilege to install. You will be prompted for your password.",
+            "what the receiver needs",
+        )
+    } else if awdl_native() {
+        (
+            "Omdrop needs a newer omdrop-awdl for its AirDrop helpers. The Wi-Fi driver in this kernel does AirDrop, so no driver is built. Installing requires administrative privilege. You will be prompted for your password.",
+            "AirDrop's helpers",
+        )
+    } else {
+        (
+            "Omdrop requires a patched wifi driver, which requires administrative privilege to install. You will be prompted for your password.",
+            "the driver",
+        )
+    };
     if !have(LAUNCHER) {
-        outln!("{INTRO}");
+        outln!("{intro}");
         outln!();
-        outln!("Install the driver with:");
+        outln!("Install {what} with:");
         outln!("\n{build}\n");
         return 0;
     }
-    outln!("Opening a terminal to install the driver.");
-    launch_install(&build, INTRO)
+    outln!("Opening a terminal to install {what}.");
+    launch_install(&build, intro)
 }
 
 /// The driver and the receiver's packages are current: only the firewall
