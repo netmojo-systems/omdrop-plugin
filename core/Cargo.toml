@@ -31,6 +31,7 @@ omdrop-send = { path = "crates/omdrop-send" }
 omdrop-adv = { path = "crates/omdrop-adv" }
 
 base64 = "0.22"
+futures-lite = "2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hex = "0.4"
 httparse = "1"
