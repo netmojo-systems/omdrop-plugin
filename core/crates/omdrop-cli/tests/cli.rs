@@ -2709,3 +2709,33 @@ fn receive_mode_cannot_offer_confirmation_with_the_python_fallback() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("Rust receiver"));
     assert!(!f.root.join("home/.config/omdrop/receive-mode").exists());
 }
+
+#[test]
+fn receive_answer_only_replies_to_a_live_private_request() {
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+    let f = Fixture::new();
+    let directory = f.root.join("run/omdrop/receive-requests");
+    omdrop_proto::receive_answer::private_directory(&directory, true).unwrap();
+    let token = "0123456789abcdef0123456789abcdef";
+    let path = omdrop_proto::receive_answer::socket_path(&directory, token).unwrap();
+    let socket = UnixDatagram::bind(&path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let (out, _) = f.run(&["receive-answer", token, "accept"], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut bytes = [0; 16];
+    let n = socket.recv(&mut bytes).unwrap();
+    assert_eq!(&bytes[..n], b"accept");
+    std::fs::remove_file(&path).unwrap();
+    let (out, _) = f.run(&["receive-answer", token, "accept"], &[]);
+    assert!(!out.status.success());
+    assert!(!path.exists());
+    let (out, _) = f.run(&["receive-answer", "../../invalid", "accept"], &[]);
+    assert!(!out.status.success());
+}

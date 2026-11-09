@@ -171,6 +171,7 @@ fn main() {
         "dir" => status::cmd_dir(&s),
         "sound" => status::cmd_sound(&s),
         "limit" => status::cmd_limit(&s),
+        "receive-answer" => status::cmd_receive_answer(&s),
         "receive-mode" => status::cmd_receive_mode(&s),
         "visibility" | "vis" | "viz" => status::cmd_visibility(&s),
         "senders" => status::cmd_senders(&s),

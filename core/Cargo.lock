@@ -643,6 +643,7 @@ version = "0.1.13"
 dependencies = [
  "libc",
  "omdrop-identity",
+ "omdrop-proto",
  "plist",
  "serde",
  "serde_json",

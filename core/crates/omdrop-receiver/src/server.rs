@@ -214,7 +214,7 @@ pub struct Server {
     next_id: AtomicU64,
     uploads: AtomicUsize,
     consent_prompt: Mutex<()>,
-    approver: fn(&Dictionary) -> bool,
+    approver: fn(&Dictionary, &dyn Fn() -> bool) -> bool,
     /// Held by a links Ask from its budget check through its last write.
     links: Mutex<()>,
 }
@@ -548,6 +548,40 @@ fn capture_peer_cert(dir: &Path, chain: &[CertificateDer<'static>]) -> io::Resul
 enum Flow {
     Keep,
     Close,
+}
+
+/// Inspect closure without consuming TLS bytes or changing socket flags.
+fn peer_gone(socket: &TcpStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let mut events = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: events describes one valid fd, with no wait or pointer retention.
+    let ready = unsafe { libc::poll(&mut events, 1, 0) };
+    if ready > 0
+        && events.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    {
+        return true;
+    }
+    let mut byte = [0u8; 1];
+    // SAFETY: byte is writable for one byte; MSG_PEEK never consumes input.
+    let read = unsafe {
+        libc::recv(
+            fd,
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    read == 0
+        || (read < 0
+            && !matches!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ))
 }
 
 struct Conn<'a> {
@@ -1167,16 +1201,28 @@ impl Conn<'_> {
             info!("ask accepted: {}", outcome.why());
             self.contacts_ok = true;
         }
-        if crate::approval::required(
+        let needs_approval = crate::approval::required(
             &self
                 .settings()
                 .visibility_path
                 .with_file_name("receive-mode"),
-        ) {
+        );
+        if needs_approval {
+            if types.iter().any(|t| t == "links") && types.iter().any(|t| t == "files") {
+                return self.reject(
+                    io,
+                    req,
+                    400,
+                    "mixed file and link requests are not supported in Ask First mode",
+                );
+            }
             let Ok(_prompt) = self.server.consent_prompt.try_lock() else {
                 return self.reject(io, req, 503, "another receive request is pending");
             };
-            if !(self.server.approver)(&ask) {
+            // One bounded interactive request must not be evicted as an idle
+            // peer while its user is deciding. Other requests remain evictable.
+            self.server.set_waiting(self.id, false);
+            if !(self.server.approver)(&ask, &|| peer_gone(&io.get_ref().sock.inner)) {
                 return self.reject(io, req, 403, "receive request declined or timed out");
             }
         }
@@ -1268,7 +1314,7 @@ impl Conn<'_> {
         // A links Ask is the whole transfer; every other kind is followed by
         // an Upload on this connection.
         if !types.iter().any(|t| t == "links") {
-            self.user_approved = true;
+            self.user_approved = needs_approval;
             self.awaiting_upload = true;
         }
         Ok(flow)

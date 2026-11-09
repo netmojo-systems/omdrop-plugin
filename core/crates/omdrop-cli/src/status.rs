@@ -718,6 +718,21 @@ pub fn cmd_receive_mode(args: &[String]) -> i32 {
     0
 }
 
+/// Called only by a desktop action. A late reply cannot recreate a request.
+pub fn cmd_receive_answer(args: &[String]) -> i32 {
+    if args.len() != 2 {
+        die("usage: omdrop receive-answer TOKEN accept|decline");
+    }
+    if let Err(e) = omdrop_proto::receive_answer::send(
+        &omdrop_proto::receive_answer::directory(),
+        &args[0],
+        &args[1],
+    ) {
+        die(format!("receive request is no longer available: {e}"));
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

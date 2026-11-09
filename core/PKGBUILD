@@ -12,7 +12,7 @@
 
 pkgname=omdrop-core
 pkgver=0.1.13
-pkgrel=1
+pkgrel=2
 pkgdesc="Omdrop core: send and receive with nearby Apple devices over AirDrop (CLI, receiver, sender, identity, root helper)"
 arch=('aarch64' 'x86_64')
 url="https://github.com/netmojo-systems/omdrop-plugin"
