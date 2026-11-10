@@ -114,7 +114,7 @@ as it does a helper that doesn't answer:
 - `omdrop install-driver` builds the pinned driver when the installed one is
   older, as well as the receiver's packages and the firewall rule. It refuses
   with the probe's `hardware` sentence when `hardware` is false.
-- When the probe's `module` is `kernel` (omdrop-awdl after 0.10.5), the
+- When the probe's `module` is `kernel` (omdrop-awdl 0.10.6 and later), the
   running kernel's own brcmfmac does AWDL and the package's DKMS build stands
   aside, so the `driver` item and `install-driver` call the update AirDrop's
   helpers, not the Wi-Fi driver. It is still required: the pin carries
