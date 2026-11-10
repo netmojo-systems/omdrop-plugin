@@ -101,6 +101,14 @@ impl Fixture {
 }
 
 fn start(contacts_only: bool, tweak: impl FnOnce(&mut Settings)) -> Fixture {
+    start_with_approver(contacts_only, tweak, crate::approval::request)
+}
+
+fn start_with_approver(
+    contacts_only: bool,
+    tweak: impl FnOnce(&mut Settings),
+    approver: fn(&Dictionary, &dyn Fn() -> bool) -> bool,
+) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("out")).unwrap();
     let visibility_path = root.path().join("visibility");
@@ -142,7 +150,9 @@ fn start(contacts_only: bool, tweak: impl FnOnce(&mut Settings)) -> Fixture {
     let apple = FakeApple {
         sender_der: chain[0].as_ref().to_vec(),
     };
-    let server = Arc::new(Server::with_apple(settings, config, Box::new(apple)));
+    let mut server = Server::with_apple(settings, config, Box::new(apple));
+    server.approver = approver;
+    let server = Arc::new(server);
     let listener = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).unwrap();
     let port = listener.local_addr().unwrap().port();
     let s = Arc::clone(&server);
@@ -1375,4 +1385,244 @@ fn a_sender_that_leaves_mid_ask_gets_no_answer() {
     }
     let mut c = connect(&fx, false);
     assert_eq!(post(&mut c, "/Ask", &ask_body(None)).0, 200);
+}
+
+fn approval_fixture(allow: bool) -> Fixture {
+    start_with_approver(
+        false,
+        |s| {
+            std::fs::write(s.visibility_path.with_file_name("receive-mode"), "ask\n").unwrap();
+        },
+        if allow { |_, _| true } else { |_, _| false },
+    )
+}
+
+#[test]
+fn receive_approval_accepts_one_transfer_on_its_tls_connection() {
+    let fx = approval_fixture(true);
+    let mut accepted = connect(&fx, false);
+    assert_eq!(post(&mut accepted, "/Ask", &ask_body(None)).0, 200);
+    let mut stranger = connect(&fx, false);
+    assert_eq!(upload(&mut stranger, &dvzip(&[("bypass.txt", b"no")])), 403);
+    assert!(fx.files().is_empty());
+    assert_eq!(
+        upload(&mut accepted, &dvzip(&[("accepted.txt", b"yes")])),
+        200
+    );
+    assert_eq!(
+        std::fs::read(fx.dest().join("accepted.txt")).unwrap(),
+        b"yes"
+    );
+}
+
+#[test]
+fn receive_approval_declines_files_and_links_before_any_disk_write() {
+    let fx = approval_fixture(false);
+    assert_eq!(
+        post(&mut connect(&fx, false), "/Ask", &ask_body(None)).0,
+        403
+    );
+    assert_eq!(
+        post(
+            &mut connect(&fx, false),
+            "/Ask",
+            &links_ask(&["https://example.com/"])
+        )
+        .0,
+        403
+    );
+    assert_eq!(
+        upload(&mut connect(&fx, false), &dvzip(&[("bypass.txt", b"no")])),
+        403
+    );
+    assert!(fx.files().is_empty());
+}
+
+#[test]
+fn an_accepted_link_does_not_authorise_a_file_upload() {
+    let fx = approval_fixture(true);
+    let mut c = connect(&fx, false);
+    assert_eq!(
+        post(&mut c, "/Ask", &links_ask(&["https://example.com/"])).0,
+        200
+    );
+    assert_eq!(upload(&mut c, &dvzip(&[("bypass.txt", b"no")])), 403);
+    assert!(!fx.dest().join("bypass.txt").exists());
+}
+
+#[test]
+fn concurrent_receive_requests_are_refused_without_queuing_prompts() {
+    let fx = approval_fixture(true);
+    let _held = fx.server.consent_prompt.lock().unwrap();
+    assert_eq!(
+        post(&mut connect(&fx, false), "/Ask", &ask_body(None)).0,
+        503
+    );
+    assert!(fx.files().is_empty());
+}
+
+#[test]
+fn receive_mode_changes_apply_to_the_running_receiver() {
+    let fx = approval_fixture(false);
+    let path = fx
+        .server
+        .settings
+        .visibility_path
+        .with_file_name("receive-mode");
+    std::fs::write(&path, "auto\n").unwrap();
+    assert_eq!(
+        upload(&mut connect(&fx, false), &dvzip(&[("auto.txt", b"yes")])),
+        200
+    );
+    std::fs::write(&path, "ask\n").unwrap();
+    assert_eq!(
+        upload(&mut connect(&fx, false), &dvzip(&[("bypass.txt", b"no")])),
+        403
+    );
+    assert!(!fx.dest().join("bypass.txt").exists());
+}
+
+#[test]
+fn contacts_only_refuses_unknown_senders_before_asking_for_consent() {
+    let fx = start_with_approver(
+        true,
+        |s| {
+            std::fs::write(s.visibility_path.with_file_name("receive-mode"), "ask\n").unwrap();
+        },
+        |_, _| panic!("unknown sender must not trigger a consent prompt"),
+    );
+    assert_eq!(
+        post(&mut connect(&fx, true), "/Ask", &ask_body(None)).0,
+        403
+    );
+    assert!(fx.files().is_empty());
+}
+
+#[test]
+fn an_auto_accepted_ask_does_not_authorise_an_upload_after_switching_to_ask_first() {
+    let fx = approval_fixture(false);
+    let path = fx
+        .server
+        .settings
+        .visibility_path
+        .with_file_name("receive-mode");
+    std::fs::write(&path, "auto\n").unwrap();
+    let mut c = connect(&fx, false);
+    assert_eq!(post(&mut c, "/Ask", &ask_body(None)).0, 200);
+    std::fs::write(&path, "ask\n").unwrap();
+    assert_eq!(upload(&mut c, &dvzip(&[("bypass.txt", b"no")])), 403);
+    assert!(fx.files().is_empty());
+}
+
+#[test]
+fn mixed_files_and_links_are_refused_before_prompting_or_storing() {
+    let fx = start_with_approver(
+        false,
+        |s| {
+            std::fs::write(s.visibility_path.with_file_name("receive-mode"), "ask\n").unwrap();
+        },
+        |_, _| panic!("mixed transfer must be rejected before prompting"),
+    );
+    let mut ask = safeplist::parse_dict(&links_ask(&["https://unseen.example/x"])).unwrap();
+    ask.get_mut("TransferType")
+        .unwrap()
+        .as_dictionary_mut()
+        .unwrap()
+        .insert("files".to_string(), Value::Integer(1.into()));
+    ask.insert(
+        "Files".into(),
+        Value::Array(vec![Value::Dictionary(Dictionary::from_iter([(
+            "FileName",
+            Value::String("holiday.jpg".into()),
+        )]))]),
+    );
+    assert_eq!(
+        post(&mut connect(&fx, false), "/Ask", &plist_bytes(ask)).0,
+        400
+    );
+    assert!(fx.files().is_empty());
+}
+
+#[test]
+fn a_prompting_connection_survives_two_silent_dials_at_the_connection_cap() {
+    static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn approve(_: &Dictionary, cancelled: &dyn Fn() -> bool) -> bool {
+        ENTERED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1500));
+        !cancelled()
+    }
+    let fx = start_with_approver(
+        false,
+        |s| {
+            s.limits.max_connections = 2;
+            std::fs::write(s.visibility_path.with_file_name("receive-mode"), "ask\n").unwrap();
+        },
+        approve,
+    );
+    std::thread::scope(|scope| {
+        let prompting = scope.spawn(|| {
+            let mut c = connect(&fx, false);
+            assert_eq!(post(&mut c, "/Ask", &ask_body(None)).0, 200);
+            assert_eq!(upload(&mut c, &dvzip(&[("accepted.txt", b"yes")])), 200);
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ENTERED.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _silent_a = TcpStream::connect((Ipv6Addr::LOCALHOST, fx.port)).unwrap();
+        let _silent_b = TcpStream::connect((Ipv6Addr::LOCALHOST, fx.port)).unwrap();
+        prompting.join().unwrap();
+    });
+    assert_eq!(
+        std::fs::read(fx.dest().join("accepted.txt")).unwrap(),
+        b"yes"
+    );
+}
+
+#[test]
+fn a_sender_that_cancels_its_prompt_releases_the_next_request() {
+    static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn approve(_: &Dictionary, cancelled: &dyn Fn() -> bool) -> bool {
+        if ENTERED.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !cancelled() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        CANCELLED.store(cancelled(), Ordering::SeqCst);
+        false
+    }
+    let fx = start_with_approver(
+        false,
+        |s| {
+            std::fs::write(s.visibility_path.with_file_name("receive-mode"), "ask\n").unwrap();
+        },
+        approve,
+    );
+    let mut c = connect(&fx, false);
+    request(&mut c, "/Ask", &[], &ask_body(None), true);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !ENTERED.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    c.get_ref().sock.shutdown(Shutdown::Both).unwrap();
+    while !CANCELLED.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The first thread clears its prompt guard as it returns its refusal.
+    let retry = loop {
+        let status = post(&mut connect(&fx, false), "/Ask", &ask_body(None)).0;
+        if status != 503 {
+            break status;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(retry, 200);
+    assert!(fx.files().is_empty());
 }

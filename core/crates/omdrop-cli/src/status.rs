@@ -177,6 +177,8 @@ struct StatusJson {
     /// Who may send, with the allow-list size so the panel can warn that an
     /// empty list refuses everybody.
     visibility: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receive_mode: Option<String>,
     senders: usize,
 }
 
@@ -218,6 +220,7 @@ pub fn cmd_status(args: &[String]) -> i32 {
             rx_proven: radio.as_ref().is_some_and(|r| r.rx_proven),
             sound: sound_on(),
             visibility: visibility().to_string(),
+            receive_mode: ctx().receiver.as_ref().map(|_| receive_mode().to_string()),
             senders: sender_count(),
         };
         outln!("{}", py_json(&st));
@@ -675,6 +678,58 @@ pub fn cmd_limit(args: &[String]) -> i32 {
         format!("the receiver refused {new}%, so the limit is still {old}%."),
     );
     outln!("A transfer may use up to {new}% of currently free download-disk space.");
+    0
+}
+
+/// Match the receiver's fail-closed policy for unreadable or invalid settings.
+fn receive_mode() -> &'static str {
+    match std::fs::read_to_string(ctx().contacts_dir.join("receive-mode")) {
+        Ok(value) if value.trim() == "auto" => "auto",
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "auto",
+        _ => "ask",
+    }
+}
+
+/// Persist atomically; a running receiver reads the setting on every request.
+pub fn cmd_receive_mode(args: &[String]) -> i32 {
+    if args.is_empty() {
+        outln!("{}", receive_mode());
+        return 0;
+    }
+    if args.len() != 1 || !matches!(args[0].as_str(), "auto" | "ask") {
+        die("usage: omdrop receive-mode [auto|ask]");
+    }
+    if ctx().receiver.is_none() {
+        die("receive confirmation requires omdrop-core's Rust receiver");
+    }
+    if let Err(e) = std::fs::create_dir_all(&ctx().contacts_dir) {
+        die(format!("could not create settings directory: {e}"));
+    }
+    let path = ctx().contacts_dir.join("receive-mode");
+    if let Err(e) = crate::util::atomic_write(
+        &path,
+        ".receive-mode.",
+        format!("{}\n", args[0]).as_bytes(),
+        0o600,
+    ) {
+        die(format!("could not save receive mode: {e}"));
+    }
+    outln!("{}", args[0]);
+    0
+}
+
+/// Called only by a desktop action. A late reply cannot recreate a request.
+pub fn cmd_receive_answer(args: &[String]) -> i32 {
+    if args.len() != 2 {
+        die("usage: omdrop receive-answer TOKEN accept|decline");
+    }
+    if let Err(e) = omdrop_proto::receive_answer::send(
+        &omdrop_proto::receive_answer::directory(),
+        &args[0],
+        &args[1],
+    ) {
+        die(format!("receive request is no longer available: {e}"));
+    }
     0
 }
 

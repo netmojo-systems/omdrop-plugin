@@ -92,6 +92,29 @@ Received files are saved, copied to the clipboard, and announced in a notificati
 
 A shared link arrives as a `.url` or `.webloc` file. Clicking its notification, or double-clicking it in Files, opens it in your browser. Only `http` and `https` links open; a link to anything else, such as `file://` or `smb://`, is refused with a notification, because it was chosen by whoever sent it.
 
+### Confirm incoming transfers (omdrop-core)
+
+With omdrop-core 0.1.13 or newer, choose **Ask First** or **Auto-Accept** in the panel, or run:
+
+```sh
+omdrop receive-mode ask
+omdrop receive-mode auto
+```
+
+Auto-Accept preserves the existing default. Ask First displays a desktop notification with **Accept** and **Decline** before saving files or links. Dismissing the notification, not answering within 30 seconds, or a notification failure declines the request. Only an accepted Ask on the same TLS connection authorises its subsequent file upload; direct uploads are refused in Ask First mode. Contacts Only checks still apply before the prompt.
+
+On Omarchy, Ask First uses `omarchy-notification-send` and its native action buttons, which remain visible under Do Not Disturb.
+
+Closing an Omarchy notification without choosing a button declines the transfer immediately, allowing a short 500 ms grace period for an action command already launched by a button. Each button replies to a fresh private, one-use socket under `$XDG_RUNTIME_DIR/omdrop/receive-requests`; stale buttons cannot approve a later transfer.
+
+Other desktops use `notify-send` from `libnotify` and need a notification daemon supporting actions.
+
+The choice is saved and applies immediately: switching from Auto-Accept to Ask First also rejects uploads for an earlier automatically accepted Ask on the same connection. Concurrent requests are declined while a prompt is pending.
+
+The one prompting connection is protected from idle-connection eviction. Cancelling the sending connection closes its prompt and releases the slot early.
+
+Ask First refuses mixed file-and-link requests; link prompts show destination hosts, and file prompts show item counts and the reported total size (or size unknown). The Python fallback does not support this setting and does not show the panel control.
+
 ## Send files
 
 Expand **Send to peers**, or press `n` in the panel. If Omdrop is off, this turns it on, because the receive window is what hears nearby devices.

@@ -206,6 +206,13 @@ class PanelRefreshTests(HandoffHarness):
         self.assertEqual(run.stdout.strip(), str(OMDROP))
         self.assertEqual(self.refreshes(), ["-q netmojo.omdrop refresh"])
 
+    def test_receive_mode_changes_refresh_the_panel(self):
+        for mode in ("ask", "auto"):
+            with self.subTest(mode=mode):
+                self.ipc_log.unlink(missing_ok=True)
+                self.assert_handed_off(self.run_omdrop("receive-mode", mode))
+                self.assertEqual(self.refreshes(), ["-q netmojo.omdrop refresh"])
+
     def test_status_does_not_refresh(self):
         # The panel's refresh runs `status`: refreshing from it would loop.
         self.assert_handed_off(self.run_omdrop("status", "--json"))

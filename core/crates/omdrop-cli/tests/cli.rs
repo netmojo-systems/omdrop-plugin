@@ -2704,3 +2704,81 @@ fn a_packaged_setup_leaves_the_path_link_alone() {
         target.join("bin/omdrop")
     );
 }
+
+#[test]
+fn receive_mode_is_saved_atomically_and_reported_without_restarting() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let native = f.root.join("native");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_omdrop"), native.join("omdrop")).unwrap();
+    write_exec(&native.join("omdrop-receiver"), "#!/bin/sh\nexit 0\n");
+    std::fs::remove_file(&f.omdrop).unwrap();
+    std::os::unix::fs::symlink(native.join("omdrop"), &f.omdrop).unwrap();
+    let native_env = [("OMDROP_IMPLEMENTATION", "")];
+    let (out, _) = f.run(&["receive-mode"], &native_env);
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"auto\n");
+    let (out, ev) = f.run(&["receive-mode", "ask"], &native_env);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ask\n");
+    let path = f.root.join("home/.config/omdrop/receive-mode");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "ask\n");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!ev.contains("restart"));
+    let (out, _) = f.run(&["status", "--json"], &native_env);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["receive_mode"], "ask");
+    let (out, _) = f.run(&["receive-mode", "invalid"], &native_env);
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "ask\n");
+    let (out, _) = f.run(&["receive-mode", "auto"], &native_env);
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"auto\n");
+}
+
+#[test]
+fn receive_mode_cannot_offer_confirmation_with_the_python_fallback() {
+    let f = Fixture::new();
+    let (out, _) = f.run(&["receive-mode", "ask"], &[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Rust receiver"));
+    assert!(!f.root.join("home/.config/omdrop/receive-mode").exists());
+}
+
+#[test]
+fn receive_answer_only_replies_to_a_live_private_request() {
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+    let f = Fixture::new();
+    let directory = f.root.join("run/omdrop/receive-requests");
+    omdrop_proto::receive_answer::private_directory(&directory, true).unwrap();
+    let token = "0123456789abcdef0123456789abcdef";
+    let path = omdrop_proto::receive_answer::socket_path(&directory, token).unwrap();
+    let socket = UnixDatagram::bind(&path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let (out, _) = f.run(&["receive-answer", token, "accept"], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut bytes = [0; 16];
+    let n = socket.recv(&mut bytes).unwrap();
+    assert_eq!(&bytes[..n], b"accept");
+    std::fs::remove_file(&path).unwrap();
+    let (out, _) = f.run(&["receive-answer", token, "accept"], &[]);
+    assert!(!out.status.success());
+    assert!(!path.exists());
+    let (out, _) = f.run(&["receive-answer", "../../invalid", "accept"], &[]);
+    assert!(!out.status.success());
+}

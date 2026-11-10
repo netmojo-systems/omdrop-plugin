@@ -72,6 +72,7 @@ const USAGE: &str = r#"omdrop -- send and receive files with nearby Apple device
   sound [on|off]    the panel's radar sound effects
   limit [PERCENT]   show the maximum transfer size, or set it to 1-90% of
                     currently free space (default 30%)
+  receive-mode [MODE] show, or set to "auto" (default) or "ask".
   visibility [MODE]  show, or set to "everyone" (default) or "contacts".
                      In contacts mode only known senders may send to you.
   senders [add|remove ID | list]
@@ -170,6 +171,8 @@ fn main() {
         "dir" => status::cmd_dir(&s),
         "sound" => status::cmd_sound(&s),
         "limit" => status::cmd_limit(&s),
+        "receive-answer" => status::cmd_receive_answer(&s),
+        "receive-mode" => status::cmd_receive_mode(&s),
         "visibility" | "vis" | "viz" => status::cmd_visibility(&s),
         "senders" => status::cmd_senders(&s),
         "identity" => identity::cmd_identity(&s),

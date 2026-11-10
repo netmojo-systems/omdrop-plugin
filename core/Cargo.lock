@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "omdrop-adv"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "libc",
  "omdrop-identity",
@@ -639,10 +639,11 @@ dependencies = [
 
 [[package]]
 name = "omdrop-cli"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "libc",
  "omdrop-identity",
+ "omdrop-proto",
  "plist",
  "serde",
  "serde_json",
@@ -653,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "omdrop-identity"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "base64",
  "hex",
@@ -670,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "omdrop-proto"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "flate2",
  "hex",
@@ -688,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "omdrop-radio"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "libc",
  "serde_json",
@@ -697,9 +698,10 @@ dependencies = [
 
 [[package]]
 name = "omdrop-receiver"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "flate2",
+ "futures-lite",
  "libc",
  "omdrop-identity",
  "omdrop-proto",
@@ -707,11 +709,12 @@ dependencies = [
  "rustls",
  "tempfile",
  "toml_edit 0.23.10+spec-1.0.0",
+ "zbus",
 ]
 
 [[package]]
 name = "omdrop-send"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "httparse",
  "image",
