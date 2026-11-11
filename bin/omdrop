@@ -111,7 +111,7 @@ version_ge() {
 # core_supported decides where it is offered, and that is only where it has
 # been tested: omdrop-awdl so far. The check is one file test. OMDROP_HOOKS
 # moves it for tests.
-CORE_MIN=0.1.13
+CORE_MIN=0.1.14
 CORE_TOO_OLD=
 CORE_NO_HOOKS=
 core_version() {
@@ -191,7 +191,7 @@ esac
 # A fallback that silently substitutes for the real value is the same class of
 # defect as a status line reporting a state that was never entered, so this one
 # says when it is guessing, and says when the two disagree.
-VERSION_FALLBACK=0.18.9
+VERSION_FALLBACK=0.18.10
 omdrop_version() {
   local dir manifest version= real
   real=$(readlink -f "$0" 2>/dev/null) || real="$0"
@@ -1275,12 +1275,12 @@ DRIVER_PKG=brcmfmac-awdl-dkms
 # checkout below is detached at this SHA and the build only runs if it
 # succeeded. Bump it, in the same commit, whenever the plugin needs a newer
 # driver: the full 40 characters, because a short SHA is not a pin.
-DRIVER_COMMIT=437798ac247da5b99786c6318aa05e8051f73f63
+DRIVER_COMMIT=9b59420299203805b213f7f65fbcba1d7690177f
 # The package version that commit builds, with its pkgrel. install-driver
 # rebuilds any older installed driver: a fix inside the helper, such as 0.5.1's,
 # changes nothing a feature probe could see, and a packaging fix such as
 # 0.6.3-2's (the kernel headers became a dependency) changes only the pkgrel.
-DRIVER_VERSION=0.10.6
+DRIVER_VERSION=0.10.7
 # The first driver whose sender, send-to-peer and advertiser follow
 # docs/identity-contract.md. Moving the identity into 1Password needs it.
 DRIVER_IDENTITY_VERSION=0.7.0
@@ -1350,7 +1350,7 @@ else
   git clone --quiet $DRIVER_REPO '$src'
 fi
 echo 'Building driver commit $DRIVER_COMMIT'
-git -C '$src' checkout --detach 437798ac247da5b99786c6318aa05e8051f73f63 && makepkg --dir '$src' -si"
+git -C '$src' checkout --detach 9b59420299203805b213f7f65fbcba1d7690177f && makepkg --dir '$src' -si"
     fi
   fi
 
