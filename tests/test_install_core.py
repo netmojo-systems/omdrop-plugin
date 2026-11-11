@@ -82,6 +82,9 @@ exit 0
                         XDG_CACHE_HOME=str(tmp / ".cache"),
                         OMDROP_SYSFS=str(tmp / "sys"),
                         OMDROP_CORE="/nonexistent",
+                        # No backend hooks unless a test installs them: the
+                        # default, /usr/lib/omdrop/radio, is this machine's.
+                        OMDROP_HOOKS=str(tmp / "no-hooks"),
                         OMDROP_DISCOVERABLE=str(self.bin / "omdrop-discoverable"))
 
     def command(self, name, body):
@@ -99,6 +102,15 @@ exit 0
         # Broadcom Wi-Fi, but no Apple Silicon device tree.
         self.devicetree.unlink()
 
+    def owl_with_hooks(self):
+        # omdrop-owl 0.4.0 and later: core's hooks beside its helper.
+        self.backend("owl")
+        radio = Path(self.tmp.name) / "radio"
+        radio.mkdir(exist_ok=True)
+        (radio / "probe").write_text("#!/bin/sh\nexit 0\n")
+        (radio / "probe").chmod(0o755)
+        self.env["OMDROP_HOOKS"] = str(radio)
+
     def omdrop(self, *args):
         return subprocess.run([OMDROP, *args], env=self.env, capture_output=True, text=True)
 
@@ -113,10 +125,13 @@ exit 0
 
     # --- doctor ---------------------------------------------------------------
 
-    def test_core_is_offered_on_broadcom_and_never_blocks(self):
-        for backend in (None, "awdl"):
+    def test_core_is_offered_where_the_backend_runs_it_and_never_blocks(self):
+        for backend in (None, "awdl", "owl"):
             with self.subTest(backend=backend):
-                self.backend(backend)
+                if backend == "owl":
+                    self.owl_with_hooks()
+                else:
+                    self.backend(backend)
                 doctor = self.doctor()
                 self.assertEqual([o["id"] for o in doctor["offers"]], ["core"], doctor)
                 self.assertIn("omdrop install-core", doctor["offers"][0]["say"])
@@ -128,8 +143,12 @@ exit 0
         self.assertTrue(doctor["ready"], doctor)
         self.assertTrue(doctor["offers"], doctor)
 
-    def test_core_is_not_offered_where_it_is_untested(self):
+    def test_core_is_not_offered_where_the_backend_cannot_run_it(self):
+        # omdrop-owl before 0.4.0 has no hooks, so core would get no commands.
         self.backend("owl")
+        self.assertEqual(self.doctor()["offers"], [])
+        self.owl_with_hooks()
+        self.backend("owl", hardware=False)
         self.assertEqual(self.doctor()["offers"], [])
         self.backend("awdl", hardware=False)
         self.assertEqual(self.doctor()["offers"], [])
@@ -252,6 +271,13 @@ exit 0
         cache = Path(self.env["XDG_CACHE_HOME"]) / "omdrop" / "omdrop-core"
         self.assertIn(f"BUILDDIR={cache}/build PKGDEST={cache} ", builds[0])
         self.assertNotIn("pacman -S", out)
+
+    def test_it_builds_core_beside_omdrop_owls_hooks(self):
+        self.owl_with_hooks()
+        self.no_broadcom()
+        code, out = self.install()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(re.findall(r"^.*\bmakepkg\b.*$", out, re.M)), 1, out)
 
     def test_a_repository_with_this_version_or_newer_is_used_instead(self):
         for repo in (core_wanted(), "99.0.0-1"):

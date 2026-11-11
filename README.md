@@ -46,7 +46,7 @@ The package puts the plugin in `/usr/share/omdrop`, and `setup` links it into `~
 
 ### omdrop-core
 
-Omdrop runs as omdrop-core, its Rust version, wherever the radio backend supports it, and as its bash and Python programs on other backends. Today omdrop-core supports omdrop-awdl and omdrop-bcm4360. omdrop-owl ships omdrop-core's hooks since 0.4.0, so an omdrop-core that is already installed runs on it too, but `setup` and `doctor` don't offer omdrop-core there until it has been tested on that hardware ([#73](https://github.com/netmojo-systems/omdrop-plugin/issues/73)).
+Omdrop runs as omdrop-core, its Rust version, wherever the radio backend supports it, and as its bash and Python programs on other backends. Today omdrop-core supports omdrop-awdl, omdrop-bcm4360, and omdrop-owl from 0.4.0, which ships omdrop-core's hooks. `setup` and `doctor` offer omdrop-core with omdrop-awdl and omdrop-owl ([#73](https://github.com/netmojo-systems/omdrop-plugin/issues/73)); with an omdrop-owl older than 0.4.0, update it first.
 
 With a supported backend, `omdrop setup` and `omdrop doctor` offer omdrop-core. Install it with Omdrop off:
 

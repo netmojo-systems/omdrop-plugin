@@ -107,10 +107,9 @@ version_ge() {
 # Core also needs a radio backend that ships its hooks (core's
 # docs/backend-contract.md): omdrop-awdl from 0.10.0 does, and so does
 # omdrop-owl from 0.4.0. Without them this script and the Python programs run.
-# Hooks are enough for a core that is already installed to run, but
-# core_supported decides where it is offered, and that is only where it has
-# been tested: omdrop-awdl so far. The check is one file test. OMDROP_HOOKS
-# moves it for tests.
+# Hooks are enough for a core that is already installed to run, and
+# core_supported decides where it is offered: omdrop-awdl, and omdrop-owl with
+# its hooks. The check is one file test. OMDROP_HOOKS moves it for tests.
 CORE_MIN=0.1.14
 CORE_TOO_OLD=
 CORE_NO_HOOKS=
@@ -1435,12 +1434,21 @@ core_wanted() {
   printf '%s-%s' "$ver" "$rel"
 }
 
-# Offered where it has been tested live: Apple's Broadcom Wi-Fi, with
-# omdrop-awdl's helper or its hooks, on hardware that backend says it can
-# drive. Other backends follow once core has run on them (issue #73).
+# Offered where the backend runs core: Apple's Broadcom Wi-Fi, with
+# omdrop-awdl's helper or its hooks, and omdrop-owl from 0.4.0, which ships
+# core's hooks (Owly, issue #73). Only on hardware the backend says it can
+# drive. An omdrop-owl without hooks would hand core no commands, so core is
+# not offered beside it.
+core_backend_ok() {
+  case "$(probe_field backend)" in
+    awdl) return 0 ;;
+    owl) [[ -x "$OMDROP_HOOKS/probe" ]] ;;
+    *) return 1 ;;
+  esac
+}
 core_supported() {
   if radio_probe; then
-    [[ "$(probe_field backend)" == awdl && "$(probe_field hardware)" != false ]]
+    core_backend_ok && [[ "$(probe_field hardware)" != false ]]
   else
     apple_broadcom_wifi
   fi
@@ -1516,13 +1524,17 @@ cmd_install_core() {
     || die "This copy of the plugin has no core/ to build omdrop-core from."
   if radio_probe; then
     radio_probe_hung && die "$(radio_probe_hung_say)"
-    [[ "$(probe_field backend)" == awdl ]] \
-      || die "omdrop-core has not been tested with the $(probe_field backend) radio backend yet. Until it has, it is installed only on Apple Broadcom Wi-Fi."
+    if [[ "$(probe_field backend)" == owl ]]; then
+      [[ -x "$OMDROP_HOOKS/probe" ]] \
+        || die "This omdrop-owl has no hooks for omdrop-core, so omdrop-core would get no commands. Update the omdrop-owl package to 0.4.0 or later first."
+    elif [[ "$(probe_field backend)" != awdl ]]; then
+      die "omdrop-core has not been tested with the $(probe_field backend) radio backend yet. Until it has, it is installed only with omdrop-awdl and omdrop-owl."
+    fi
     [[ "$(probe_field hardware)" != false ]] \
       || die "This computer's Wi-Fi is not one the installed radio backend ($(probe_field backend)) can drive, so omdrop-core is not installed here."
   else
     apple_broadcom_wifi \
-      || die "This computer has no Apple Broadcom Wi-Fi. omdrop-core has been tested only there so far, so it is not installed here."
+      || die "This computer has no Apple Broadcom Wi-Fi and no radio backend that runs omdrop-core, so it is not installed here."
   fi
   # Core's package puts nothing on PATH, and a core older than 0.1.3 was
   # /usr/bin/omdrop, which this install removes. Link the plugin's command

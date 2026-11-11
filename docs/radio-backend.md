@@ -16,9 +16,9 @@ plugin finds the backend's helpers in `/usr/lib/omdrop`, on `PATH`, or through
 
 This page describes the interface the bash and Python programs use. Omdrop
 runs omdrop-core (`core/`) instead wherever the radio backend supports it:
-today omdrop-awdl and omdrop-bcm4360. omdrop-owl ships core's hooks since
-0.4.0, so an installed core runs on it, though `setup` and `doctor` don't
-offer core there yet (#73). Core uses the same `omdrop-discoverable` when a
+today omdrop-awdl, omdrop-bcm4360, and omdrop-owl from 0.4.0, which ships
+core's hooks; `setup` and `doctor` offer core with omdrop-awdl and omdrop-owl
+(#73). Core uses the same `omdrop-discoverable` when a
 backend ships nothing else. A backend can instead provide per-operation hooks in
 `/usr/lib/omdrop/radio/`, as described in
 [the backend contract](../core/docs/backend-contract.md); core then drives the
