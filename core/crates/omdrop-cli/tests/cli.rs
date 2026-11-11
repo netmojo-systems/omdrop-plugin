@@ -2103,7 +2103,7 @@ fn awdl_with_an_outdated_driver_offers_install_driver_which_builds_it() {
     assert_eq!(
         doctor["missing"].as_array().unwrap()[..2],
         [
-            serde_json::json!({"id": "driver", "say": "The Wi-Fi driver is older than the 0.10.6 this version of Omdrop needs (installed: 0.9.0-1). Update it with: omdrop install-driver"}),
+            serde_json::json!({"id": "driver", "say": "The Wi-Fi driver is older than the 0.10.7 this version of Omdrop needs (installed: 0.9.0-1). Update it with: omdrop install-driver"}),
             serde_json::json!({"id": "radio", "say": AWDL_RADIO}),
         ],
         "{doctor}"
@@ -2126,7 +2126,7 @@ fn awdl_with_an_outdated_driver_offers_install_driver_which_builds_it() {
     with_driver(&r, None);
     assert_eq!(
         r.doctor()["missing"][0]["say"],
-        "The Wi-Fi driver is older than the 0.10.6 this version of Omdrop needs (installed: none). Update it with: omdrop install-driver"
+        "The Wi-Fi driver is older than the 0.10.7 this version of Omdrop needs (installed: none). Update it with: omdrop install-driver"
     );
 }
 
@@ -2136,10 +2136,10 @@ fn awdl_on_a_native_kernel_calls_the_update_helpers_not_a_driver() {
     let mut hooks = awdl_hooks(serde_json::json!([]));
     hooks["module"] = "kernel".into();
     r.helper(&backend_helper(Some(hooks)));
-    with_driver(&r, Some("0.10.5-1"));
+    with_driver(&r, Some("0.10.6-1"));
     assert_eq!(
         r.doctor()["missing"][0],
-        serde_json::json!({"id": "driver", "say": "AirDrop's helpers (omdrop-awdl 0.10.5-1) are older than the 0.10.6 this version of Omdrop needs. This kernel's own Wi-Fi driver does AirDrop, so updating them builds no driver. Update them with: omdrop install-driver"}),
+        serde_json::json!({"id": "driver", "say": "AirDrop's helpers (omdrop-awdl 0.10.6-1) are older than the 0.10.7 this version of Omdrop needs. This kernel's own Wi-Fi driver does AirDrop, so updating them builds no driver. Update them with: omdrop install-driver"}),
     );
     let out = r.run(&["install-driver"]);
     let stdout = text(&out.stdout);
@@ -2169,7 +2169,7 @@ fn awdl_on_a_native_kernel_calls_the_update_helpers_not_a_driver() {
 fn awdl_with_a_current_driver_has_nothing_to_install() {
     let mut r = Radio::new();
     r.helper(&backend_helper(Some(awdl_hooks(serde_json::json!([])))));
-    with_driver(&r, Some("0.10.6-1"));
+    with_driver(&r, Some("0.10.7-1"));
     assert!(!r.ids().contains(&"driver".to_string()), "{}", r.doctor());
     let out = r.run(&["install-driver"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
@@ -2221,10 +2221,10 @@ fn a_repository_driver_older_than_the_pin_is_not_installed() {
     let r = Radio::new();
     r.helper(&backend_helper(Some(awdl_hooks(serde_json::json!([])))));
     for (offered, from_repo) in [
-        ("0.10.5-1", false),
-        ("0.10.6rc1-1", false),
-        ("0.10.6-1", true),
+        ("0.10.6-1", false),
+        ("0.10.7rc1-1", false),
         ("0.10.7-1", true),
+        ("0.10.8-1", true),
         ("1:0.1.0-1", true),
     ] {
         with_repo_driver(&r, offered);
@@ -2323,7 +2323,7 @@ fn assert_installs_only_the_firewall_rule(r: &Radio) {
 fn a_current_awdl_driver_still_gets_the_firewall_rule_while_ufw_is_active() {
     let r = Radio::new();
     r.helper(&backend_helper(Some(awdl_hooks(serde_json::json!([])))));
-    with_driver(&r, Some("0.10.6-1"));
+    with_driver(&r, Some("0.10.7-1"));
     with_ufw_active(&r);
     assert_installs_only_the_firewall_rule(&r);
 }
@@ -2333,7 +2333,7 @@ fn a_current_driver_without_a_probe_still_gets_the_firewall_rule_while_ufw_is_ac
     let r = Radio::new();
     r.helper(&backend_helper(None));
     on_a_mac(&r);
-    with_driver(&r, Some("0.10.6-1"));
+    with_driver(&r, Some("0.10.7-1"));
     with_ufw_active(&r);
     assert_installs_only_the_firewall_rule(&r);
 }
@@ -2348,7 +2348,7 @@ fn a_current_driver_with_ufw_inactive_has_nothing_to_do() {
         let r = Radio::new();
         r.helper(&backend_helper(probe.clone()));
         on_a_mac(&r);
-        with_driver(&r, Some("0.10.6-1"));
+        with_driver(&r, Some("0.10.7-1"));
         write_exec(&r.f.root.join("bin/ufw"), "#!/bin/sh\nexit 0\n");
         let out = r.run(&["install-driver"]);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
