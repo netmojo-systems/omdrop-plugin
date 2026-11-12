@@ -1454,11 +1454,13 @@ def interface_ipv6(iface):
 
 def arrived_on(local, iface):
     """Whether a connection whose local end is `local` (a getsockname() tuple)
-    arrived on iface: the address is one iface holds now, and a link-local one
-    carries iface's index as its scope, which the kernel sets to the interface
-    it came in on."""
+    arrived on iface: a link-local address iface holds now, scoped to iface's
+    index, which the kernel sets to the interface it came in on. Any other
+    address proves nothing about ingress, since Linux accepts one held by any
+    interface, except loopback, which arrives only on lo."""
     addr = ipaddress.IPv6Address(local[0].split('%')[0])
-    return any(addr == have and (not have.is_link_local or local[3] == index)
+    return any(addr == have
+               and (local[3] == index if have.is_link_local else have.is_loopback)
                for have, index in interface_rows(iface))
 
 

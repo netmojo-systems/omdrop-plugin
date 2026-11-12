@@ -37,16 +37,23 @@ fn if_inet6_rows<'a>(text: &'a str, iface: &'a str) -> impl Iterator<Item = (Ipv
     })
 }
 
-/// Whether a connection whose local end is `local` arrived on `iface`: the
-/// address is one `iface` holds now, and a link-local one carries `iface`'s
-/// index as its scope, which the kernel sets to the interface it came in on.
+/// Whether a connection whose local end is `local` arrived on `iface`: a
+/// link-local address `iface` holds now, scoped to `iface`'s index, which the
+/// kernel sets to the interface it came in on. Any other address proves
+/// nothing about ingress, since Linux accepts one held by any interface,
+/// except loopback, which arrives only on `lo`.
 pub fn arrived_on(local: &SocketAddrV6, iface: &str) -> bool {
     std::fs::read_to_string("/proc/net/if_inet6").is_ok_and(|text| local_is_on(&text, local, iface))
 }
 
 fn local_is_on(text: &str, local: &SocketAddrV6, iface: &str) -> bool {
     if_inet6_rows(text, iface).any(|(addr, index)| {
-        addr == *local.ip() && (!addr.is_unicast_link_local() || local.scope_id() == index)
+        addr == *local.ip()
+            && if addr.is_unicast_link_local() {
+                local.scope_id() == index
+            } else {
+                addr.is_loopback()
+            }
     })
 }
 
@@ -159,7 +166,8 @@ mod tests {
         let text = "00000000000000000000000000000001 01 80 10 80       lo\n\
                     fe80000000000000e09d03fffe6c5823 05 40 20 80    awdl0\n\
                     fe80000000000000aaaaaafffeaaaaaa 0b 40 20 80    wlan0\n\
-                    20010db8000000000000000000000001 0b 40 00 80    wlan0\n";
+                    20010db8000000000000000000000001 0b 40 00 80    wlan0\n\
+                    20010db8000000000000000000000002 05 40 00 80    awdl0\n";
         let on = |addr: &str, scope, iface| {
             local_is_on(
                 text,
@@ -172,6 +180,8 @@ mod tests {
         assert!(!on("fe80::e09d:3ff:fe6c:5823", 11, "awdl0"));
         assert!(!on("fe80::a8aa:aaff:feaa:aaaa", 11, "awdl0"));
         assert!(!on("2001:db8::1", 0, "awdl0"));
+        // A global address awdl0 holds: Linux accepts it from any interface.
+        assert!(!on("2001:db8::2", 0, "awdl0"));
         assert!(!on("::ffff:192.0.2.1", 0, "awdl0"));
         assert!(on("::1", 0, "lo"));
     }
