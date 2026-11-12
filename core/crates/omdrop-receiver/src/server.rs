@@ -88,6 +88,8 @@ pub struct ConnLimits {
     pub head_deadline: Duration,
     /// How long a read waits for any byte before the request is given up.
     pub idle_timeout: Duration,
+    /// An upload's grace before its minimum read rate applies.
+    pub body_grace: Duration,
     pub upload_wait: Duration,
     pub upload_step: Duration,
     pub drain_quiet: Duration,
@@ -101,6 +103,7 @@ impl Default for ConnLimits {
             max_per_peer: MAX_CONNECTIONS_PER_PEER,
             head_deadline: HEAD_DEADLINE,
             idle_timeout: READ_IDLE_TIMEOUT,
+            body_grace: Duration::from_secs_f64(http::INITIAL_READ_SECONDS),
             upload_wait: UPLOAD_WAIT,
             upload_step: UPLOAD_STEP,
             drain_quiet: DRAIN_QUIET,
@@ -111,7 +114,8 @@ impl Default for ConnLimits {
 
 /// A connection's socket. Each read waits at most the idle timeout for
 /// data, or the override while one is set, and while a deadline is set (the
-/// TLS handshake, a request head) no longer than what is left of it.
+/// TLS handshake, a request head, an upload's body rate) no longer than what
+/// is left of it.
 pub struct Sock {
     inner: TcpStream,
     idle: Duration,
@@ -119,6 +123,9 @@ pub struct Sock {
     /// that holds the connection (an upload's [`Patience`]) can set it.
     wait: Arc<AtomicU64>,
     deadline: Option<Instant>,
+    /// The body's rate deadline, as [`BodyDeadline`] stores it; 0 for none.
+    body: Arc<AtomicU64>,
+    epoch: Instant,
     timeout: Option<Duration>,
 }
 
@@ -129,13 +136,47 @@ impl Sock {
             idle,
             wait: Arc::new(AtomicU64::new(0)),
             deadline: None,
+            body: Arc::new(AtomicU64::new(0)),
+            epoch: Instant::now(),
             timeout: None,
+        }
+    }
+
+    /// Where an upload publishes its body deadline to this socket.
+    fn body_deadline(&self) -> BodyDeadline {
+        BodyDeadline {
+            cell: Arc::clone(&self.body),
+            epoch: self.epoch,
         }
     }
 
     /// Override the idle wait (`Some`) or restore it (`None`).
     fn set_wait(&self, wait: Option<Duration>) {
         set_wait(&self.wait, wait);
+    }
+}
+
+/// Sets a [`Sock`]'s body deadline, and clears it when dropped so the next
+/// request on the connection does not inherit it.
+struct BodyDeadline {
+    cell: Arc<AtomicU64>,
+    epoch: Instant,
+}
+
+impl BodyDeadline {
+    fn set(&self, at: Instant) {
+        // Microseconds past the socket's epoch, plus one so 0 still means none.
+        let us = at.saturating_duration_since(self.epoch).as_micros();
+        self.cell.store(
+            u64::try_from(us).unwrap_or(u64::MAX - 1) + 1,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+impl Drop for BodyDeadline {
+    fn drop(&mut self) {
+        self.cell.store(0, Ordering::Relaxed);
     }
 }
 
@@ -152,7 +193,15 @@ impl Read for Sock {
             0 => self.idle,
             ms => Duration::from_millis(ms),
         };
-        let wait = match self.deadline {
+        let body = match self.body.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(self.epoch + Duration::from_micros(us - 1)),
+        };
+        let deadline = match (self.deadline, body) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let wait = match deadline {
             None => base,
             Some(deadline) => {
                 let left = deadline.saturating_duration_since(Instant::now());
@@ -1299,7 +1348,7 @@ impl Conn<'_> {
         {
             http::write_response(io.get_mut(), 100, &[], b"")?;
         }
-        let mut deadline = ReadDeadline::new();
+        let mut deadline = ReadDeadline::with_grace(s.limits.body_grace);
         let limits = ExtractLimits {
             byte_limit: budget.byte_limit,
             max_members: MAX_ARCHIVE_MEMBERS,
@@ -1310,13 +1359,16 @@ impl Conn<'_> {
         let wait_cell = Arc::clone(&io.get_mut().sock.wait);
         let set_upload_wait = |w: Option<Duration>| set_wait(&wait_cell, w);
         let archive_whole = || progress.whole();
-        let mut body =
-            BodyReader::new(io, plan, budget.byte_limit, &mut deadline).with_patience(Patience {
+        let body_deadline = io.get_mut().sock.body_deadline();
+        let publish = |at: Instant| body_deadline.set(at);
+        let mut body = BodyReader::new(io, plan, budget.byte_limit, &mut deadline)
+            .with_patience(Patience {
                 step,
                 limit: s.limits.idle_timeout,
                 set_wait: &set_upload_wait,
                 is_complete: &archive_whole,
-            });
+            })
+            .with_deadline_hook(&publish);
         let result = archive::extract(&mut body, &s.dest, &limits, &PARTIALS, &progress);
         // The Python receiver read the whole body before decoding it, so the
         // sender always got to read its answer. A stream decoded as it arrives

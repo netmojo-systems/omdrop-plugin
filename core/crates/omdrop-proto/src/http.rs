@@ -145,6 +145,7 @@ pub struct Patience<'p> {
 #[derive(Debug)]
 pub struct ReadDeadline {
     started: Instant,
+    grace: Duration,
     transferred: u64,
 }
 
@@ -162,7 +163,16 @@ impl ReadDeadline {
     pub fn started_at(started: Instant) -> Self {
         ReadDeadline {
             started,
+            grace: Duration::from_secs_f64(INITIAL_READ_SECONDS),
             transferred: 0,
+        }
+    }
+
+    /// Starting now, with `grace` in place of [`INITIAL_READ_SECONDS`].
+    pub fn with_grace(grace: Duration) -> Self {
+        ReadDeadline {
+            grace,
+            ..Self::new()
         }
     }
 
@@ -175,13 +185,18 @@ impl ReadDeadline {
         self.started.elapsed()
     }
 
+    /// When the body falls behind the minimum rate, given what it has sent.
+    pub fn limit_at(&self) -> Instant {
+        let earned =
+            Duration::from_secs_f64(self.transferred as f64 / MIN_READ_BYTES_PER_SECOND as f64);
+        self.started + self.grace + earned
+    }
+
     /// Count `size` received bytes; a [`Stall::Rate`] timeout when the body is
     /// behind the minimum rate.
     pub fn note(&mut self, size: usize) -> Result<(), BodyError> {
         self.transferred += size as u64;
-        let allowed =
-            INITIAL_READ_SECONDS + self.transferred as f64 / MIN_READ_BYTES_PER_SECOND as f64;
-        if self.started.elapsed().as_secs_f64() > allowed {
+        if Instant::now() > self.limit_at() {
             return Err(BodyError::Timeout(Stall::Rate));
         }
         Ok(())
@@ -365,6 +380,7 @@ pub struct BodyReader<'a, R: BufRead> {
     length_left: u64,
     chunk: Option<Chunk>,
     patience: Option<Patience<'a>>,
+    publish: Option<&'a dyn Fn(Instant)>,
 }
 
 impl<'a, R: BufRead> BodyReader<'a, R> {
@@ -381,7 +397,16 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
             length_left,
             chunk,
             patience: None,
+            publish: None,
         }
+    }
+
+    /// Hand [`ReadDeadline::limit_at`] to `publish` before every read, so the
+    /// transport can stop at it: a callback here cannot run while TLS is
+    /// still assembling a record from fragments.
+    pub fn with_deadline_hook(mut self, publish: &'a dyn Fn(Instant)) -> Self {
+        self.publish = Some(publish);
+        self
     }
 
     /// Wait at chunk boundaries as [`Patience`] describes. Chunked bodies only.
@@ -423,6 +448,9 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
                     idle += p.step;
                     if (p.is_complete)() {
                         break Err(BodyError::Complete.into_io());
+                    }
+                    if Instant::now() >= self.deadline.limit_at() {
+                        break Err(e);
                     }
                     if idle >= p.limit {
                         break Err(e);
@@ -561,7 +589,19 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
 
 impl<R: BufRead> Read for BodyReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.read_framed(buf).map_err(connection_lost)
+        if let Some(publish) = self.publish {
+            publish(self.deadline.limit_at());
+        }
+        self.read_framed(buf)
+            .map_err(|e| {
+                // The transport times out at the published deadline too.
+                if is_timeout(&e) && Instant::now() >= self.deadline.limit_at() {
+                    BodyError::Timeout(Stall::Rate).into_io()
+                } else {
+                    e
+                }
+            })
+            .map_err(connection_lost)
     }
 }
 
