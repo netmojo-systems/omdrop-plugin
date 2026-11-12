@@ -365,6 +365,25 @@ class StalledHandshakeTests(ReceiverFixture):
         self.assertEqual(status, 200)
 
 
+class IngressTests(ReceiverFixture):
+    def test_a_connection_that_did_not_arrive_on_the_interface_is_closed_before_tls(self):
+        # The socket is dual-stack [::], so IPv4 loopback reaches it as
+        # ::ffff:127.0.0.1, an address lo does not hold in /proc/net/if_inet6.
+        try:
+            other = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        except ConnectionRefusedError:
+            self.skipTest("IPv6-only sockets (net.ipv6.bindv6only=1)")
+        self.addCleanup(other.close)
+        try:
+            self.assertEqual(b"", other.recv(1))
+        except ConnectionResetError:
+            pass
+        self.assertIn("did not arrive on lo", self.log.read_text())
+        status, _ = self.post(self.connection(), "/Discover",
+                              plistlib.dumps({}, fmt=plistlib.FMT_BINARY))
+        self.assertEqual(status, 200)
+
+
 def receiver_seconds(name):
     """One of the receiver's timeout constants, so the test follows its value."""
     return int(re.search(rf"^{name} = (\d+)$", SERVE.read_text(), re.M).group(1))

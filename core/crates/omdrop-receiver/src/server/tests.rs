@@ -126,6 +126,7 @@ fn start(contacts_only: bool, tweak: impl FnOnce(&mut Settings)) -> Fixture {
         known_senders_path,
         min_free_bytes: 0,
         limits: ConnLimits::default(),
+        iface: "lo".into(),
     };
     tweak(&mut settings);
     let receiver = self_signed("receiver");
@@ -718,6 +719,14 @@ fn raw(fx: &Fixture) -> TcpStream {
     // Let the accept loop register it before the next one arrives.
     std::thread::sleep(Duration::from_millis(50));
     sock
+}
+
+#[test]
+fn a_connection_from_another_interface_is_closed_before_tls() {
+    // ::1 is on lo, so to a receiver serving another interface it came in elsewhere.
+    let fx = start(false, |s| s.iface = "omdrop-test0".into());
+    assert!(closed_by_server(&mut raw(&fx), Duration::from_secs(5)));
+    assert!(fx.server.live.lock().unwrap().is_empty());
 }
 
 #[test]

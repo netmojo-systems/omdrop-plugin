@@ -304,6 +304,7 @@ fn run() -> i32 {
         known_senders_path: contacts::known_senders_path(),
         min_free_bytes: server::MIN_FREE_BYTES,
         limits: server::ConnLimits::default(),
+        iface: args.iface.clone(),
     };
     drop(identity);
     let server = Arc::new(Server::new(settings, tls_config));

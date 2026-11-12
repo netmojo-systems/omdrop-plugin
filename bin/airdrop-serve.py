@@ -232,6 +232,18 @@ class ThreadingHTTPServerV6(ThreadingHTTPServer):
         self.live = set()
         super().__init__(*a, **k)
 
+    # The socket is the IPv6 wildcard, so refuse what came in on any other
+    # interface before it reaches TLS.
+    def verify_request(self, request, client_address):
+        try:
+            if arrived_on(request.getsockname(), args.iface):
+                return True
+        except (OSError, ValueError):
+            pass
+        logging.warning('refusing [%s]:%s: it did not arrive on %s',
+                        client_address[0], client_address[1], args.iface)
+        return False
+
     def process_request(self, request, client_address):
         logging.info('connection from [%s]:%s', client_address[0], client_address[1])
         self.live.add(request)
@@ -1423,17 +1435,31 @@ if PEERCERT_DIR:
 
 # ------------------------------------------------------------------- serving
 
-def interface_ipv6(iface):
-    """The first IPv6 address the kernel lists on iface, or None."""
+def interface_rows(iface):
+    """(address, interface index) for each IPv6 address the kernel lists on iface."""
     try:
         with open('/proc/net/if_inet6') as f:
             rows = [line.split() for line in f]
     except OSError:
-        return None
-    for row in rows:
-        if len(row) == 6 and row[5] == iface:
-            return ipaddress.IPv6Address(bytes.fromhex(row[0]))
-    return None
+        return []
+    return [(ipaddress.IPv6Address(bytes.fromhex(row[0])), int(row[1], 16))
+            for row in rows if len(row) == 6 and row[5] == iface]
+
+
+def interface_ipv6(iface):
+    """The first IPv6 address the kernel lists on iface, or None."""
+    rows = interface_rows(iface)
+    return rows[0][0] if rows else None
+
+
+def arrived_on(local, iface):
+    """Whether a connection whose local end is `local` (a getsockname() tuple)
+    arrived on iface: the address is one iface holds now, and a link-local one
+    carries iface's index as its scope, which the kernel sets to the interface
+    it came in on."""
+    addr = ipaddress.IPv6Address(local[0].split('%')[0])
+    return any(addr == have and (not have.is_link_local or local[3] == index)
+               for have, index in interface_rows(iface))
 
 
 # The socket is the IPv6 wildcard, but an interface with no address yet is one
