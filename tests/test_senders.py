@@ -49,8 +49,18 @@ class SendersTests(unittest.TestCase):
         self.senders("add", "16045550100", "friend@example.com")
         self.assertEqual(4, len(self.file.read_text().splitlines()))
         self.senders("remove", "+1 (604) 555-0100", "friend@example.com")
-        self.assertEqual("# Friend@Example.com\nc@d.co\n", self.file.read_text())
+        self.assertEqual("# Friend@Example.com\nc@d.co", self.file.read_text())
         self.assertEqual({contacts.hash_identifier("c@d.co")},
+                         contacts.known_hashes(self.file))
+        self.senders("add", "e@f.co")
+        self.assertEqual("# Friend@Example.com\nc@d.co\ne@f.co\n", self.file.read_text())
+
+    def test_removal_splits_lines_where_the_receiver_does(self):
+        self.file.parent.mkdir()
+        self.file.write_text("a@b.co\u2028keep@b.co\n")
+        self.senders("remove", "a@b.co")
+        self.assertEqual("keep@b.co\n", self.file.read_text())
+        self.assertEqual({contacts.hash_identifier("keep@b.co")},
                          contacts.known_hashes(self.file))
 
     def test_a_failed_write_keeps_the_list(self):

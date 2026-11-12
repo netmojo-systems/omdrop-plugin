@@ -3548,22 +3548,26 @@ senders_edit() {
 import os, sys, tempfile
 from contacts import normalize
 op, path, *ids = sys.argv[1:]
+# Split where contacts.known_hashes() does (str.splitlines, so U+2028 too) and
+# write kept lines back byte for byte, separators included.
 with open(path, "rb") as fh:
-    lines = fh.read().splitlines()
-key = lambda b: normalize(b.decode(errors="replace"))
+    lines = fh.read().decode(errors="surrogateescape").splitlines(keepends=True)
+key = lambda l: normalize(l.encode(errors="surrogateescape").decode(errors="replace"))
 if op == "add":
     have = {key(l) for l in lines}
     for i in ids:
         if normalize(i) not in have:
             have.add(normalize(i))
-            lines.append(i.strip().encode())
+            if lines and lines[-1] == lines[-1].splitlines()[0]:
+                lines[-1] += "\n"
+            lines.append(i.strip() + "\n")
 else:
     drop = {normalize(i) for i in ids} - {None}
     lines = [l for l in lines if key(l) not in drop]
 fd, tmp = tempfile.mkstemp(prefix=".known-senders.", dir=os.path.dirname(path))
 try:
     with os.fdopen(fd, "wb") as fh:
-        fh.write(b"".join(l + b"\n" for l in lines))
+        fh.write("".join(lines).encode(errors="surrogateescape"))
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 except BaseException:
