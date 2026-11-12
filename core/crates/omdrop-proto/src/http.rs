@@ -305,6 +305,16 @@ pub fn body_plan(headers: &Headers, limit: u64) -> Result<BodyPlan, BodyError> {
 /// Read one line of at most `max` bytes (stopping after `\n`), as Python's
 /// `readline(max)`.
 pub fn read_line(r: &mut impl BufRead, max: usize) -> io::Result<Vec<u8>> {
+    read_line_noting(r, max, |_| Ok(()))
+}
+
+/// [`read_line`], passing the size of each piece the reader returns to
+/// `note`, which can end the line early with an error.
+fn read_line_noting(
+    r: &mut impl BufRead,
+    max: usize,
+    mut note: impl FnMut(usize) -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
     let mut line = Vec::new();
     while line.len() < max {
         let available = match r.fill_buf() {
@@ -323,12 +333,14 @@ pub fn read_line(r: &mut impl BufRead, max: usize) -> io::Result<Vec<u8>> {
             Some(i) => {
                 line.extend_from_slice(window.get(..=i).unwrap_or_default());
                 r.consume(i + 1);
+                note(i + 1)?;
                 return Ok(line);
             }
             None => {
                 let n = window.len();
                 line.extend_from_slice(window);
                 r.consume(n);
+                note(n)?;
             }
         }
     }
@@ -384,9 +396,12 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
     }
 
     fn line(&mut self) -> io::Result<Vec<u8>> {
-        let line = read_line(self.r, MAX_CHUNK_LINE_BYTES + 1)?;
-        self.deadline.note(line.len()).map_err(BodyError::into_io)?;
-        Ok(line)
+        // Checked on every read, not once per line: a line trickled a byte at
+        // a time would otherwise outlast the deadline by many idle timeouts.
+        let deadline = &mut *self.deadline;
+        read_line_noting(self.r, MAX_CHUNK_LINE_BYTES + 1, |n| {
+            deadline.note(n).map_err(BodyError::into_io)
+        })
     }
 
     /// Wait for the next chunk-size line's first byte without consuming it,
@@ -984,6 +999,41 @@ mod tests {
             .unwrap(),
             b"hello"
         );
+    }
+
+    #[test]
+    fn a_chunk_line_trickled_past_the_deadline_stops_at_the_next_read() {
+        /// Hands over one byte per read, as a sender sending one TLS record each.
+        struct Trickle<'a>(&'a [u8], usize);
+        impl Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let Some((&b, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                buf[0] = b;
+                self.0 = rest;
+                self.1 += 1;
+                Ok(1)
+            }
+        }
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs_f64(INITIAL_READ_SECONDS + 1.0))
+            .unwrap();
+        let mut deadline = ReadDeadline::started_at(started);
+        let mut trickle = Trickle(
+            b"1;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nx\r\n0\r\n\r\n",
+            0,
+        );
+        let mut r = io::BufReader::with_capacity(1, &mut trickle);
+        let err = BodyReader::new(&mut r, BodyPlan::Chunked, 1 << 20, &mut deadline)
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
+        assert!(matches!(
+            BodyError::classify(err),
+            Ok(BodyError::Timeout(Stall::Rate))
+        ));
+        drop(r);
+        assert_eq!(trickle.1, 1);
     }
 
     #[test]
