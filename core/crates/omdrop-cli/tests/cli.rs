@@ -925,13 +925,17 @@ case "$*" in
     n=0
     while [ -n "$GATE" ] && [ ! -e "$GATE" ] && [ $n -lt 400 ]; do sleep 0.05; n=$((n + 1)); done
     echo '22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770  hume'
+    echo 'lookup-end' >> "$CAPTURE"
     exit 0 ;;
   --list)
+    if [ -n "$TABLE_GATE" ] && [ ! -e "$TABLE_GATE" ]; then echo 'table-empty' >> "$CAPTURE"; exit 1; fi
     echo 'e2:9d:03:6c:58:23   -47 dBm  [fe80::1%awdl0]:8770'
     echo '22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770'
     exit 0 ;;
 esac
-exit 2
+printf 'sent %s\n' "$*" >> "$CAPTURE"
+echo '+0.41s FOUND x at y; asking'
+exit 0
 "#;
 const STUDIO: &str = r#"{"mac": "e2:9d:03:6c:58:23", "rssi": -47, "name": "Studio Mac"}"#;
 const HUME: &str = r#"{"mac": "22:8b:38:31:89:4e", "rssi": -34, "name": "hume"}"#;
@@ -1116,6 +1120,110 @@ fn a_named_listing_while_a_lookup_runs_answers_from_its_names_alone() {
     std::fs::write(&gate, "").unwrap();
     let out = finish_within(first, std::time::Duration::from_secs(10));
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+/// How many times `line` is in the capture past its first `from` bytes.
+fn captured_since(f: &Fixture, from: usize, line: &str) -> usize {
+    std::fs::read_to_string(&f.capture).unwrap()[from..]
+        .lines()
+        .filter(|l| *l == line)
+        .count()
+}
+
+fn wait_for_captured(f: &Fixture, from: usize, line: &str, times: usize) {
+    let start = std::time::Instant::now();
+    while captured_since(f, from, line) < times {
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "{line:?} not captured {times} times:\n{}",
+            std::fs::read_to_string(&f.capture).unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_named_send_while_a_lookup_runs_waits_for_it_then_runs_its_own() {
+    let (f, sender, gate) = peers_fixture();
+    let file = f.root.join("photo.jpg");
+    std::fs::write(&file, "x").unwrap();
+    let env = [
+        ("OMDROP_SENDER", sender.as_str()),
+        ("LINK_LOCAL", "1"),
+        ("GATE", gate.to_str().unwrap()),
+        ("ACTIVE", "active"),
+        ("VISIBLE", "1"),
+    ];
+    let first = running_lookup(&f, &env);
+    let mut send = spawn_with(&f, &["send", "hume", file.to_str().unwrap()], &env);
+    let lines = stdout_lines(&mut send);
+    loop {
+        match lines.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(l) if l == "Waiting for the name lookup already running..." => break,
+            Ok(_) => {}
+            Err(_) => {
+                let out = finish_within(send, std::time::Duration::from_secs(10));
+                panic!("the send never waited: {}", text(&out.stderr));
+            }
+        }
+    }
+    std::fs::write(&gate, "").unwrap();
+    let out = finish_within(first, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let out = finish_within(send, std::time::Duration::from_secs(20));
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}{ev}", text(&out.stderr));
+    // One lookup at a time: the send's own whole pass starts after the first ends.
+    let turns: Vec<&str> = ev
+        .lines()
+        .filter_map(|l| match l {
+            "lookup-end" => Some("end"),
+            l if l.starts_with("lookup ") => Some("start"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(turns, ["start", "end", "start", "end"], "{ev}");
+    assert_eq!(
+        ev.lines().filter(|l| l.starts_with("sent ")).count(),
+        1,
+        "{ev}"
+    );
+}
+
+#[test]
+fn a_follower_shows_a_name_once_the_table_has_its_device_even_after_the_lookup_ended() {
+    let (f, sender, gate) = peers_fixture();
+    let table_gate = f.root.join("table-gate");
+    let env = [
+        ("OMDROP_SENDER", sender.as_str()),
+        ("LINK_LOCAL", "1"),
+        ("GATE", gate.to_str().unwrap()),
+        ("TABLE_GATE", table_gate.to_str().unwrap()),
+    ];
+    let first = running_lookup(&f, &env);
+    let mut follower = spawn_with(&f, &STREAM, &env);
+    let lines = stdout_lines(&mut follower);
+    // The lookup's table and then the follower's were read, and were empty.
+    wait_for_captured(&f, 0, "table-empty", 2);
+    std::fs::write(&gate, "").unwrap();
+    let out = finish_within(first, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    // The follower is still after a row for hume, with the lookup gone.
+    let ended = std::fs::read_to_string(&f.capture).unwrap().len();
+    wait_for_captured(&f, ended, "table-empty", 2);
+    std::fs::write(&table_gate, "").unwrap();
+    let mut got = vec![next_line(&lines), next_line(&lines)];
+    got.sort();
+    let mut want = vec![HUME.to_string(), STUDIO.to_string()];
+    want.sort();
+    assert_eq!(got, want);
+    let out = finish_within(follower, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        lines.recv_timeout(std::time::Duration::from_secs(1)).ok(),
+        None
+    );
+    assert_eq!(lookups(&f), 1);
 }
 
 #[test]

@@ -706,7 +706,9 @@ fn choose_peer(to: &str, payload: &[String]) -> String {
 /// the same name. Every wait is bounded by OMDROP_NAME_WAIT, including a
 /// lookup that closes its output but stays alive; each pass runs in its own
 /// session, so a cancel or the deadline stops its probes and Bluetooth
-/// advertising together (TERM, then KILL two seconds later).
+/// advertising together (TERM, then KILL two seconds later). Each pass takes
+/// the named-lookup turn, waiting out another program's lookup first: only
+/// a whole pass of its own shows a name is unique.
 fn find_by_name(want: &str, shown: &str) -> (String, i32) {
     let c = ctx();
     let start = Instant::now();
@@ -715,6 +717,8 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
     let mut row_of: HashMap<String, String> = HashMap::new();
     let mut said: HashMap<String, ()> = HashMap::new();
     let mut found = false;
+    let mut passes = 0;
+    let mut said_waiting = false;
     let mut note_at = start;
     trap_signals();
     outln!("Looking for \"{shown}\" nearby (up to {}s)...", c.name_wait);
@@ -728,6 +732,19 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
         if Instant::now() >= deadline {
             break;
         }
+        let turn = match crate::names::lookup() {
+            Lookup::Ours(turn) => turn,
+            Lookup::Running(watch) => {
+                if !std::mem::replace(&mut said_waiting, true) {
+                    outln!("Waiting for the name lookup already running...");
+                }
+                while watch.running() && Instant::now() < deadline {
+                    nap_until((Instant::now() + FOLLOW_POLL).min(deadline));
+                }
+                continue;
+            }
+        };
+        passes += 1;
         let mut other = String::new();
         let pass = name_pass(deadline, &mut |line| {
             if let Some(row) = parse_row(line) {
@@ -752,6 +769,7 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
                 other.push('\n');
             }
         });
+        drop(turn);
         let rc = match pass {
             Pass::Done(rc) => rc,
             Pass::TimedOut => {
@@ -794,6 +812,12 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
         nap_until((Instant::now() + Duration::from_secs(3)).min(deadline));
     }
     untrap_signals();
+    if passes == 0 {
+        die(format!(
+            "Another name lookup ran for all {} seconds, so \"{shown}\" was never looked for; nothing was sent. Try again.",
+            c.name_wait
+        ));
+    }
     let listing = order
         .iter()
         .map(|m| row_of[m].clone())
@@ -1037,6 +1061,10 @@ fn print_peers(rc: i32, out: &str, json: bool, names: bool) -> i32 {
 /// How often a follower of another program's lookup looks for news.
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
 
+/// How often a follower reads the table again for a device it has a name
+/// for but no row.
+const TABLE_RETRY: Duration = Duration::from_secs(1);
+
 /// `peers -n` while another program's lookup runs: wait for it, at most
 /// OMDROP_NAME_WAIT, then answer from the table and the names learned.
 fn after_lookup(watch: &Watch, spin: bool) -> (i32, String) {
@@ -1058,7 +1086,8 @@ fn after_lookup(watch: &Watch, spin: bool) -> (i32, String) {
 
 /// `peers -n --json --stream` while another program's lookup runs: the names
 /// learned for the table's devices, then each one that lookup stores, until it
-/// ends or OMDROP_NAME_WAIT passes.
+/// ends or OMDROP_NAME_WAIT passes. A name whose device the table does not
+/// show yet waits for it, past that lookup's end, until the same deadline.
 fn follow_stream(watch: &Watch) -> i32 {
     trap_signals();
     let deadline = Instant::now() + Duration::from_secs(ctx().name_wait);
@@ -1069,51 +1098,58 @@ fn follow_stream(watch: &Watch) -> i32 {
         return rc;
     }
     let mut table: Vec<Row> = listed.lines().filter_map(parse_row).collect();
+    let mut read_at = Instant::now();
     let mut shown: HashMap<String, String> = HashMap::new();
     loop {
         // Looked at before the names are read: a lookup stores its last name
         // before it lets go of the lock.
-        let ended = !watch.running() || Instant::now() >= deadline;
+        let ended = !watch.running();
         let names = crate::names::load();
-        let mut fresh: Vec<(String, String)> = Vec::new();
+        let mut pending: Vec<(String, String)> = Vec::new();
         let known = table
             .iter()
             .filter_map(|r| names.get(&r.mac).map(|n| (r.mac.as_str(), n)));
         for (mac, name) in known.chain(names.since(since)) {
             if shown.get(mac).map(String::as_str) != Some(name)
-                && !fresh.iter().any(|(m, _)| m == mac)
+                && !pending.iter().any(|(m, _)| m == mac)
             {
-                fresh.push((mac.to_string(), name.to_string()));
+                pending.push((mac.to_string(), name.to_string()));
             }
         }
         // A device heard since the table was read: read it again for its row.
-        if fresh
+        if pending
             .iter()
             .any(|(mac, _)| !table.iter().any(|r| r.mac == *mac))
-            && let (0, listed) = passive_listing()
+            && read_at.elapsed() >= TABLE_RETRY
         {
-            table = listed.lines().filter_map(parse_row).collect();
+            read_at = Instant::now();
+            if let (0, listed) = passive_listing() {
+                table = listed.lines().filter_map(parse_row).collect();
+            }
         }
-        for (mac, name) in fresh {
-            if let Some(r) = table.iter().find(|r| r.mac == mac) {
-                let row = Row {
-                    mac: r.mac.clone(),
-                    rssi: r.rssi.clone(),
-                    name: name.clone(),
-                };
-                if !emit(&row) {
-                    crate::util::exit(141);
-                }
+        let mut waiting = false;
+        for (mac, name) in pending {
+            let Some(r) = table.iter().find(|r| r.mac == mac) else {
+                waiting = true;
+                continue;
+            };
+            let row = Row {
+                mac: r.mac.clone(),
+                rssi: r.rssi.clone(),
+                name: name.clone(),
+            };
+            if !emit(&row) {
+                crate::util::exit(141);
             }
             shown.insert(mac, name);
         }
-        if ended {
+        if (ended && !waiting) || Instant::now() >= deadline {
             break;
         }
-        nap_until(Instant::now() + FOLLOW_POLL);
+        nap_until((Instant::now() + FOLLOW_POLL).min(deadline));
     }
     untrap_signals();
-    rc
+    if shown.is_empty() { rc } else { 0 }
 }
 
 fn peers_stream(cmd: &mut Command) -> i32 {
