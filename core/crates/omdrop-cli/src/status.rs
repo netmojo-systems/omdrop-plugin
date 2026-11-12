@@ -472,7 +472,9 @@ fn add_senders(f: &Path, ids: &[String]) -> std::io::Result<()> {
     };
     let original = text.len();
     for id in ids {
-        if text.lines().any(|l| l == id) {
+        let id = id.trim();
+        // The receiver trims each line before matching, so compare trimmed lines too.
+        if text.lines().any(|l| l.trim() == id) {
             continue;
         }
         // An entry appended to a last line with no newline would be glued to it.
@@ -494,7 +496,7 @@ fn remove_senders(f: &Path, ids: &[String]) -> std::io::Result<()> {
     let text = String::from_utf8_lossy(&std::fs::read(f)?).into_owned();
     let mut out = String::new();
     for line in text.lines() {
-        if !ids.iter().any(|id| id == line) {
+        if !ids.iter().any(|id| id.trim() == line.trim()) {
             out.push_str(line);
             out.push('\n');
         }
@@ -739,5 +741,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "a@b.co\nc@d.co\n");
         remove_senders(&f, &["a@b.co".to_string(), "c@d.co".to_string()]).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "");
+    }
+
+    #[test]
+    fn padded_entries_are_matched_trimmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("known-senders");
+        std::fs::write(&f, " +1 (604) 555-0100 \n").unwrap();
+        add_senders(
+            &f,
+            &["+1 (604) 555-0100".to_string(), " a@b.co ".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            " +1 (604) 555-0100 \na@b.co\n"
+        );
+        remove_senders(&f, &["+1 (604) 555-0100".to_string()]).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "a@b.co\n");
     }
 }
