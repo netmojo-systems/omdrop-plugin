@@ -548,7 +548,12 @@ fn send_narrated(cmd: &mut Command) -> i32 {
                     outln!("{s}");
                 }
             }
-            Read1::Signal => cancelled(Some(&mut child)),
+            Read1::Signal => {
+                if stepping {
+                    errln!("");
+                }
+                cancelled(Some(&mut child))
+            }
             Read1::Eof | Read1::Timeout => break,
         }
     }
