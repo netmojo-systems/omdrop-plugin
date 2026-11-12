@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use omdrop_identity::apple::Record;
 use omdrop_identity::{Identity, Source};
@@ -1133,6 +1133,29 @@ fn a_closing_chunk_sent_after_the_early_answer_is_drained_not_reset() {
 }
 
 #[test]
+fn a_closing_chunk_is_drained_after_the_body_deadline_has_passed() {
+    // The archive is whole before the quiet boundary step ends, by which
+    // time the body's rate deadline has passed: the drain must not inherit it.
+    let fx = start(false, |s| {
+        patient_limits(s);
+        s.limits.body_grace = Duration::from_millis(100);
+    });
+    let mut c = connect(&fx, false);
+    upload_without_closing_chunk(&mut c, &dvzip(&[("late.bin", b"late")]));
+    assert_eq!(response(&mut c).0, 200);
+    // Closed only once the drain has waited its quiet time for the chunk,
+    // not at once, which would reset a chunk still on the way.
+    let answered = Instant::now();
+    assert!(matches!(after_answer(&mut c), Ok(0)), "not a clean close");
+    assert!(
+        answered.elapsed() >= Duration::from_millis(250),
+        "{:?}",
+        answered.elapsed()
+    );
+    assert_eq!(fx.files(), ["late.bin"]);
+}
+
+#[test]
 fn half_an_archive_without_its_closing_chunk_still_times_out() {
     let fx = start(false, patient_limits);
     let mut c = connect(&fx, false);
@@ -1365,6 +1388,50 @@ fn a_sender_that_leaves_mid_upload_gets_no_answer_and_frees_its_slot() {
     );
     assert_eq!(response(&mut c).0, 200);
     assert_eq!(fx.files(), ["after.txt"]);
+}
+
+#[test]
+fn an_upload_cannot_outlast_its_body_deadline_inside_one_tls_record() {
+    let fx = start(false, |s| s.limits.body_grace = Duration::from_millis(500));
+    let mut c = connect(&fx, false);
+    c.get_mut()
+        .write_all(
+            b"POST /Upload HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-dvzip\r\n\
+              Transfer-Encoding: chunked\r\n\r\n",
+        )
+        .unwrap();
+    c.get_mut().flush().unwrap();
+    let holding = || fx.server.uploads.load(Ordering::SeqCst);
+    let waited = Instant::now();
+    while holding() == 0 && waited.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(holding(), 1);
+
+    // One TLS record carrying a chunk-size line, sent a ciphertext byte at a
+    // time: rustls returns nothing until the whole record is in.
+    let StreamOwned { mut conn, mut sock } = c.into_inner();
+    conn.writer()
+        .write_all(format!("1;{}\r\n", "a".repeat(100)).as_bytes())
+        .unwrap();
+    let mut record = Vec::new();
+    conn.write_tls(&mut record).unwrap();
+    let started = Instant::now();
+    let mut sent = 0;
+    for byte in &record {
+        if holding() == 0 || sock.write_all(std::slice::from_ref(byte)).is_err() {
+            break;
+        }
+        sent += 1;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(holding(), 0, "slot still held after the whole record");
+    assert!(sent < record.len(), "{sent} of {} bytes", record.len());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

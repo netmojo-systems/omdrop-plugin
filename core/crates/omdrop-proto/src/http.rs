@@ -145,6 +145,7 @@ pub struct Patience<'p> {
 #[derive(Debug)]
 pub struct ReadDeadline {
     started: Instant,
+    grace: Duration,
     transferred: u64,
 }
 
@@ -162,7 +163,16 @@ impl ReadDeadline {
     pub fn started_at(started: Instant) -> Self {
         ReadDeadline {
             started,
+            grace: Duration::from_secs_f64(INITIAL_READ_SECONDS),
             transferred: 0,
+        }
+    }
+
+    /// Starting now, with `grace` in place of [`INITIAL_READ_SECONDS`].
+    pub fn with_grace(grace: Duration) -> Self {
+        ReadDeadline {
+            grace,
+            ..Self::new()
         }
     }
 
@@ -175,13 +185,18 @@ impl ReadDeadline {
         self.started.elapsed()
     }
 
+    /// When the body falls behind the minimum rate, given what it has sent.
+    pub fn limit_at(&self) -> Instant {
+        let earned =
+            Duration::from_secs_f64(self.transferred as f64 / MIN_READ_BYTES_PER_SECOND as f64);
+        self.started + self.grace + earned
+    }
+
     /// Count `size` received bytes; a [`Stall::Rate`] timeout when the body is
     /// behind the minimum rate.
     pub fn note(&mut self, size: usize) -> Result<(), BodyError> {
         self.transferred += size as u64;
-        let allowed =
-            INITIAL_READ_SECONDS + self.transferred as f64 / MIN_READ_BYTES_PER_SECOND as f64;
-        if self.started.elapsed().as_secs_f64() > allowed {
+        if Instant::now() > self.limit_at() {
             return Err(BodyError::Timeout(Stall::Rate));
         }
         Ok(())
@@ -305,6 +320,16 @@ pub fn body_plan(headers: &Headers, limit: u64) -> Result<BodyPlan, BodyError> {
 /// Read one line of at most `max` bytes (stopping after `\n`), as Python's
 /// `readline(max)`.
 pub fn read_line(r: &mut impl BufRead, max: usize) -> io::Result<Vec<u8>> {
+    read_line_noting(r, max, |_| Ok(()))
+}
+
+/// [`read_line`], passing the size of each piece the reader returns to
+/// `note`, which can end the line early with an error.
+fn read_line_noting(
+    r: &mut impl BufRead,
+    max: usize,
+    mut note: impl FnMut(usize) -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
     let mut line = Vec::new();
     while line.len() < max {
         let available = match r.fill_buf() {
@@ -323,16 +348,31 @@ pub fn read_line(r: &mut impl BufRead, max: usize) -> io::Result<Vec<u8>> {
             Some(i) => {
                 line.extend_from_slice(window.get(..=i).unwrap_or_default());
                 r.consume(i + 1);
+                note(i + 1)?;
                 return Ok(line);
             }
             None => {
                 let n = window.len();
                 line.extend_from_slice(window);
                 r.consume(n);
+                note(n)?;
             }
         }
     }
     Ok(line)
+}
+
+/// Count `n` body bytes, then publish the deadline they moved.
+fn note(
+    deadline: &mut ReadDeadline,
+    publish: Option<&dyn Fn(Instant)>,
+    n: usize,
+) -> io::Result<()> {
+    deadline.note(n).map_err(BodyError::into_io)?;
+    if let Some(publish) = publish {
+        publish(deadline.limit_at());
+    }
+    Ok(())
 }
 
 enum Chunk {
@@ -353,6 +393,7 @@ pub struct BodyReader<'a, R: BufRead> {
     length_left: u64,
     chunk: Option<Chunk>,
     patience: Option<Patience<'a>>,
+    publish: Option<&'a dyn Fn(Instant)>,
 }
 
 impl<'a, R: BufRead> BodyReader<'a, R> {
@@ -369,7 +410,16 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
             length_left,
             chunk,
             patience: None,
+            publish: None,
         }
+    }
+
+    /// Hand [`ReadDeadline::limit_at`] to `publish` before the first read and
+    /// after every byte counted, so the transport can stop at it: a callback
+    /// here cannot run while TLS is still assembling a record from fragments.
+    pub fn with_deadline_hook(mut self, publish: &'a dyn Fn(Instant)) -> Self {
+        self.publish = Some(publish);
+        self
     }
 
     /// Wait at chunk boundaries as [`Patience`] describes. Chunked bodies only.
@@ -384,9 +434,12 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
     }
 
     fn line(&mut self) -> io::Result<Vec<u8>> {
-        let line = read_line(self.r, MAX_CHUNK_LINE_BYTES + 1)?;
-        self.deadline.note(line.len()).map_err(BodyError::into_io)?;
-        Ok(line)
+        // Checked on every read, not once per line: a line trickled a byte at
+        // a time would otherwise outlast the deadline by many idle timeouts.
+        let (deadline, publish) = (&mut *self.deadline, self.publish);
+        read_line_noting(self.r, MAX_CHUNK_LINE_BYTES + 1, |n| {
+            note(deadline, publish, n)
+        })
     }
 
     /// Wait for the next chunk-size line's first byte without consuming it,
@@ -408,6 +461,9 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
                     idle += p.step;
                     if (p.is_complete)() {
                         break Err(BodyError::Complete.into_io());
+                    }
+                    if Instant::now() >= self.deadline.limit_at() {
+                        break Err(e);
                     }
                     if idle >= p.limit {
                         break Err(e);
@@ -434,7 +490,7 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
         if n == 0 {
             return Err(BodyError::Invalid(truncated.into()).into_io());
         }
-        self.deadline.note(n).map_err(BodyError::into_io)?;
+        note(self.deadline, self.publish, n)?;
         self.total += n as u64;
         Ok(n)
     }
@@ -523,8 +579,17 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
                 }
                 Some(Chunk::End) => {
                     let mut ending = [0u8; 2];
-                    let n = crate::archive::read_full(self.r, &mut ending)?;
-                    self.deadline.note(n).map_err(BodyError::into_io)?;
+                    let mut n = 0;
+                    while n < ending.len() {
+                        let got = match self.r.read(&mut ending[n..]) {
+                            Ok(0) => break,
+                            Ok(got) => got,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(e) => return Err(e),
+                        };
+                        n += got;
+                        note(self.deadline, self.publish, got)?;
+                    }
                     if n != 2 || ending != *b"\r\n" {
                         return Err(BodyError::Invalid("chunk data missing CRLF".into()).into_io());
                     }
@@ -537,7 +602,19 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
 
 impl<R: BufRead> Read for BodyReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.read_framed(buf).map_err(connection_lost)
+        if let Some(publish) = self.publish {
+            publish(self.deadline.limit_at());
+        }
+        self.read_framed(buf)
+            .map_err(|e| {
+                // The transport times out at the published deadline too.
+                if is_timeout(&e) && Instant::now() >= self.deadline.limit_at() {
+                    BodyError::Timeout(Stall::Rate).into_io()
+                } else {
+                    e
+                }
+            })
+            .map_err(connection_lost)
     }
 }
 
@@ -984,6 +1061,118 @@ mod tests {
             .unwrap(),
             b"hello"
         );
+    }
+
+    #[test]
+    fn bytes_counted_inside_one_read_move_the_transport_deadline() {
+        use std::cell::Cell;
+        use std::collections::VecDeque;
+
+        /// Delivers each part at its time, and times out, as the receiver's
+        /// socket does, at the last deadline published to it.
+        struct Paced<'a> {
+            start: Instant,
+            parts: VecDeque<(Duration, Vec<u8>)>,
+            limit: &'a Cell<Option<Instant>>,
+        }
+        impl Read for Paced<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let Some((at, part)) = self.parts.front_mut() else {
+                    return Ok(0);
+                };
+                let due = self.start + *at;
+                if let Some(limit) = self.limit.get()
+                    && due >= limit
+                {
+                    std::thread::sleep(limit.saturating_duration_since(Instant::now()));
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                let n = buf.len().min(part.len());
+                buf[..n].copy_from_slice(&part[..n]);
+                part.drain(..n);
+                if part.is_empty() {
+                    self.parts.pop_front();
+                }
+                Ok(n)
+            }
+        }
+
+        let grace = Duration::from_millis(100);
+        let mut deadline = ReadDeadline::with_grace(grace);
+        // About 90 ms of allowance earned at once, inside one read of the
+        // trailers, then the end arriving after the grace alone has run out.
+        let mut framing = b"0\r\n".to_vec();
+        for _ in 0..50 {
+            framing.extend(format!("X-Pad: {}\r\n", "a".repeat(111)).bytes());
+        }
+        let limit = Cell::new(None);
+        let mut paced = Paced {
+            start: Instant::now(),
+            parts: VecDeque::from([
+                (Duration::ZERO, framing),
+                (grace + Duration::from_millis(20), b"\r\n".to_vec()),
+            ]),
+            limit: &limit,
+        };
+        let publish = |at: Instant| limit.set(Some(at));
+        let mut r = io::BufReader::new(&mut paced);
+        let mut body = BodyReader::new(&mut r, BodyPlan::Chunked, 1 << 20, &mut deadline)
+            .with_deadline_hook(&publish);
+        let mut out = Vec::new();
+        body.read_to_end(&mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn chunk_framing_trickled_past_the_deadline_stops_at_the_next_read() {
+        /// Hands over one byte per read, as a sender sending one TLS record each.
+        struct Trickle<'a>(&'a [u8], usize);
+        impl Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let Some((&b, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                buf[0] = b;
+                self.0 = rest;
+                self.1 += 1;
+                Ok(1)
+            }
+        }
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs_f64(INITIAL_READ_SECONDS + 1.0))
+            .unwrap();
+        let mut deadline = ReadDeadline::started_at(started);
+        let mut trickle = Trickle(
+            b"1;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nx\r\n0\r\n\r\n",
+            0,
+        );
+        let mut r = io::BufReader::with_capacity(1, &mut trickle);
+        let err = BodyReader::new(&mut r, BodyPlan::Chunked, 1 << 20, &mut deadline)
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
+        assert!(matches!(
+            BodyError::classify(err),
+            Ok(BodyError::Timeout(Stall::Rate))
+        ));
+        drop(r);
+        assert_eq!(trickle.1, 1);
+
+        // The CRLF after chunk data: the deadline passes after the CR.
+        let mut deadline = ReadDeadline::new();
+        let mut trickle = Trickle(b"1\r\nx\r\n0\r\n\r\n", 0);
+        let mut r = io::BufReader::with_capacity(1, &mut trickle);
+        let mut body = BodyReader::new(&mut r, BodyPlan::Chunked, 1 << 20, &mut deadline);
+        let mut x = [0u8; 1];
+        assert_eq!(body.read(&mut x).unwrap(), 1);
+        *body.deadline = ReadDeadline::started_at(started);
+        let err = body.read(&mut x).unwrap_err();
+        assert!(matches!(
+            BodyError::classify(err),
+            Ok(BodyError::Timeout(Stall::Rate))
+        ));
+        drop(r);
+        assert_eq!(trickle.1, 5);
     }
 
     #[test]
