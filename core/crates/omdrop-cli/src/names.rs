@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -236,7 +236,8 @@ pub enum Lookup {
 }
 
 /// The named lookup this process runs: `peer-lookup.lock` is held until this
-/// is dropped. `None`: the lock could not be used, so nothing coordinates it.
+/// is dropped, and holds when it was taken. `None`: the lock could not be
+/// used, so nothing coordinates it.
 pub struct Turn {
     _lock: Option<File>,
 }
@@ -259,6 +260,14 @@ impl Watch {
             Err(_) => false,
         }
     }
+
+    /// When that lookup took the lock, in seconds since the epoch as names are
+    /// dated; `None` until it has written it there, an instant after taking it.
+    pub fn began(&self) -> Option<u64> {
+        let mut buf = [0u8; 24];
+        let n = self.lock.read_at(&mut buf, 0).ok()?;
+        std::str::from_utf8(buf.get(..n)?).ok()?.trim().parse().ok()
+    }
 }
 
 /// Take `peer-lookup.lock` for a named lookup, unless another lookup holds it.
@@ -277,7 +286,10 @@ fn lookup_at(path: &Path) -> Lookup {
     };
     for _ in 0..TAKE_TRIES {
         match try_flock(&file, libc::LOCK_EX) {
-            Ok(true) => return Lookup::Ours(Turn { _lock: Some(file) }),
+            Ok(true) => {
+                mark_began(&file);
+                return Lookup::Ours(Turn { _lock: Some(file) });
+            }
             Ok(false) => {}
             Err(_) => return Lookup::Ours(Turn { _lock: None }),
         }
@@ -291,6 +303,15 @@ fn lookup_at(path: &Path) -> Lookup {
         std::thread::sleep(Duration::from_millis(1));
     }
     Lookup::Running(Watch { lock: file })
+}
+
+/// Write when this lookup took the lock, for `Watch::began`. Best effort: a
+/// follower that cannot read it counts from its own start.
+fn mark_began(file: &File) {
+    let text = format!("{}\n", now());
+    if file.write_all_at(text.as_bytes(), 0).is_ok() {
+        let _ = file.set_len(text.len() as u64);
+    }
 }
 
 fn open_lock(path: &Path) -> Option<File> {
@@ -465,6 +486,10 @@ mod tests {
     fn one_named_lookup_runs_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LOOKUP_LOCK);
+        let stale = open_lock(&path).unwrap();
+        stale.write_all_at(b"not a time, and longer\n", 0).unwrap();
+        drop(stale);
+        let before = now();
         let Lookup::Ours(turn) = lookup_at(&path) else {
             panic!("a free lock is ours");
         };
@@ -473,6 +498,8 @@ mod tests {
         };
         assert!(watch.running());
         assert!(watch.running(), "looking changes nothing");
+        let began = watch.began().expect("the lookup wrote when it began");
+        assert!((before..=now()).contains(&began), "{began}");
         drop(turn);
         assert!(!watch.running());
         // Looking left nothing held, so the next lookup is ours.
