@@ -3541,6 +3541,41 @@ sender_id_valid() {
   (( ${#digits} >= 7 && ${#digits} <= 15 ))
 }
 
+# Add or remove known senders by the identity the receiver hashes
+# (contacts.normalize), so a removal revokes every line it would still match.
+senders_edit() {
+  PYTHONPATH="$PROJ/bin" python3 - "$@" <<'PY'
+import os, sys, tempfile
+from contacts import normalize
+op, path, *ids = sys.argv[1:]
+# Split where contacts.known_hashes() does (str.splitlines, so U+2028 too) and
+# write kept lines back byte for byte, separators included.
+with open(path, "rb") as fh:
+    lines = fh.read().decode(errors="surrogateescape").splitlines(keepends=True)
+key = lambda l: normalize(l.encode(errors="surrogateescape").decode(errors="replace"))
+if op == "add":
+    have = {key(l) for l in lines}
+    for i in ids:
+        if normalize(i) not in have:
+            have.add(normalize(i))
+            if lines and lines[-1] == lines[-1].splitlines()[0]:
+                lines[-1] += "\n"
+            lines.append(i.strip() + "\n")
+else:
+    drop = {normalize(i) for i in ids} - {None}
+    lines = [l for l in lines if key(l) not in drop]
+fd, tmp = tempfile.mkstemp(prefix=".known-senders.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "wb") as fh:
+        fh.write("".join(lines).encode(errors="surrogateescape"))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except BaseException:
+    os.unlink(tmp)
+    raise
+PY
+}
+
 cmd_senders() {
   local f="$CONTACTS_DIR/known-senders"
   local sub=${1:-list}; shift || true
@@ -3562,17 +3597,12 @@ cmd_senders() {
           || die "\"$id\" is not an email address or a phone number. Use the email or phone number of their Apple ID."
       done
       mkdir -p "$CONTACTS_DIR"; touch "$f"
-      for id in "$@"; do
-        grep -qxF "$id" "$f" 2>/dev/null || printf '%s\n' "$id" >> "$f"
-      done
+      senders_edit add "$f" "$@" || die "could not write $f"
       printf 'Added. %s known now.\n' "$(sender_count)" ;;
     remove|rm)
       (( $# )) || die "usage: omdrop senders remove <email-or-phone> [...]"
       [[ -f "$f" ]] || die "no known-senders list yet"
-      local id tmp; tmp=$(mktemp)
-      cp "$f" "$tmp"
-      for id in "$@"; do grep -vxF "$id" "$tmp" > "$tmp.n" && mv "$tmp.n" "$tmp"; done
-      mv "$tmp" "$f"
+      senders_edit remove "$f" "$@" || die "could not write $f"
       printf 'Removed. %s known now.\n' "$(sender_count)" ;;
     *) die "usage: omdrop senders [list|add <id>|remove <id>]" ;;
   esac
