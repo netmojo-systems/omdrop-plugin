@@ -40,13 +40,15 @@ class SendersTests(unittest.TestCase):
         self.senders("remove", "c@d.co")
         self.assertEqual("", self.file.read_text())
 
-    def test_a_padded_entry_is_removed_by_the_listed_id(self):
+    def test_removal_matches_the_identity_the_receiver_hashes(self):
         self.file.parent.mkdir()
-        self.file.write_text(" +1 (604) 555-0100 \na@b.co\n")
-        self.senders("add", "+1 (604) 555-0100")
-        self.senders("remove", "+1 (604) 555-0100")
-        self.assertEqual("a@b.co\n", self.file.read_text())
-        self.assertNotIn(contacts.hash_identifier("16045550100"),
+        self.file.write_text("\u00a0+1 (604) 555-0100\u00a0\n# Friend@Example.com\n"
+                             "Friend@Example.com\r\nc@d.co")
+        self.senders("add", "16045550100", "friend@example.com")
+        self.assertEqual(4, len(self.file.read_text().splitlines()))
+        self.senders("remove", "+1 (604) 555-0100", "friend@example.com")
+        self.assertEqual("# Friend@Example.com\nc@d.co\n", self.file.read_text())
+        self.assertEqual({contacts.hash_identifier("c@d.co")},
                          contacts.known_hashes(self.file))
 
 

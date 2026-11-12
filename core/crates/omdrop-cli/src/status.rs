@@ -473,8 +473,7 @@ fn add_senders(f: &Path, ids: &[String]) -> std::io::Result<()> {
     let original = text.len();
     for id in ids {
         let id = id.trim();
-        // The receiver trims each line before matching, so compare trimmed lines too.
-        if text.lines().any(|l| l.trim() == id) {
+        if text.lines().any(|l| same_sender(l, id)) {
             continue;
         }
         // An entry appended to a last line with no newline would be glued to it.
@@ -492,11 +491,17 @@ fn add_senders(f: &Path, ids: &[String]) -> std::io::Result<()> {
     file.write_all(&text.as_bytes()[original..])
 }
 
+/// Whether two entries name the Apple ID the receiver would hash for them.
+fn same_sender(line: &str, id: &str) -> bool {
+    use omdrop_proto::contacts::normalize;
+    normalize(line).is_some_and(|n| Some(n) == normalize(id))
+}
+
 fn remove_senders(f: &Path, ids: &[String]) -> std::io::Result<()> {
     let text = String::from_utf8_lossy(&std::fs::read(f)?).into_owned();
     let mut out = String::new();
     for line in text.lines() {
-        if !ids.iter().any(|id| id.trim() == line.trim()) {
+        if !ids.iter().any(|id| same_sender(line, id)) {
             out.push_str(line);
             out.push('\n');
         }
@@ -744,20 +749,33 @@ mod tests {
     }
 
     #[test]
-    fn padded_entries_are_matched_trimmed() {
+    fn removal_matches_the_identity_the_receiver_hashes() {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("known-senders");
-        std::fs::write(&f, " +1 (604) 555-0100 \n").unwrap();
+        std::fs::write(&f, "\u{a0}+1 (604) 555-0100\u{a0}\n# Friend@Example.com\n").unwrap();
         add_senders(
             &f,
-            &["+1 (604) 555-0100".to_string(), " a@b.co ".to_string()],
+            &[
+                "16045550100".to_string(),
+                " Friend@Example.com ".to_string(),
+            ],
         )
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
-            " +1 (604) 555-0100 \na@b.co\n"
+            "\u{a0}+1 (604) 555-0100\u{a0}\n# Friend@Example.com\nFriend@Example.com\n"
         );
-        remove_senders(&f, &["+1 (604) 555-0100".to_string()]).unwrap();
-        assert_eq!(std::fs::read_to_string(&f).unwrap(), "a@b.co\n");
+        remove_senders(
+            &f,
+            &[
+                "+1 (604) 555-0100".to_string(),
+                "friend@example.com".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "# Friend@Example.com\n"
+        );
     }
 }

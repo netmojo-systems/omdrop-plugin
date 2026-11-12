@@ -3541,19 +3541,35 @@ sender_id_valid() {
   (( ${#digits} >= 7 && ${#digits} <= 15 ))
 }
 
-trim_ws() {
-  local s=$1
-  s=${s#"${s%%[![:space:]]*}"}
-  printf '%s' "${s%"${s##*[![:space:]]}"}"
-}
-
-# The receiver trims each line before matching, so compare trimmed lines too.
-sender_listed() {
-  local line
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$(trim_ws "$line")" == "$1" ]] && return 0
-  done < "$2"
-  return 1
+# Add or remove known senders by the identity the receiver hashes
+# (contacts.normalize), so a removal revokes every line it would still match.
+senders_edit() {
+  PYTHONPATH="$PROJ/bin" python3 - "$@" <<'PY'
+import os, sys, tempfile
+from contacts import normalize
+op, path, *ids = sys.argv[1:]
+with open(path, "rb") as fh:
+    lines = fh.read().splitlines()
+key = lambda b: normalize(b.decode(errors="replace"))
+if op == "add":
+    have = {key(l) for l in lines}
+    for i in ids:
+        if normalize(i) not in have:
+            have.add(normalize(i))
+            lines.append(i.strip().encode())
+else:
+    drop = {normalize(i) for i in ids} - {None}
+    lines = [l for l in lines if key(l) not in drop]
+fd, tmp = tempfile.mkstemp(prefix=".known-senders.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(b"".join(l + b"\n" for l in lines))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except BaseException:
+    os.unlink(tmp)
+    raise
+PY
 }
 
 cmd_senders() {
@@ -3577,24 +3593,12 @@ cmd_senders() {
           || die "\"$id\" is not an email address or a phone number. Use the email or phone number of their Apple ID."
       done
       mkdir -p "$CONTACTS_DIR"; touch "$f"
-      for id in "$@"; do
-        id=$(trim_ws "$id")
-        sender_listed "$id" "$f" || printf '%s\n' "$id" >> "$f"
-      done
+      senders_edit add "$f" "$@" || die "could not write $f"
       printf 'Added. %s known now.\n' "$(sender_count)" ;;
     remove|rm)
       (( $# )) || die "usage: omdrop senders remove <email-or-phone> [...]"
       [[ -f "$f" ]] || die "no known-senders list yet"
-      local id line tmp drop
-      tmp=$(mktemp "$CONTACTS_DIR/.known-senders.XXXXXX") || die "could not write $f"
-      while IFS= read -r line || [[ -n "$line" ]]; do
-        drop=0
-        for id in "$@"; do
-          [[ "$(trim_ws "$line")" == "$(trim_ws "$id")" ]] && { drop=1; break; }
-        done
-        (( drop )) || printf '%s\n' "$line"
-      done < "$f" > "$tmp" || { rm -f "$tmp"; die "could not write $f"; }
-      chmod 600 "$tmp" && mv "$tmp" "$f" || { rm -f "$tmp"; die "could not write $f"; }
+      senders_edit remove "$f" "$@" || die "could not write $f"
       printf 'Removed. %s known now.\n' "$(sender_count)" ;;
     *) die "usage: omdrop senders [list|add <id>|remove <id>]" ;;
   esac
