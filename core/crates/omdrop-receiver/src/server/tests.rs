@@ -1124,6 +1124,29 @@ fn a_closing_chunk_sent_after_the_early_answer_is_drained_not_reset() {
 }
 
 #[test]
+fn a_closing_chunk_is_drained_after_the_body_deadline_has_passed() {
+    // The archive is whole before the quiet boundary step ends, by which
+    // time the body's rate deadline has passed: the drain must not inherit it.
+    let fx = start(false, |s| {
+        patient_limits(s);
+        s.limits.body_grace = Duration::from_millis(100);
+    });
+    let mut c = connect(&fx, false);
+    upload_without_closing_chunk(&mut c, &dvzip(&[("late.bin", b"late")]));
+    assert_eq!(response(&mut c).0, 200);
+    // Closed only once the drain has waited its quiet time for the chunk,
+    // not at once, which would reset a chunk still on the way.
+    let answered = Instant::now();
+    assert!(matches!(after_answer(&mut c), Ok(0)), "not a clean close");
+    assert!(
+        answered.elapsed() >= Duration::from_millis(250),
+        "{:?}",
+        answered.elapsed()
+    );
+    assert_eq!(fx.files(), ["late.bin"]);
+}
+
+#[test]
 fn half_an_archive_without_its_closing_chunk_still_times_out() {
     let fx = start(false, patient_limits);
     let mut c = connect(&fx, false);

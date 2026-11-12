@@ -1381,6 +1381,8 @@ impl Conn<'_> {
             let _ = io::copy(&mut body, &mut io::sink());
         }
         let wire = body.total();
+        // The body is read: what follows, including the drain, is not held to its rate.
+        drop(body_deadline);
         let failure = match result {
             Ok(done) => {
                 if done.unterminated {
