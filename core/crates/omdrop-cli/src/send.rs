@@ -19,6 +19,7 @@ use crate::config::{effective_name, setting_set};
 use crate::ctx::{DEFAULT_SEND_WAIT, DEFAULT_WINDOW, ctx};
 use crate::driver::{awdl_link_local, radio_pkg, radio_update};
 use crate::identity::{Out, id};
+use crate::names::{Lookup, Watch};
 use crate::proc::{
     Forwarded, LineReader, Read1, cancelled, capture_merged, pipe, run_cancellable, spawn_group,
     spawn_session, stop_group, trap_signals, untrap_signals, wait_cancellable,
@@ -37,22 +38,20 @@ pub struct Row {
     pub name: String,
 }
 
+/// An address as the sender prints one: `aa:bb:cc:dd:ee:ff`, lower-case.
+pub fn is_mac(s: &str) -> bool {
+    s.len() == 17
+        && s.bytes().enumerate().all(|(i, c)| {
+            if i % 3 == 2 {
+                c == b':'
+            } else {
+                c.is_ascii_digit() || (b'a'..=b'f').contains(&c)
+            }
+        })
+}
+
 pub fn parse_row(line: &str) -> Option<Row> {
-    let b = line.as_bytes();
-    if b.len() < 17 {
-        return None;
-    }
-    for (i, &c) in b[..17].iter().enumerate() {
-        let ok = if i % 3 == 2 {
-            c == b':'
-        } else {
-            c.is_ascii_digit() || (b'a'..=b'f').contains(&c)
-        };
-        if !ok {
-            return None;
-        }
-    }
-    let mac = &line[..17];
+    let mac = line.get(..17).filter(|m| is_mac(m))?;
     let rest = &line[17..];
     let after_ws = rest.trim_start_matches(crate::util::is_space);
     if after_ws.len() == rest.len() {
@@ -91,7 +90,7 @@ pub fn parse_row(line: &str) -> Option<Row> {
     })
 }
 
-fn placeholder(name: &str) -> bool {
+pub fn placeholder(name: &str) -> bool {
     matches!(name, "" | "(no response)" | "(anonymous)")
 }
 
@@ -740,6 +739,7 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
                     row_of.insert(row.mac.clone(), line.to_string());
                 }
                 if !placeholder(&row.name) {
+                    crate::names::store(std::slice::from_ref(&row));
                     if said.insert(row.mac.clone(), ()).is_none() {
                         outln!("Heard from {}.", row.name);
                     }
@@ -791,13 +791,7 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
             note_at = Instant::now() + Duration::from_secs(15);
         }
         // A fast empty pass must not spin, or sleep past the budget.
-        let nap_until = (Instant::now() + Duration::from_secs(3)).min(deadline);
-        while Instant::now() < nap_until {
-            if crate::proc::caught().is_some() {
-                cancelled(None);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        nap_until((Instant::now() + Duration::from_secs(3)).min(deadline));
     }
     untrap_signals();
     let listing = order
@@ -929,7 +923,6 @@ pub fn peers_json(listing: &str) -> String {
 }
 
 pub fn cmd_peers(args: &[String]) -> i32 {
-    let c = ctx();
     // -n is opt-in because asking a peer its name means connecting to it,
     // which shows this machine to every device listed, and raises a BLE
     // advert with this account's contact hashes so a Contacts Only device
@@ -955,6 +948,17 @@ pub fn cmd_peers(args: &[String]) -> i32 {
             radio_update()
         ));
     }
+    // One named lookup at a time per user, whichever program asks: overlapping
+    // ones piled up adverts and connection bursts until names stopped resolving.
+    let turn = match names.then(crate::names::lookup) {
+        Some(Lookup::Running(watch)) if stream => return follow_stream(&watch),
+        Some(Lookup::Running(watch)) => {
+            let (rc, out) = after_lookup(&watch, !json);
+            return print_peers(rc, &out, json, names);
+        }
+        Some(Lookup::Ours(turn)) => Some(turn),
+        None => None,
+    };
     let mut cmd = sender_cmd();
     cmd.arg("--list");
     if names {
@@ -973,27 +977,34 @@ pub fn cmd_peers(args: &[String]) -> i32 {
         }
         return peers_stream(&mut cmd);
     }
-    // The panel ends a named lookup every time its section closes, and a
-    // bare kill of the old script left the sender and its advert running,
-    // piling up beside the next lookup. So the lookup runs as its own
-    // process group and writes to a file read once it has finished.
-    let tmp = anonymous_file().unwrap_or_else(|| die("could not make a temporary file"));
-    let Ok(out_fd) = tmp.try_clone() else {
-        die("could not make a temporary file");
-    };
-    cmd.stdout(Stdio::from(out_fd));
     // Naming takes fifteen to twenty seconds (measured 2026-09-21), and
     // silence that long reads as a hang. The panel draws its own progress.
     let spin = names && !json;
+    trap_signals();
     if spin {
         crate::proc::spinner_start("Asking nearby devices for their names");
     }
-    let rc = run_cancellable(&mut cmd);
+    let (rc, out) = listing(&mut cmd);
     if spin {
         crate::proc::spinner_restore_tty();
     }
-    let out = read_all(tmp);
-    let out = crate::util::strip_trailing_newlines(&out).to_string();
+    untrap_signals();
+    if names {
+        let rows: Vec<Row> = out.lines().filter_map(parse_row).collect();
+        crate::names::store(&rows);
+    }
+    drop(turn);
+    print_peers(rc, &out, json, names)
+}
+
+/// A listing as `peers` prints it, where it has a name column (JSON, `-n`)
+/// with each row that has no name given the one learned for its address.
+fn print_peers(rc: i32, out: &str, json: bool, names: bool) -> i32 {
+    let out = if rc == 0 && (json || names) {
+        crate::names::load().fill_listing(out)
+    } else {
+        out.to_string()
+    };
     if json {
         // An empty room is still an answer the panel can draw: `[]` on
         // stdout, and the same exit status and sentence as text on stderr.
@@ -1009,7 +1020,7 @@ pub fn cmd_peers(args: &[String]) -> i32 {
     if rc == 1 {
         // The RADIO, not the receiver, decides: it is the window that runs
         // the peer watcher which fills this table.
-        let (_, st) = crate::proc::capture(&c.discoverable, &["status", "--json"]);
+        let (_, st) = crate::proc::capture(&ctx().discoverable, &["status", "--json"]);
         if !String::from_utf8_lossy(&st).contains("\"visible\":true") {
             die("Omdrop is currently OFF. Turn it on to see peers.");
         }
@@ -1023,12 +1034,106 @@ pub fn cmd_peers(args: &[String]) -> i32 {
     rc
 }
 
+/// How often a follower of another program's lookup looks for news.
+const FOLLOW_POLL: Duration = Duration::from_millis(200);
+
+/// `peers -n` while another program's lookup runs: wait for it, at most
+/// OMDROP_NAME_WAIT, then answer from the table and the names learned.
+fn after_lookup(watch: &Watch, spin: bool) -> (i32, String) {
+    trap_signals();
+    if spin {
+        crate::proc::spinner_start("Waiting for the name lookup already running");
+    }
+    let deadline = Instant::now() + Duration::from_secs(ctx().name_wait);
+    while watch.running() && Instant::now() < deadline {
+        nap_until((Instant::now() + FOLLOW_POLL).min(deadline));
+    }
+    let listed = passive_listing();
+    if spin {
+        crate::proc::spinner_restore_tty();
+    }
+    untrap_signals();
+    listed
+}
+
+/// `peers -n --json --stream` while another program's lookup runs: the names
+/// learned for the table's devices, then each one that lookup stores, until it
+/// ends or OMDROP_NAME_WAIT passes.
+fn follow_stream(watch: &Watch) -> i32 {
+    trap_signals();
+    let deadline = Instant::now() + Duration::from_secs(ctx().name_wait);
+    let since = crate::names::now();
+    let (rc, listed) = passive_listing();
+    if rc != 0 && rc != 1 {
+        untrap_signals();
+        return rc;
+    }
+    let mut table: Vec<Row> = listed.lines().filter_map(parse_row).collect();
+    let mut shown: HashMap<String, String> = HashMap::new();
+    loop {
+        // Looked at before the names are read: a lookup stores its last name
+        // before it lets go of the lock.
+        let ended = !watch.running() || Instant::now() >= deadline;
+        let names = crate::names::load();
+        let mut fresh: Vec<(String, String)> = Vec::new();
+        let known = table
+            .iter()
+            .filter_map(|r| names.get(&r.mac).map(|n| (r.mac.as_str(), n)));
+        for (mac, name) in known.chain(names.since(since)) {
+            if shown.get(mac).map(String::as_str) != Some(name)
+                && !fresh.iter().any(|(m, _)| m == mac)
+            {
+                fresh.push((mac.to_string(), name.to_string()));
+            }
+        }
+        // A device heard since the table was read: read it again for its row.
+        if fresh
+            .iter()
+            .any(|(mac, _)| !table.iter().any(|r| r.mac == *mac))
+            && let (0, listed) = passive_listing()
+        {
+            table = listed.lines().filter_map(parse_row).collect();
+        }
+        for (mac, name) in fresh {
+            if let Some(r) = table.iter().find(|r| r.mac == mac) {
+                let row = Row {
+                    mac: r.mac.clone(),
+                    rssi: r.rssi.clone(),
+                    name: name.clone(),
+                };
+                if !emit(&row) {
+                    crate::util::exit(141);
+                }
+            }
+            shown.insert(mac, name);
+        }
+        if ended {
+            break;
+        }
+        nap_until(Instant::now() + FOLLOW_POLL);
+    }
+    untrap_signals();
+    rc
+}
+
 fn peers_stream(cmd: &mut Command) -> i32 {
+    trap_signals();
+    // Learned names for the table's devices first: a program reading only this
+    // stream shows them at once. An unreadable table is the lookup's to report.
+    let mut names = crate::names::load();
+    let mut table = sender_cmd();
+    table.arg("--list").stderr(Stdio::null());
+    if let (0, listed) = listing(&mut table) {
+        for mut row in listed.lines().filter_map(parse_row) {
+            if names.fill(&mut row) && !emit(&row) {
+                crate::util::exit(141);
+            }
+        }
+    }
     let Ok((read, write)) = pipe() else {
         die("omdrop could not create a pipe.");
     };
     cmd.stdout(Stdio::from(write));
-    trap_signals();
     let spawned = spawn_group(cmd);
     cmd.stdout(Stdio::null());
     let mut child = match spawned {
@@ -1043,18 +1148,16 @@ fn peers_stream(cmd: &mut Command) -> i32 {
         match reader.read_line(None) {
             Read1::Signal => cancelled(Some(&mut child)),
             Read1::Line(l) => {
-                if let Some(row) = parse_row(&String::from_utf8_lossy(&l)) {
-                    use std::io::Write;
-                    let line = format!("{}\n", peer_json(&row));
-                    let mut out = std::io::stdout();
+                if let Some(mut row) = parse_row(&String::from_utf8_lossy(&l)) {
+                    if names.learn(&row, crate::names::now()) {
+                        crate::names::store(std::slice::from_ref(&row));
+                    } else {
+                        names.fill(&mut row);
+                    }
                     // Nobody reading any more (the panel died without a
                     // signal): stop the lookup and its advert now, as the
                     // bash pipeline's SIGPIPE did, not at the lookup's end.
-                    if out
-                        .write_all(line.as_bytes())
-                        .and_then(|()| out.flush())
-                        .is_err()
-                    {
+                    if !emit(&row) {
                         stop_group(&mut child);
                         crate::util::exit(141);
                     }
@@ -1066,6 +1169,52 @@ fn peers_stream(cmd: &mut Command) -> i32 {
     let rc = wait_cancellable(&mut child, None).unwrap_or(1);
     untrap_signals();
     rc
+}
+
+/// One row of a stream, flushed at once; false when nobody reads any more.
+fn emit(row: &Row) -> bool {
+    use std::io::Write;
+    let line = format!("{}\n", peer_json(row));
+    let mut out = std::io::stdout();
+    out.write_all(line.as_bytes())
+        .and_then(|()| out.flush())
+        .is_ok()
+}
+
+/// Sleep until `until`, unless a signal arrives first: then "Cancelled.".
+fn nap_until(until: Instant) {
+    while Instant::now() < until {
+        if crate::proc::caught().is_some() {
+            cancelled(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The radio's table alone: `--list`, which transmits nothing.
+fn passive_listing() -> (i32, String) {
+    let mut cmd = sender_cmd();
+    cmd.arg("--list");
+    listing(&mut cmd)
+}
+
+/// `cmd`'s exit status and its stdout, read once it has finished; the
+/// caller has trapped the signals. The panel ends a named lookup every time
+/// its section closes, and a bare kill of the old script left the sender and
+/// its advert running, piling up beside the next lookup. So `cmd` runs as
+/// its own process group, which a cancel stops whole, and writes to a file.
+fn listing(cmd: &mut Command) -> (i32, String) {
+    let tmp = anonymous_file().unwrap_or_else(|| die("could not make a temporary file"));
+    let Ok(out_fd) = tmp.try_clone() else {
+        die("could not make a temporary file");
+    };
+    cmd.stdout(Stdio::from(out_fd));
+    let rc = match spawn_group(cmd) {
+        Ok(mut child) => wait_cancellable(&mut child, None).unwrap_or(1),
+        Err(e) => crate::proc::spawn_error(cmd, &e),
+    };
+    let out = read_all(tmp);
+    (rc, crate::util::strip_trailing_newlines(&out).to_string())
 }
 
 /// A file only we can reach: created in the runtime directory and unlinked

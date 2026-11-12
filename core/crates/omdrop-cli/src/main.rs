@@ -8,7 +8,7 @@
 //!
 //! The panel holds no state of its own. It shells out to this command for
 //! every action and reads `omdrop status --json`, `peers --json` and
-//! `peers --json -n --stream`, whose bytes are unchanged from the bash
+//! `peers --json -n --stream`, whose format is unchanged from the bash
 //! version this replaces, as is every subcommand, message and exit status.
 
 #[macro_use]
@@ -18,6 +18,7 @@ mod ctx;
 mod driver;
 mod identity;
 mod links;
+mod names;
 mod pick;
 mod proc;
 mod send;

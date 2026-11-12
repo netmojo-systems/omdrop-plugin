@@ -913,6 +913,211 @@ fn a_send_cancelled_while_its_stderr_is_held_elsewhere_still_ends() {
     );
 }
 
+/// send-to-peer for `peers`: a table of two devices, and a named lookup that
+/// logs `lookup` with its arguments and names the first device at once and
+/// the second once the file $GATE exists, if $GATE is set (20 s at most).
+const PEERS_SENDER: &str = r#"#!/bin/sh
+case "$*" in
+  --help) echo '  [file ...] --url --names --stream'; exit 0 ;;
+  *--names*)
+    printf 'lookup %s\n' "$*" >> "$CAPTURE"
+    echo 'e2:9d:03:6c:58:23   -47 dBm  [fe80::1%awdl0]:8770  Studio Mac'
+    n=0
+    while [ -n "$GATE" ] && [ ! -e "$GATE" ] && [ $n -lt 400 ]; do sleep 0.05; n=$((n + 1)); done
+    echo '22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770  hume'
+    exit 0 ;;
+  --list)
+    echo 'e2:9d:03:6c:58:23   -47 dBm  [fe80::1%awdl0]:8770'
+    echo '22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770'
+    exit 0 ;;
+esac
+exit 2
+"#;
+const STUDIO: &str = r#"{"mac": "e2:9d:03:6c:58:23", "rssi": -47, "name": "Studio Mac"}"#;
+const HUME: &str = r#"{"mac": "22:8b:38:31:89:4e", "rssi": -34, "name": "hume"}"#;
+const UNNAMED_HUME: &str = r#"{"mac": "22:8b:38:31:89:4e", "rssi": -34, "name": null}"#;
+const STREAM: [&str; 4] = ["peers", "-n", "--json", "--stream"];
+
+/// The fixture with PEERS_SENDER, and where its gate goes.
+fn peers_fixture() -> (Fixture, String, PathBuf) {
+    let f = Fixture::new();
+    let sender = f.root.join("peers-sender");
+    write_exec(&sender, PEERS_SENDER);
+    let gate = f.root.join("gate");
+    (f, sender.display().to_string(), gate)
+}
+
+fn lookups(f: &Fixture) -> usize {
+    std::fs::read_to_string(&f.capture)
+        .unwrap()
+        .matches("lookup ")
+        .count()
+}
+
+/// The child's stdout, a line at a time, read on a thread of its own to the
+/// end, whether or not anyone still takes the lines.
+fn stdout_lines(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead;
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let _ = tx.send(line);
+        }
+    });
+    rx
+}
+
+fn next_line(lines: &std::sync::mpsc::Receiver<String>) -> String {
+    lines
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("no line within 10 s")
+}
+
+/// A streamed named lookup that holds the lookup lock: it has named Studio
+/// Mac, and names hume once the gate opens. Its stdout is read to the end.
+fn running_lookup(f: &Fixture, env: &[(&str, &str)]) -> std::process::Child {
+    let mut child = spawn_with(f, &STREAM, env);
+    let lines = stdout_lines(&mut child);
+    assert_eq!(next_line(&lines), STUDIO);
+    child
+}
+
+#[test]
+fn a_name_one_lookup_learned_is_in_every_later_passive_listing() {
+    use std::os::unix::fs::PermissionsExt;
+    let (f, sender, _) = peers_fixture();
+    let env = [("OMDROP_SENDER", sender.as_str()), ("LINK_LOCAL", "1")];
+    let unnamed = r#"{"mac": "e2:9d:03:6c:58:23", "rssi": -47, "name": null}"#;
+    let (out, _) = f.run(&["peers", "--json"], &env);
+    assert_eq!(text(&out.stdout), format!("[{unnamed}, {UNNAMED_HUME}]\n"));
+    let (out, _) = f.run(&["peers", "-n", "--json"], &env);
+    assert_eq!(text(&out.stdout), format!("[{STUDIO}, {HUME}]\n"));
+    let (out, _) = f.run(&["peers", "--json"], &env);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("[{STUDIO}, {HUME}]\n"));
+    assert_eq!(lookups(&f), 1, "a passive listing transmits nothing");
+    // The plain listing has no name column, and keeps none.
+    let (out, _) = f.run(&["peers"], &env);
+    assert!(
+        !text(&out.stdout).contains("Studio Mac"),
+        "{}",
+        text(&out.stdout)
+    );
+    let mode = |p: &str| {
+        std::fs::metadata(f.root.join(p))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(
+        (mode("run/omdrop"), mode("run/omdrop/peer-names.json")),
+        (0o700, 0o600)
+    );
+}
+
+#[test]
+fn a_second_named_lookup_follows_the_running_one_instead_of_starting_its_own() {
+    let (f, sender, gate) = peers_fixture();
+    let env = [
+        ("OMDROP_SENDER", sender.as_str()),
+        ("LINK_LOCAL", "1"),
+        ("GATE", gate.to_str().unwrap()),
+    ];
+    let first = running_lookup(&f, &env);
+    let mut second = spawn_with(&f, &STREAM, &env);
+    let lines = stdout_lines(&mut second);
+    // What the running lookup has learned so far, at once...
+    assert_eq!(next_line(&lines), STUDIO);
+    std::fs::write(&gate, "").unwrap();
+    // ...then what it learns, as it learns it, until it ends.
+    assert_eq!(next_line(&lines), HUME);
+    let out = finish_within(second, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        lines.recv_timeout(std::time::Duration::from_secs(1)).ok(),
+        None
+    );
+    let out = finish_within(first, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(lookups(&f), 1);
+}
+
+#[test]
+fn a_following_stream_still_ends_on_a_cancel_and_when_nobody_reads_it() {
+    use std::io::BufRead;
+    let (f, sender, gate) = peers_fixture();
+    let env = [
+        ("OMDROP_SENDER", sender.as_str()),
+        ("LINK_LOCAL", "1"),
+        ("GATE", gate.to_str().unwrap()),
+    ];
+    let first = running_lookup(&f, &env);
+
+    let mut cancelled = spawn_with(&f, &STREAM, &env);
+    let lines = stdout_lines(&mut cancelled);
+    assert_eq!(next_line(&lines), STUDIO);
+    signal(&cancelled, 15);
+    let out = finish_within(cancelled, std::time::Duration::from_secs(5));
+    assert_eq!(out.status.code(), Some(130));
+    assert!(
+        text(&out.stderr).contains("Cancelled."),
+        "{}",
+        text(&out.stderr)
+    );
+
+    // Its reader takes one line and goes away; the next row has nowhere to go.
+    let mut unread = spawn_with(&f, &STREAM, &env);
+    let stdout = unread.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        drop(reader);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("no line within 10 s");
+    assert_eq!(line.trim_end(), STUDIO);
+    std::fs::write(&gate, "").unwrap();
+    let out = finish_within(unread, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(141), "{}", text(&out.stderr));
+
+    let out = finish_within(first, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(lookups(&f), 1);
+}
+
+#[test]
+fn a_named_listing_while_a_lookup_runs_answers_from_its_names_alone() {
+    let (f, sender, gate) = peers_fixture();
+    let env = [
+        ("OMDROP_SENDER", sender.as_str()),
+        ("LINK_LOCAL", "1"),
+        ("GATE", gate.to_str().unwrap()),
+        // The running lookup outlasts this wait, which bounds the answer.
+        ("OMDROP_NAME_WAIT", "1"),
+    ];
+    let first = running_lookup(&f, &env);
+    let (out, _) = f.run(&["peers", "-n", "--json"], &env);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("[{STUDIO}, {UNNAMED_HUME}]\n"));
+    let (out, _) = f.run(&["peers", "-n"], &env);
+    assert_eq!(
+        text(&out.stdout),
+        "e2:9d:03:6c:58:23   -47 dBm  [fe80::1%awdl0]:8770  Studio Mac\n\
+         22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770\n"
+    );
+    assert_eq!(lookups(&f), 1);
+    std::fs::write(&gate, "").unwrap();
+    let out = finish_within(first, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
 #[test]
 fn the_identity_step_leaves_the_root_helper_its_core_dumps() {
     let f = Fixture::new();
