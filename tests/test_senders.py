@@ -1,6 +1,8 @@
 """`omdrop senders remove` has to revoke what the receiver matches."""
 
 import os
+import resource
+import signal
 import subprocess
 import sys
 import tempfile
@@ -50,6 +52,21 @@ class SendersTests(unittest.TestCase):
         self.assertEqual("# Friend@Example.com\nc@d.co\n", self.file.read_text())
         self.assertEqual({contacts.hash_identifier("c@d.co")},
                          contacts.known_hashes(self.file))
+
+    def test_a_failed_write_keeps_the_list(self):
+        self.senders("add", "keep@b.co", "remove@b.co")
+        before = self.file.read_bytes()
+
+        def no_writes():
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+        for op, sender in (("remove", "remove@b.co"), ("add", "new@b.co")):
+            r = subprocess.run([OMDROP, "senders", op, sender], env=self.env,
+                               capture_output=True, text=True, preexec_fn=no_writes)
+            self.assertNotEqual(0, r.returncode, r.stdout)
+            self.assertEqual(before, self.file.read_bytes())
+            self.assertEqual(["known-senders"], os.listdir(self.file.parent))
 
 
 if __name__ == "__main__":
