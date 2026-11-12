@@ -459,6 +459,15 @@ pub fn narrate(line: &str) -> Option<(bool, String)> {
     }
 }
 
+/// The sender's `UPLOAD progress <sent>/<total>` line, as owly's
+/// `\r<sent> / <total> bytes` step, which file managers already read.
+pub fn progress(line: &str) -> Option<String> {
+    let rest = line.split_once("UPLOAD progress ")?.1;
+    let (sent, total) = rest.trim().split_once('/')?;
+    let (sent, total) = (sent.parse::<u64>().ok()?, total.parse::<u64>().ok()?);
+    Some(format!("\r{sent} / {total} bytes"))
+}
+
 /// The sender's "<address> never opened 8770; on an iPhone, open a share
 /// sheet..." names a port and a macOS daemon. What the person can act on
 /// depends on the identity this computer is sending with: a self-signed one
@@ -514,16 +523,42 @@ fn send_narrated(cmd: &mut Command) -> i32 {
         }
     });
     let mut reader = LineReader::new(out_r);
+    // A progress step ends with no newline, so the next sentence starts on its own line.
+    let mut stepping = false;
     loop {
         match reader.read_line(None) {
-            Read1::Line(l) => match narrate(&String::from_utf8_lossy(&l)) {
-                Some((false, s)) => outln!("{s}"),
-                Some((true, s)) => errln!("{s}"),
-                None => {}
-            },
-            Read1::Signal => cancelled(Some(&mut child)),
+            Read1::Line(l) => {
+                let line = String::from_utf8_lossy(&l);
+                if let Some(step) = progress(&line) {
+                    let mut err = std::io::stderr().lock();
+                    let _ = std::io::Write::write_all(&mut err, step.as_bytes())
+                        .and_then(|()| std::io::Write::flush(&mut err));
+                    stepping = true;
+                    continue;
+                }
+                let Some((error, s)) = narrate(&line) else {
+                    continue;
+                };
+                if std::mem::take(&mut stepping) {
+                    errln!("");
+                }
+                if error {
+                    errln!("{s}");
+                } else {
+                    outln!("{s}");
+                }
+            }
+            Read1::Signal => {
+                if stepping {
+                    errln!("");
+                }
+                cancelled(Some(&mut child))
+            }
             Read1::Eof | Read1::Timeout => break,
         }
+    }
+    if stepping {
+        errln!("");
     }
     let rc = wait_cancellable(&mut child, None).unwrap_or(1);
     // The sender's stderr can outlive it (an advertiser it started still
@@ -1074,6 +1109,18 @@ mod tests {
             r#"[{"mac": "22:8b:38:31:89:4e", "rssi": -34, "name": "hume"}, {"mac": "b2:c4:98:5e:e6:be", "rssi": null, "name": null}, {"mac": "f2:f2:ee:c4:5a:f7", "rssi": null, "name": "Brent's iPhone"}]"#
         );
         assert_eq!(peers_json(""), "[]");
+    }
+
+    #[test]
+    fn upload_progress_becomes_owlys_byte_step_and_no_sentence() {
+        let line = "2026-11-12 01:00:00,000 INFO send: +  2.50s UPLOAD progress 65536/52428800";
+        assert_eq!(progress(line), Some("\r65536 / 52428800 bytes".into()));
+        assert_eq!(narrate(line), None, "a step is not a sentence");
+        assert_eq!(
+            progress("+2.72s UPLOAD photo.jpg -> ok (2493 B, 0.62s)"),
+            None
+        );
+        assert_eq!(progress("+1.00s UPLOAD progress lots/52428800"), None);
     }
 
     #[test]

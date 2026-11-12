@@ -143,10 +143,11 @@ impl Fixture {
             "#!/bin/sh\nif [ -n \"$VISIBLE\" ]; then echo '{\"visible\":true}'; else echo '{\"visible\":false}'; fi\n",
         );
         // send-to-peer: its help, one peer, and a send that says it is asking.
-        // HOLD_STDERR leaves a process of another session holding its stderr.
+        // HOLD_STDERR leaves a process of another session holding its stderr;
+        // UPLOADING stops partway through an upload.
         write_exec(
             &root.join("sender"),
-            "#!/bin/sh\ncase \"$1\" in\n  --help) echo '  [file ...] --url --names --stream'; exit 0 ;;\n  --list) echo 'e2:9d:03:6c:58:23   -47 dBm  [fe80::1%awdl0]:8770  Studio Mac'; exit 0 ;;\nesac\nprintf 'sender-helper %s\\n' \"$OMDROP_DISCOVERABLE\" >> \"$CAPTURE\"\necho '+0.41s FOUND x at y; asking'\n[ -n \"$HOLD_STDERR\" ] && (setsid sleep 8 >/dev/null &)\nexit 0\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --help) echo '  [file ...] --url --names --stream'; exit 0 ;;\n  --list) echo 'e2:9d:03:6c:58:23   -47 dBm  [fe80::1%awdl0]:8770  Studio Mac'; exit 0 ;;\nesac\nprintf 'sender-helper %s\\n' \"$OMDROP_DISCOVERABLE\" >> \"$CAPTURE\"\necho '+0.41s FOUND x at y; asking'\n[ -n \"$HOLD_STDERR\" ] && (setsid sleep 8 >/dev/null &)\n[ -n \"$UPLOADING\" ] && { echo '+0.50s UPLOAD progress 65536/52428800'; exec sleep 8; }\nexit 0\n",
         );
         let capture = root.join("events");
         std::fs::write(&capture, "").unwrap();
@@ -843,6 +844,33 @@ fn finish_within(child: std::process::Child, limit: std::time::Duration) -> Outp
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_send_cancelled_mid_upload_says_cancelled_on_its_own_line() {
+    let f = Fixture::new();
+    let file = f.root.join("photo.jpg");
+    std::fs::write(&file, "x").unwrap();
+    let sender = f.root.join("sender");
+    let child = spawn_with(
+        &f,
+        &["send", "--to", "e2:9d:03:6c:58:23", file.to_str().unwrap()],
+        &[
+            ("OMDROP_SENDER", sender.to_str().unwrap()),
+            ("LINK_LOCAL", "1"),
+            ("VISIBLE", "1"),
+            ("UPLOADING", "1"),
+        ],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    signal(&child, 2);
+    let out = finish_within(child, std::time::Duration::from_secs(3));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(130), "{err}");
+    assert!(
+        err.contains("\r65536 / 52428800 bytes\nCancelled.\n"),
+        "{err:?}"
+    );
 }
 
 #[test]
