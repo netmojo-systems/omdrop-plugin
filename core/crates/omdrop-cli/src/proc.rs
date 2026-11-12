@@ -311,19 +311,46 @@ fn set_handler(handler: libc::sighandler_t) {
     }
 }
 
+/// Set by [`hold_signals`]: an outer trap that inner traps must neither reset nor lift.
+static HELD: AtomicBool = AtomicBool::new(false);
+
 /// `trap '...' TERM INT HUP`: from here a signal is a flag to poll.
 pub fn trap_signals() {
-    CAUGHT.store(0, Ordering::SeqCst);
+    if !HELD.load(Ordering::SeqCst) {
+        CAUGHT.store(0, Ordering::SeqCst);
+    }
     set_handler(on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
 }
 
 /// `trap - TERM INT HUP`. A signal that arrived after the last check still
-/// gets the trap bash would have run for it.
+/// gets the trap bash would have run for it. Under [`hold_signals`] the trap
+/// stays, for the holder to act on.
 pub fn untrap_signals() {
+    if HELD.load(Ordering::SeqCst) {
+        return;
+    }
     if caught().is_some() {
         cancelled(None);
     }
     set_handler(libc::SIG_DFL);
+}
+
+/// A trap for work with an undo of its own: every inner trap keeps it and
+/// every inner untrap leaves it, until [`release_signals_or`].
+pub fn hold_signals() {
+    trap_signals();
+    HELD.store(true, Ordering::SeqCst);
+}
+
+/// Lifts [`hold_signals`]: back to the default action first, so a signal
+/// that came before is seen here and runs `undo`, and one after is the
+/// default's.
+pub fn release_signals_or(undo: impl FnOnce()) {
+    HELD.store(false, Ordering::SeqCst);
+    set_handler(libc::SIG_DFL);
+    if caught().is_some() {
+        undo();
+    }
 }
 
 /// Back to the default action, forgetting a signal that was already acted

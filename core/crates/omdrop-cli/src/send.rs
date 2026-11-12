@@ -413,33 +413,20 @@ pub fn cmd_send(args: &[OsString]) -> i32 {
     send_narrated(&mut cmd)
 }
 
-/// `omdrop on` for a send that found Omdrop off. A cancel while it runs
-/// leaves Omdrop as it was: `on` undoes a start it was interrupted in and
-/// says so by exiting 130; any other ending (killed outside its own undo, or
-/// a start that finished as the cancel came) is turned off here. A receiver
-/// that was already running with the radio down is left alone.
+/// `omdrop on` for a send that found Omdrop off. A cancel while it runs is
+/// passed on, and `on` undoes its start under its own identity lock, so no
+/// other window can be caught by the undo. A cancel that arrives once `on`
+/// has finished leaves its window open, as after any `omdrop on`.
 fn auto_start(omdrop: &Path) {
-    let receiver_was_up = crate::status::receiving();
-    let outcome = crate::proc::run_no_stdout_forwarding(omdrop, &["on"]);
-    let cancelled_meanwhile = crate::proc::caught().is_some();
-    match outcome {
-        Forwarded::Cancelled(Some(UNDONE)) => cancelled(None),
-        Forwarded::Cancelled(_) | Forwarded::Exited(0) if cancelled_meanwhile => {
-            if !receiver_was_up {
-                crate::window::off_under_lock();
-            }
-            cancelled(None)
-        }
+    match crate::proc::run_no_stdout_forwarding(omdrop, &["on"]) {
         Forwarded::Exited(0) => untrap_signals(),
-        _ => {
+        Forwarded::Cancelled(_) => cancelled(None),
+        Forwarded::Exited(_) => {
             untrap_signals();
             die("Omdrop could not be turned on, so nothing was sent.");
         }
     }
 }
-
-/// The exit status of a command that undid its work on a cancel and said "Cancelled.".
-const UNDONE: i32 = 130;
 
 /// The sender speaks in debug log lines, deliberately: a transfer that goes
 /// wrong is a protocol problem and that log is how it gets diagnosed.

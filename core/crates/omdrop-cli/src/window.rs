@@ -175,6 +175,9 @@ pub fn cmd_on(args: &[String]) -> i32 {
     // lock, so `off` can interrupt it. Then, under the lock, `window`
     // refuses if an `off` ran meanwhile, and otherwise fixes this window's
     // identity; the lock is held until the receiver and radio are up.
+    // From here to the end a cancel is a flag, acted on between steps by
+    // undoing whatever has started, so `omdrop send` can rely on it.
+    crate::proc::hold_signals();
     let name = effective_name();
     let begun = id(&["begin", "--name", &name], Out::Capture, true);
     if begun.code != 0 {
@@ -188,10 +191,14 @@ pub fn cmd_on(args: &[String]) -> i32 {
             identity_notice(v);
         }
     }
+    if caught().is_some() {
+        crate::proc::cancelled(None);
+    }
     let lock = identity_lock();
     let win = id(&["window", "--seq", &seq], Out::Capture, true);
     if win.code == 3 {
         drop(lock);
+        crate::proc::release_signals_or(|| crate::proc::cancelled(None));
         errln!("Omdrop was turned off while it was starting.");
         return 0;
     }
@@ -213,6 +220,14 @@ pub fn cmd_on(args: &[String]) -> i32 {
         id(&["stop-begin"], Out::Null, false);
         id(&["stop-end"], Out::Null, false);
     };
+    let cancelled_before_radio = || {
+        if caught().is_some() {
+            cancel_window();
+            identity_abort();
+            crate::proc::cancelled(None);
+        }
+    };
+    cancelled_before_radio();
 
     cancel_window();
     let self_exe = c.command_path().to_string_lossy().into_owned();
@@ -270,6 +285,7 @@ pub fn cmd_on(args: &[String]) -> i32 {
     if run("systemd-run", &watch) != 0 {
         errln!("receiving, but nothing is watching for arrivals");
     }
+    cancelled_before_radio();
 
     // Receiver FIRST when it can start, radio second: a window once
     // advertised 16 s before the receiver listened, and 45 SYNs were answered
@@ -289,9 +305,9 @@ pub fn cmd_on(args: &[String]) -> i32 {
             err
         })
     };
-    // A start cancelled while the radio comes up is undone like a failed
-    // one before saying "Cancelled.": the bash died there and left the
-    // receiver up with no window (deliberately different).
+    // A start cancelled while the radio comes up, or at any step after, is
+    // undone like a failed one before saying "Cancelled.": the bash died
+    // there and left the receiver up with no window (deliberately different).
     let undo_and_cancel = |receiver_up: bool| -> ! {
         cancel_window();
         if receiver_up {
@@ -306,6 +322,9 @@ pub fn cmd_on(args: &[String]) -> i32 {
             cancel_window();
             identity_abort();
             die("The AirDrop receiver would not start.");
+        }
+        if caught().is_some() {
+            undo_and_cancel(true);
         }
         match radio_up(&radio_secs) {
             Radio::Up => {}
@@ -338,6 +357,9 @@ pub fn cmd_on(args: &[String]) -> i32 {
             die("The AirDrop receiver would not start.");
         }
     }
+    if caught().is_some() {
+        undo_and_cancel(true);
+    }
 
     // Receiving works from here, so this is where the clock starts. The
     // radio's own deadline began with the gate, so ask it for the window
@@ -367,6 +389,7 @@ pub fn cmd_on(args: &[String]) -> i32 {
             );
         }
     }
+    crate::proc::release_signals_or(|| undo_and_cancel(true));
     drop(lock);
     crate::status::cmd_status(&[])
 }
@@ -641,7 +664,7 @@ pub fn cmd_off(args: &[String]) -> i32 {
 /// Under the identity lock, in this order: nothing that starts later can
 /// publish into this window; the receiver stops before the identity it
 /// loaded is released; the window file goes last.
-pub(crate) fn off_under_lock() {
+fn off_under_lock() {
     let lock = identity_lock();
     off_locked();
     drop(lock);
