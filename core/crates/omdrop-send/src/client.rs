@@ -3,7 +3,7 @@
 //! it (airdrop-send.py's `AirDropClient`).
 
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -515,12 +515,18 @@ impl<'a> Client<'a> {
                 inner: dvzip,
                 count: 0,
             });
+            let mut meter = Meter::new(log, total);
             for f in files {
                 let mut data = &f.file;
                 data.seek(SeekFrom::Start(0))?;
                 let meta = f.file.metadata()?;
-                cpio.append_file(&f.name, &meta, &mut data)?;
+                let mut metered = Metered {
+                    inner: data,
+                    meter: &mut meter,
+                };
+                cpio.append_file(&f.name, &meta, &mut metered)?;
             }
+            meter.finish();
             let counted = cpio.finish()?;
             cpio_bytes = counted.count;
             let wire = counted.inner.finish()?;
@@ -564,6 +570,71 @@ impl<'a> Client<'a> {
             }
         }
         result.map(|(ok, _)| ok)
+    }
+}
+
+/// How often an upload reports its progress, at most.
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+
+/// An upload's file bytes against `TotalBytes`, as `UPLOAD progress <sent>/<total>`
+/// send lines; `omdrop send` turns them into `\r<sent> / <total> bytes`.
+struct Meter<'l> {
+    log: &'l Logger,
+    total: u64,
+    sent: u64,
+    shown: Option<(u64, Instant)>,
+}
+
+impl<'l> Meter<'l> {
+    fn new(log: &'l Logger, total: u64) -> Self {
+        Meter {
+            log,
+            total,
+            sent: 0,
+            shown: None,
+        }
+    }
+
+    fn add(&mut self, n: u64) {
+        self.sent += n;
+        if self
+            .shown
+            .is_none_or(|(_, at)| at.elapsed() >= PROGRESS_EVERY)
+        {
+            self.show();
+        }
+    }
+
+    /// The last step, so the final count is always reported.
+    fn finish(&mut self) {
+        if self.shown.is_none_or(|(sent, _)| sent != self.sent) {
+            self.show();
+        }
+    }
+
+    fn show(&mut self) {
+        let line = format!(
+            "{} UPLOAD progress {}/{}",
+            self.log.t(),
+            self.sent,
+            self.total
+        );
+        self.log.send(&line);
+        self.shown = Some((self.sent, Instant::now()));
+    }
+}
+
+/// A file read into the archive, counted as it goes.
+struct Metered<'m, 'l, R: Read> {
+    inner: R,
+    meter: &'m mut Meter<'l>,
+}
+
+impl<R: Read> Read for Metered<'_, '_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.meter.add(n as u64);
+        Ok(n)
     }
 }
 

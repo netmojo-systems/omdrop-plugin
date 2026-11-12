@@ -199,10 +199,26 @@ fn exercise(rx: &Receiver) {
     big.resize(50 << 20, 0);
     std::fs::write(path("big.bin"), &big).unwrap();
     let out = send(rx, &[path("big.bin")]);
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(log.contains(&format!("UPLOAD big.bin -> ok ({} B, ", 50 << 20)));
+    let steps: Vec<(u64, u64)> = log
+        .lines()
+        .filter_map(|l| l.split_once("UPLOAD progress ")?.1.split_once('/'))
+        .map(|(sent, total)| (sent.parse().unwrap(), total.trim().parse().unwrap()))
+        .collect();
+    let total = 50u64 << 20;
     assert!(
-        String::from_utf8_lossy(&out.stdout)
-            .contains(&format!("UPLOAD big.bin -> ok ({} B, ", 50 << 20))
+        steps.first().is_some_and(|&(sent, _)| sent < total),
+        "an intermediate step comes before the end: {steps:?}"
     );
+    assert_eq!(
+        steps.last(),
+        Some(&(total, total)),
+        "the last step is the whole file"
+    );
+    assert!(steps.windows(2).all(|w| w[0].0 < w[1].0), "{steps:?}");
+    let done = log.find("UPLOAD big.bin -> ok").unwrap();
+    assert!(log.rfind("UPLOAD progress ").is_some_and(|at| at < done));
     assert!(
         wait_for(&rx.outdir.join("big.bin"), big.len()) == big,
         "big.bin differs"
@@ -237,6 +253,10 @@ fn exercise(rx: &Receiver) {
     let url = "https://example.com/omdrop?interop=1";
     let out = send(rx, &["--url".to_owned(), url.to_owned()]);
     assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("LINK {url} -> ok")));
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("UPLOAD progress "),
+        "a link has no upload, so no progress"
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let found = std::fs::read_dir(&rx.outdir)
