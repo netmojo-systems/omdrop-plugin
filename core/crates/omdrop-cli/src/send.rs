@@ -20,7 +20,7 @@ use crate::ctx::{DEFAULT_SEND_WAIT, DEFAULT_WINDOW, ctx};
 use crate::driver::{awdl_link_local, radio_pkg, radio_update};
 use crate::identity::{Out, id};
 use crate::proc::{
-    LineReader, Read1, cancelled, capture_merged, pipe, run_cancellable, spawn_group,
+    Forwarded, LineReader, Read1, cancelled, capture_merged, pipe, run_cancellable, spawn_group,
     spawn_session, stop_group, trap_signals, untrap_signals, wait_cancellable,
 };
 use crate::util::{
@@ -374,9 +374,7 @@ pub fn cmd_send(args: &[OsString]) -> i32 {
         outln!(
             "Omdrop is off. Turning it on for {DEFAULT_WINDOW}, so nearby devices can be heard..."
         );
-        if crate::proc::run_no_stdout(c.command_path(), &["on"]) != 0 {
-            die("Omdrop could not be turned on, so nothing was sent.");
-        }
+        auto_start(c.command_path());
         if !radio_on() {
             die(
                 "Omdrop turned on, but the radio is not up yet, so nothing was sent. Try again in a few seconds.",
@@ -413,6 +411,21 @@ pub fn cmd_send(args: &[OsString]) -> i32 {
         return run_cancellable(&mut cmd);
     }
     send_narrated(&mut cmd)
+}
+
+/// `omdrop on` for a send that found Omdrop off. A cancel while it runs is
+/// passed on, and `on` undoes its start under its own identity lock, so no
+/// other window can be caught by the undo. A cancel that arrives once `on`
+/// has finished leaves its window open, as after any `omdrop on`.
+fn auto_start(omdrop: &Path) {
+    match crate::proc::run_no_stdout_forwarding(omdrop, &["on"]) {
+        Forwarded::Exited(0) => untrap_signals(),
+        Forwarded::Cancelled(_) => cancelled(None),
+        Forwarded::Exited(_) => {
+            untrap_signals();
+            die("Omdrop could not be turned on, so nothing was sent.");
+        }
+    }
 }
 
 /// The sender speaks in debug log lines, deliberately: a transfer that goes

@@ -65,6 +65,71 @@ pub fn run_no_stdout<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> i3
     }
 }
 
+/// How a child run by [`run_no_stdout_forwarding`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forwarded {
+    /// It exited by itself with this status.
+    Exited(i32),
+    /// A TERM, INT or HUP reached us and was passed on; the child then exited with this status.
+    Cancelled(i32),
+}
+
+/// `prog args >/dev/null` with TERM, INT and HUP trapped from before the
+/// spawn. A signal is passed on to the child alone, which owns undoing its
+/// work: it is waited for, never killed, since a kill mid-undo leaves more
+/// behind than a slow undo. The trap stays in place whichever way it ends,
+/// so the caller decides when to [`untrap_signals`]. The child stays in our
+/// process group, so a password prompt keeps the terminal and a Ctrl-C
+/// reaches it directly.
+pub fn run_no_stdout_forwarding<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> Forwarded {
+    let prog = prog.as_ref();
+    trap_signals();
+    let mut child = match Command::new(prog).args(args).stdout(Stdio::null()).spawn() {
+        Ok(c) => c,
+        Err(e) => return Forwarded::Exited(spawn_failed(prog, &e)),
+    };
+    let mut forwarded = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) if forwarded => return Forwarded::Cancelled(code_of(s)),
+            Ok(Some(s)) => return Forwarded::Exited(code_of(s)),
+            Ok(None) => {}
+            Err(_) => return Forwarded::Exited(1),
+        }
+        if !forwarded && caught().is_some() {
+            forwarded = true;
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: kill(2) on our own unreaped child's pid.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Runs `cmd` until it exits or a trapped signal arrives: its status, or
+/// `None` on a cancel, when the child is killed if it can be and left to
+/// finish if not (a root helper), as `radio_up` leaves one.
+pub fn run_unless_cancelled(cmd: &mut Command) -> Option<i32> {
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Some(spawn_failed(cmd.get_program(), &e)),
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => return Some(code_of(s)),
+            Ok(None) => {}
+            Err(_) => return Some(1),
+        }
+        if caught().is_some() {
+            let _ = child.kill();
+            let _ = child.try_wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `$(prog args 2>/dev/null)`: the status and the raw output.
 pub fn capture<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> (i32, Vec<u8>) {
     capture_cmd(Command::new(prog.as_ref()).args(args).stderr(Stdio::null()))
@@ -253,19 +318,46 @@ fn set_handler(handler: libc::sighandler_t) {
     }
 }
 
+/// Set by [`hold_signals`]: an outer trap that inner traps must neither reset nor lift.
+static HELD: AtomicBool = AtomicBool::new(false);
+
 /// `trap '...' TERM INT HUP`: from here a signal is a flag to poll.
 pub fn trap_signals() {
-    CAUGHT.store(0, Ordering::SeqCst);
+    if !HELD.load(Ordering::SeqCst) {
+        CAUGHT.store(0, Ordering::SeqCst);
+    }
     set_handler(on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
 }
 
 /// `trap - TERM INT HUP`. A signal that arrived after the last check still
-/// gets the trap bash would have run for it.
+/// gets the trap bash would have run for it. Under [`hold_signals`] the trap
+/// stays, for the holder to act on.
 pub fn untrap_signals() {
+    if HELD.load(Ordering::SeqCst) {
+        return;
+    }
     if caught().is_some() {
         cancelled(None);
     }
     set_handler(libc::SIG_DFL);
+}
+
+/// A trap for work with an undo of its own: every inner trap keeps it and
+/// every inner untrap leaves it, until [`release_signals_or`].
+pub fn hold_signals() {
+    trap_signals();
+    HELD.store(true, Ordering::SeqCst);
+}
+
+/// Lifts [`hold_signals`]: back to the default action first, so a signal
+/// that came before is seen here and runs `undo`, and one after is the
+/// default's.
+pub fn release_signals_or(undo: impl FnOnce()) {
+    HELD.store(false, Ordering::SeqCst);
+    set_handler(libc::SIG_DFL);
+    if caught().is_some() {
+        undo();
+    }
 }
 
 /// Back to the default action, forgetting a signal that was already acted
