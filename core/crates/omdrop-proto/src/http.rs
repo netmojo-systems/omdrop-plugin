@@ -538,8 +538,17 @@ impl<'a, R: BufRead> BodyReader<'a, R> {
                 }
                 Some(Chunk::End) => {
                     let mut ending = [0u8; 2];
-                    let n = crate::archive::read_full(self.r, &mut ending)?;
-                    self.deadline.note(n).map_err(BodyError::into_io)?;
+                    let mut n = 0;
+                    while n < ending.len() {
+                        let got = match self.r.read(&mut ending[n..]) {
+                            Ok(0) => break,
+                            Ok(got) => got,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(e) => return Err(e),
+                        };
+                        n += got;
+                        self.deadline.note(got).map_err(BodyError::into_io)?;
+                    }
                     if n != 2 || ending != *b"\r\n" {
                         return Err(BodyError::Invalid("chunk data missing CRLF".into()).into_io());
                     }
@@ -1002,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chunk_line_trickled_past_the_deadline_stops_at_the_next_read() {
+    fn chunk_framing_trickled_past_the_deadline_stops_at_the_next_read() {
         /// Hands over one byte per read, as a sender sending one TLS record each.
         struct Trickle<'a>(&'a [u8], usize);
         impl Read for Trickle<'_> {
@@ -1034,6 +1043,22 @@ mod tests {
         ));
         drop(r);
         assert_eq!(trickle.1, 1);
+
+        // The CRLF after chunk data: the deadline passes after the CR.
+        let mut deadline = ReadDeadline::new();
+        let mut trickle = Trickle(b"1\r\nx\r\n0\r\n\r\n", 0);
+        let mut r = io::BufReader::with_capacity(1, &mut trickle);
+        let mut body = BodyReader::new(&mut r, BodyPlan::Chunked, 1 << 20, &mut deadline);
+        let mut x = [0u8; 1];
+        assert_eq!(body.read(&mut x).unwrap(), 1);
+        *body.deadline = ReadDeadline::started_at(started);
+        let err = body.read(&mut x).unwrap_err();
+        assert!(matches!(
+            BodyError::classify(err),
+            Ok(BodyError::Timeout(Stall::Rate))
+        ));
+        drop(r);
+        assert_eq!(trickle.1, 5);
     }
 
     #[test]
