@@ -965,6 +965,46 @@ fn a_start_cancelled_while_the_radio_comes_up_is_undone() {
 }
 
 #[test]
+fn a_send_cancelled_while_it_turns_omdrop_on_undoes_that_start() {
+    let f = Fixture::new();
+    let file = f.root.join("photo.jpg");
+    std::fs::write(&file, "x").unwrap();
+    let sender = f.root.join("sender");
+    let child = spawn_with(
+        &f,
+        &["send", "Studio Mac", file.to_str().unwrap()],
+        &[
+            ("OMDROP_SENDER", sender.to_str().unwrap()),
+            ("RADIO_SLEEP", "5"),
+        ],
+    );
+    let start = std::time::Instant::now();
+    while !std::fs::read_to_string(&f.capture)
+        .unwrap()
+        .contains(" start 600")
+    {
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "the automatic on never started the radio"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // TERM to `omdrop send` alone, as a file manager's Cancel sends it.
+    signal(&child, 15);
+    let out = finish_within(child, std::time::Duration::from_secs(10));
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    assert_eq!(out.status.code(), Some(130), "{ev}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cancelled."));
+    let stop = format!("pkexec {} stop", f.helper.display());
+    assert!(
+        first(&ev, " start 600") < first(&ev, &stop),
+        "the start was undone:\n{ev}"
+    );
+    assert!(ev.contains("identity stop-end"), "{ev}");
+    assert!(!ev.contains("sender-helper"), "nothing was sent:\n{ev}");
+}
+
+#[test]
 fn a_plugin_outside_the_default_directory_is_found_again_by_what_omdrop_starts() {
     // The fixture's plugin is under the test root, not ~/.config/omarchy/plugins.
     let f = Fixture::new();

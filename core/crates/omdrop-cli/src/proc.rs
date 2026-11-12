@@ -65,6 +65,60 @@ pub fn run_no_stdout<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> i3
     }
 }
 
+/// How long a cancelled `omdrop on` gets to undo its start before it is killed.
+const UNDO_GRACE: Duration = Duration::from_secs(15);
+
+/// `prog args >/dev/null` for a child that undoes its own work when
+/// signalled, as `omdrop on` does. A TERM, INT or HUP here is passed on to
+/// it, it gets [`UNDO_GRACE`] to finish undoing, and then this says
+/// "Cancelled." and exits 130. The child stays in our process group, so a
+/// password prompt keeps the terminal and a Ctrl-C reaches it directly.
+pub fn run_no_stdout_undoable<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> i32 {
+    let prog = prog.as_ref();
+    trap_signals();
+    let mut child = match Command::new(prog).args(args).stdout(Stdio::null()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            untrap_signals();
+            return spawn_failed(prog, &e);
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                untrap_signals();
+                return code_of(s);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                untrap_signals();
+                return 1;
+            }
+        }
+        if caught().is_some() {
+            undo_then_cancel(&mut child);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// TERM to the child alone, a bounded wait for its own undo, then KILL.
+fn undo_then_cancel(child: &mut Child) -> ! {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: kill(2) on our own unreaped child's pid.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    let until = Instant::now() + UNDO_GRACE;
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    cancelled(None)
+}
+
 /// `$(prog args 2>/dev/null)`: the status and the raw output.
 pub fn capture<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> (i32, Vec<u8>) {
     capture_cmd(Command::new(prog.as_ref()).args(args).stderr(Stdio::null()))

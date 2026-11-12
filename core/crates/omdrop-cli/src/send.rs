@@ -374,7 +374,8 @@ pub fn cmd_send(args: &[OsString]) -> i32 {
         outln!(
             "Omdrop is off. Turning it on for {DEFAULT_WINDOW}, so nearby devices can be heard..."
         );
-        if crate::proc::run_no_stdout(c.command_path(), &["on"]) != 0 {
+        // A cancel while it starts lets `on` undo itself before "Cancelled.".
+        if crate::proc::run_no_stdout_undoable(c.command_path(), &["on"]) != 0 {
             die("Omdrop could not be turned on, so nothing was sent.");
         }
         if !radio_on() {
