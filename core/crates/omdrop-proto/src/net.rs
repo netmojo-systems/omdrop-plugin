@@ -18,7 +18,12 @@ pub fn interface_ipv6(iface: &str) -> Option<Ipv6Addr> {
 }
 
 fn parse_if_inet6(text: &str, iface: &str) -> Option<Ipv6Addr> {
-    text.lines().find_map(|line| {
+    if_inet6_rows(text, iface).next().map(|(addr, _)| addr)
+}
+
+/// `iface`'s addresses and their interface index, in `/proc/net/if_inet6` order.
+fn if_inet6_rows<'a>(text: &'a str, iface: &'a str) -> impl Iterator<Item = (Ipv6Addr, u32)> + 'a {
+    text.lines().filter_map(move |line| {
         let row: Vec<&str> = line.split_whitespace().collect();
         if row.len() != 6 || row[5] != iface || row[0].len() != 32 {
             return None;
@@ -27,7 +32,28 @@ fn parse_if_inet6(text: &str, iface: &str) -> Option<Ipv6Addr> {
         for (i, octet) in octets.iter_mut().enumerate() {
             *octet = u8::from_str_radix(row[0].get(2 * i..2 * i + 2)?, 16).ok()?;
         }
-        Some(Ipv6Addr::from(octets))
+        let index = u32::from_str_radix(row[1], 16).ok()?;
+        Some((Ipv6Addr::from(octets), index))
+    })
+}
+
+/// Whether a connection whose local end is `local` arrived on `iface`: a
+/// link-local address `iface` holds now, scoped to `iface`'s index, which the
+/// kernel sets to the interface it came in on. Any other address proves
+/// nothing about ingress, since Linux accepts one held by any interface,
+/// except loopback, which arrives only on `lo`.
+pub fn arrived_on(local: &SocketAddrV6, iface: &str) -> bool {
+    std::fs::read_to_string("/proc/net/if_inet6").is_ok_and(|text| local_is_on(&text, local, iface))
+}
+
+fn local_is_on(text: &str, local: &SocketAddrV6, iface: &str) -> bool {
+    if_inet6_rows(text, iface).any(|(addr, index)| {
+        addr == *local.ip()
+            && if addr.is_unicast_link_local() {
+                local.scope_id() == index
+            } else {
+                addr.is_loopback()
+            }
     })
 }
 
@@ -133,5 +159,30 @@ mod tests {
             Some("fe80::e09d:3ff:fe6c:5823".parse().unwrap())
         );
         assert_eq!(parse_if_inet6(text, "wlan0"), None);
+    }
+
+    #[test]
+    fn only_connections_to_the_interface_are_on_it() {
+        let text = "00000000000000000000000000000001 01 80 10 80       lo\n\
+                    fe80000000000000e09d03fffe6c5823 05 40 20 80    awdl0\n\
+                    fe80000000000000aaaaaafffeaaaaaa 0b 40 20 80    wlan0\n\
+                    20010db8000000000000000000000001 0b 40 00 80    wlan0\n\
+                    20010db8000000000000000000000002 05 40 00 80    awdl0\n";
+        let on = |addr: &str, scope, iface| {
+            local_is_on(
+                text,
+                &SocketAddrV6::new(addr.parse().unwrap(), 8771, 0, scope),
+                iface,
+            )
+        };
+        assert!(on("fe80::e09d:3ff:fe6c:5823", 5, "awdl0"));
+        // awdl0's address scoped to another interface, then wlan0's own addresses.
+        assert!(!on("fe80::e09d:3ff:fe6c:5823", 11, "awdl0"));
+        assert!(!on("fe80::a8aa:aaff:feaa:aaaa", 11, "awdl0"));
+        assert!(!on("2001:db8::1", 0, "awdl0"));
+        // A global address awdl0 holds: Linux accepts it from any interface.
+        assert!(!on("2001:db8::2", 0, "awdl0"));
+        assert!(!on("::ffff:192.0.2.1", 0, "awdl0"));
+        assert!(on("::1", 0, "lo"));
     }
 }

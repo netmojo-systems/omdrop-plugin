@@ -8,6 +8,7 @@ sharingd does: chunked /Discover and /Ask bodies, then /Ask and a DVZip
 
 import gzip
 import http.client
+import ipaddress
 import hashlib
 import json
 import os
@@ -364,6 +365,68 @@ class StalledHandshakeTests(ReceiverFixture):
                               plistlib.dumps({}, fmt=plistlib.FMT_BINARY))
         self.assertEqual(status, 200)
 
+
+class IngressTests(ReceiverFixture):
+    def test_a_connection_that_did_not_arrive_on_the_interface_is_closed_before_tls(self):
+        # The socket is dual-stack [::], so IPv4 loopback reaches it as
+        # ::ffff:127.0.0.1, an address lo does not hold in /proc/net/if_inet6.
+        try:
+            other = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        except ConnectionRefusedError:
+            self.skipTest("IPv6-only sockets (net.ipv6.bindv6only=1)")
+        self.addCleanup(other.close)
+        try:
+            self.assertEqual(b"", other.recv(1))
+        except ConnectionResetError:
+            pass
+        self.assertIn("did not arrive on lo", self.log.read_text())
+        status, _ = self.post(self.connection(), "/Discover",
+                              plistlib.dumps({}, fmt=plistlib.FMT_BINARY))
+        self.assertEqual(status, 200)
+
+
+
+def link_local_interface():
+    """A non-loopback interface with a link-local address: (name, address)."""
+    try:
+        with open("/proc/net/if_inet6") as f:
+            rows = [line.split() for line in f]
+    except OSError:
+        return None
+    for row in rows:
+        if len(row) == 6 and row[5] != "lo" and row[0].startswith("fe80"):
+            return row[5], str(ipaddress.IPv6Address(bytes.fromhex(row[0])))
+    return None
+
+
+LINK_LOCAL = link_local_interface()
+
+
+@unittest.skipUnless(LINK_LOCAL, "needs an interface with a link-local address")
+class LinkLocalIngressTests(ReceiverFixture):
+    """The kernel scopes an accepted link-local socket to the interface it
+    came in on; the receiver's check depends on it."""
+
+    @classmethod
+    def receiver_command(cls, *argv):
+        argv = list(argv)
+        argv[argv.index("lo")] = LINK_LOCAL[0]
+        return super().receiver_command(*argv)
+
+    def test_a_link_local_connection_on_the_interface_is_served_and_loopback_is_not(self):
+        iface, addr = LINK_LOCAL
+        conn = http.client.HTTPSConnection(f"{addr}%{iface}", self.port, timeout=10,
+                                           context=self.context())
+        self.addCleanup(conn.close)
+        status, _ = self.post(conn, "/Discover", plistlib.dumps({}, fmt=plistlib.FMT_BINARY))
+        self.assertEqual(status, 200)
+        loopback = socket.create_connection(("::1", self.port), timeout=5)
+        self.addCleanup(loopback.close)
+        try:
+            self.assertEqual(b"", loopback.recv(1))
+        except ConnectionResetError:
+            pass
+        self.assertIn(f"did not arrive on {iface}", self.log.read_text())
 
 def receiver_seconds(name):
     """One of the receiver's timeout constants, so the test follows its value."""

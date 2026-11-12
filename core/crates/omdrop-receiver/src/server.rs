@@ -204,6 +204,8 @@ pub struct Settings {
     pub known_senders_path: PathBuf,
     pub min_free_bytes: u64,
     pub limits: ConnLimits,
+    /// Connections that arrive on any other interface are refused.
+    pub iface: String,
 }
 
 pub struct Server {
@@ -593,6 +595,23 @@ impl Server {
                     continue;
                 }
             };
+            // The socket is the IPv6 wildcard, so refuse what came in on any
+            // other interface before it reaches TLS.
+            let arrived = match sock.local_addr() {
+                Ok(SocketAddr::V6(local)) => {
+                    omdrop_proto::net::arrived_on(&local, &self.settings.iface)
+                }
+                _ => false,
+            };
+            if !arrived {
+                warning!(
+                    "refusing [{}]:{}: it did not arrive on {}",
+                    host(&peer),
+                    peer.port(),
+                    self.settings.iface
+                );
+                continue;
+            }
             // A connection that opens and then carries no request is the
             // signature of a sender that gave up or a TLS handshake we lost,
             // invisible in the request log.
