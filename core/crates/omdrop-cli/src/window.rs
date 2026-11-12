@@ -195,6 +195,9 @@ pub fn cmd_on(args: &[String]) -> i32 {
         crate::proc::cancelled(None);
     }
     let lock = identity_lock();
+    // A repeated `on` re-arms a window that is already open, so a cancel
+    // finishes it rather than undoing what it found.
+    let repeated = c.window_file().exists();
     let win = id(&["window", "--seq", &seq], Out::Capture, true);
     if win.code == 3 {
         drop(lock);
@@ -221,13 +224,22 @@ pub fn cmd_on(args: &[String]) -> i32 {
         id(&["stop-end"], Out::Null, false);
     };
     let cancelled_before_radio = || {
-        if caught().is_some() {
+        if !repeated && caught().is_some() {
             cancel_window();
             identity_abort();
             crate::proc::cancelled(None);
         }
     };
     cancelled_before_radio();
+    // A blocking step after the hold gives way to a cancel, so the undo
+    // runs at once; a repeated `on` finishes its steps instead.
+    let step = |cmd: &mut Command| -> Option<i32> {
+        if repeated {
+            Some(cmd.status().map_or(127, crate::proc::code_of))
+        } else {
+            crate::proc::run_unless_cancelled(cmd)
+        }
+    };
 
     cancel_window();
     let self_exe = c.command_path().to_string_lossy().into_owned();
@@ -249,20 +261,18 @@ pub fn cmd_on(args: &[String]) -> i32 {
         let on_active = format!("--on-active={n}s");
         let on_calendar = format!("--on-calendar=@{}", now + n);
         let unit = format!("--unit={ID_EXPIRY}");
-        if run(
-            "systemd-run",
-            &[
-                "--user",
-                "--quiet",
-                &on_active,
-                &on_calendar,
-                &unit,
-                &self_exe,
-                "off",
-                "--force",
-            ],
-        ) != 0
-        {
+        let armed = step(Command::new("systemd-run").args([
+            "--user",
+            "--quiet",
+            &on_active,
+            &on_calendar,
+            &unit,
+            &self_exe,
+            "off",
+            "--force",
+        ]));
+        cancelled_before_radio();
+        if armed != Some(0) {
             identity_abort();
             die(
                 "The AirDrop receiver would not start: the identity cache's expiry could not be armed.",
@@ -282,7 +292,8 @@ pub fn cmd_on(args: &[String]) -> i32 {
         Mode::Timed => watch.extend(["--window", dur.as_str()]),
         Mode::Forever => {}
     }
-    if run("systemd-run", &watch) != 0 {
+    let watching = step(Command::new("systemd-run").args(&watch));
+    if watching != Some(0) && caught().is_none() {
         errln!("receiving, but nothing is watching for arrivals");
     }
     cancelled_before_radio();
@@ -323,11 +334,12 @@ pub fn cmd_on(args: &[String]) -> i32 {
             identity_abort();
             die("The AirDrop receiver would not start.");
         }
-        if caught().is_some() {
+        if !repeated && caught().is_some() {
             undo_and_cancel(true);
         }
         match radio_up(&radio_secs) {
             Radio::Up => {}
+            Radio::Cancelled if repeated => {}
             Radio::Cancelled => undo_and_cancel(true),
             Radio::Failed(err) => {
                 cancel_window();
@@ -340,6 +352,7 @@ pub fn cmd_on(args: &[String]) -> i32 {
     } else {
         match radio_up(&radio_secs) {
             Radio::Up => {}
+            Radio::Cancelled if repeated => {}
             Radio::Cancelled => undo_and_cancel(false),
             Radio::Failed(err) => {
                 cancel_window();
@@ -357,7 +370,7 @@ pub fn cmd_on(args: &[String]) -> i32 {
             die("The AirDrop receiver would not start.");
         }
     }
-    if caught().is_some() {
+    if !repeated && caught().is_some() {
         undo_and_cancel(true);
     }
 
@@ -367,29 +380,39 @@ pub fn cmd_on(args: &[String]) -> i32 {
     if mode == Mode::Timed {
         let on_active = format!("--on-active={dur}");
         let unit = format!("--unit={WINDOW}");
-        if run(
-            "systemd-run",
-            &[
-                "--user", "--quiet", &on_active, &unit, &self_exe, "off", "--force",
-            ],
-        ) != 0
-        {
+        let armed = step(Command::new("systemd-run").args([
+            "--user", "--quiet", &on_active, &unit, &self_exe, "off", "--force",
+        ]));
+        if armed.is_none() {
+            undo_and_cancel(true);
+        }
+        if armed != Some(0) {
             die(format!(
                 "receiving, but the {dur} window could not be armed -- turn it off yourself"
             ));
         }
         if helper {
-            run_quiet(
-                "pkexec",
-                &[
-                    c.discoverable.as_os_str(),
-                    "start".as_ref(),
-                    radio_secs.as_ref(),
-                ],
+            let rearmed = step(
+                Command::new("pkexec")
+                    .args([
+                        c.discoverable.as_os_str(),
+                        "start".as_ref(),
+                        radio_secs.as_ref(),
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
             );
+            if rearmed.is_none() {
+                undo_and_cancel(true);
+            }
         }
     }
-    crate::proc::release_signals_or(|| undo_and_cancel(true));
+    crate::proc::release_signals_or(|| {
+        if repeated {
+            crate::proc::cancelled(None);
+        }
+        undo_and_cancel(true);
+    });
     drop(lock);
     crate::status::cmd_status(&[])
 }

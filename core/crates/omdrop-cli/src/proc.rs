@@ -65,24 +65,22 @@ pub fn run_no_stdout<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> i3
     }
 }
 
-/// How long a cancelled `omdrop on` gets to finish: the radio helper's `down` hook alone may take 60 s.
-const UNDO_GRACE: Duration = Duration::from_secs(75);
-
 /// How a child run by [`run_no_stdout_forwarding`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Forwarded {
     /// It exited by itself with this status.
     Exited(i32),
-    /// A TERM, INT or HUP reached us and was passed on; its exit status, if it exited within [`UNDO_GRACE`].
-    Cancelled(Option<i32>),
+    /// A TERM, INT or HUP reached us and was passed on; the child then exited with this status.
+    Cancelled(i32),
 }
 
 /// `prog args >/dev/null` with TERM, INT and HUP trapped from before the
-/// spawn. A signal is passed on to the child alone, which gets
-/// [`UNDO_GRACE`] to finish before it is killed. The trap stays in place
-/// whichever way it ends, so the caller decides what a cancel undoes and
-/// when to [`untrap_signals`]. The child stays in our process group, so a
-/// password prompt keeps the terminal and a Ctrl-C reaches it directly.
+/// spawn. A signal is passed on to the child alone, which owns undoing its
+/// work: it is waited for, never killed, since a kill mid-undo leaves more
+/// behind than a slow undo. The trap stays in place whichever way it ends,
+/// so the caller decides when to [`untrap_signals`]. The child stays in our
+/// process group, so a password prompt keeps the terminal and a Ctrl-C
+/// reaches it directly.
 pub fn run_no_stdout_forwarding<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> Forwarded {
     let prog = prog.as_ref();
     trap_signals();
@@ -90,36 +88,45 @@ pub fn run_no_stdout_forwarding<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: 
         Ok(c) => c,
         Err(e) => return Forwarded::Exited(spawn_failed(prog, &e)),
     };
+    let mut forwarded = false;
     loop {
         match child.try_wait() {
+            Ok(Some(s)) if forwarded => return Forwarded::Cancelled(code_of(s)),
             Ok(Some(s)) => return Forwarded::Exited(code_of(s)),
             Ok(None) => {}
             Err(_) => return Forwarded::Exited(1),
         }
-        if caught().is_some() {
-            return Forwarded::Cancelled(forward_and_wait(&mut child));
+        if !forwarded && caught().is_some() {
+            forwarded = true;
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: kill(2) on our own unreaped child's pid.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// TERM to the child alone, a bounded wait for it, then KILL; its status if it exited by itself.
-fn forward_and_wait(child: &mut Child) -> Option<i32> {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // SAFETY: kill(2) on our own unreaped child's pid.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-    }
-    let until = Instant::now() + UNDO_GRACE;
+/// Runs `cmd` until it exits or a trapped signal arrives: its status, or
+/// `None` on a cancel, when the child is killed if it can be and left to
+/// finish if not (a root helper), as `radio_up` leaves one.
+pub fn run_unless_cancelled(cmd: &mut Command) -> Option<i32> {
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Some(spawn_failed(cmd.get_program(), &e)),
+    };
     loop {
-        if let Ok(Some(s)) = child.try_wait() {
-            return Some(code_of(s));
+        match child.try_wait() {
+            Ok(Some(s)) => return Some(code_of(s)),
+            Ok(None) => {}
+            Err(_) => return Some(1),
         }
-        if Instant::now() >= until {
+        if caught().is_some() {
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.try_wait();
             return None;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

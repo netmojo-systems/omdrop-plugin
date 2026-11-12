@@ -101,13 +101,13 @@ impl Fixture {
         write_exec(
             &bin.join("systemd-run"),
             &format!(
-                "#!/bin/sh\n{log}\ncase \"$*\" in *omdrop-identity-expiry*) exit \"${{ARM_RC:-0}}\" ;; *unit=omdrop-window\\ *) [ -n \"$WINDOW_ARM_SLEEP\" ] && sleep \"$WINDOW_ARM_SLEEP\" ;; esac\nexit 0\n"
+                "#!/bin/sh\n{log}\ncase \"$*\" in *omdrop-identity-expiry*) exit \"${{ARM_RC:-0}}\" ;; *unit=omdrop-window\\ *) [ -n \"$WINDOW_ARM_SLEEP\" ] && sleep \"$WINDOW_ARM_SLEEP\" >/dev/null 2>&1 ;; esac\nexit 0\n"
             ),
         );
         write_exec(
             &bin.join("pkexec"),
             &format!(
-                "#!/bin/sh\n{log}\nprintf 'pkexec-ulimit %s\\n' \"$(ulimit -Hc)\" >> \"$CAPTURE\"\n[ \"$1\" = --disable-internal-agent ] && exit 1\n[ \"$2\" = start ] || exit 0\n[ -n \"$RADIO_SLEEP\" ] && sleep \"$RADIO_SLEEP\"\n[ \"${{RADIO_RC:-0}}\" = 0 ] && exit 0\necho '12:00:08Z supervisor did not start' >&2\nexit \"$RADIO_RC\"\n"
+                "#!/bin/sh\n{log}\nprintf 'pkexec-ulimit %s\\n' \"$(ulimit -Hc)\" >> \"$CAPTURE\"\n[ \"$1\" = --disable-internal-agent ] && exit 1\n[ \"$2\" = stop ] && [ -n \"$RADIO_STOP_SLEEP\" ] && sleep \"$RADIO_STOP_SLEEP\"\n[ \"$2\" = start ] || exit 0\n[ -n \"$RADIO_SLEEP\" ] && sleep \"$RADIO_SLEEP\"\n[ \"${{RADIO_RC:-0}}\" = 0 ] && exit 0\necho '12:00:08Z supervisor did not start' >&2\nexit \"$RADIO_RC\"\n"
             ),
         );
         write_exec(
@@ -1044,6 +1044,109 @@ fn a_send_cancelled_after_the_radio_came_up_turns_off_what_its_start_left() {
     assert!(armed < first(&ev, &stop), "the radio was stopped:\n{ev}");
     assert!(ev.contains("identity stop-end"), "{ev}");
     assert!(!ev.contains("sender-helper"), "nothing was sent:\n{ev}");
+}
+
+#[test]
+fn a_repeated_on_cancelled_finishes_the_window_it_found_instead_of_undoing_it() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.root.join("run/omdrop")).unwrap();
+    std::fs::write(f.root.join("run/omdrop/window"), "source=self-signed\n").unwrap();
+    let child = spawn_with(
+        &f,
+        &["on", "10m"],
+        &[("ACTIVE", "active"), ("RADIO_SLEEP", "5")],
+    );
+    let start = std::time::Instant::now();
+    while !std::fs::read_to_string(&f.capture)
+        .unwrap()
+        .contains(" start 600")
+    {
+        assert!(start.elapsed().as_secs() < 10, "the radio never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    signal(&child, 15);
+    let out = finish_within(child, std::time::Duration::from_secs(10));
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    assert_eq!(out.status.code(), Some(130), "{ev}");
+    assert!(
+        !ev.contains("identity stop-begin"),
+        "the open window kept its identity:\n{ev}"
+    );
+    assert!(
+        !ev.contains("--user stop airdrop-receiver.service"),
+        "its receiver kept running:\n{ev}"
+    );
+    assert!(
+        first(&ev, " start 600") < first(&ev, "--unit=omdrop-window "),
+        "its deadline was armed again:\n{ev}"
+    );
+}
+
+/// `omdrop send "Studio Mac"` with Omdrop off, cancelled with TERM once
+/// `needle` shows the automatic `on` reached that step.
+fn cancel_send_at(f: &Fixture, needle: &str, env: &[(&str, &str)]) -> (Output, String) {
+    let file = f.root.join("photo.jpg");
+    std::fs::write(&file, "x").unwrap();
+    let sender = f.root.join("sender");
+    let mut all = vec![("OMDROP_SENDER", sender.to_str().unwrap())];
+    all.extend_from_slice(env);
+    let child = spawn_with(f, &["send", "Studio Mac", file.to_str().unwrap()], &all);
+    let start = std::time::Instant::now();
+    while !std::fs::read_to_string(&f.capture)
+        .unwrap()
+        .contains(needle)
+    {
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "the automatic on never reached {needle:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    signal(&child, 15);
+    let out = finish_within(child, std::time::Duration::from_secs(10));
+    (out, std::fs::read_to_string(&f.capture).unwrap())
+}
+
+#[test]
+fn a_cancel_during_a_step_that_never_returns_still_undoes_at_once() {
+    let f = Fixture::new();
+    // Window arming would block for a minute; the cancel must not wait for it.
+    let started = std::time::Instant::now();
+    let (out, ev) = cancel_send_at(&f, "--unit=omdrop-window ", &[("WINDOW_ARM_SLEEP", "60")]);
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "the undo waited for the step"
+    );
+    assert_eq!(out.status.code(), Some(130), "{ev}");
+    let armed = first(&ev, "--unit=omdrop-window ");
+    let stop = format!("pkexec {} stop", f.helper.display());
+    for undone in [
+        "--user stop airdrop-receiver.service",
+        &stop,
+        "stop omdrop-window.timer",
+        "identity stop-end",
+    ] {
+        assert!(
+            armed < ev.rfind(undone).unwrap_or(0),
+            "{undone:?} not after the arm:\n{ev}"
+        );
+    }
+}
+
+#[test]
+fn a_slow_radio_stop_during_the_undo_is_waited_for_to_the_end() {
+    let f = Fixture::new();
+    let (out, ev) = cancel_send_at(
+        &f,
+        " start 600",
+        &[("RADIO_SLEEP", "5"), ("RADIO_STOP_SLEEP", "3")],
+    );
+    assert_eq!(out.status.code(), Some(130), "{ev}");
+    let stop = format!("pkexec {} stop", f.helper.display());
+    assert!(
+        first(&ev, &stop) < first(&ev, "identity stop-end"),
+        "identity cleanup ran after the slow stop:\n{ev}"
+    );
 }
 
 #[test]
