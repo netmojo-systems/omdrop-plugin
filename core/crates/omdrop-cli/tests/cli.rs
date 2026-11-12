@@ -101,7 +101,7 @@ impl Fixture {
         write_exec(
             &bin.join("systemd-run"),
             &format!(
-                "#!/bin/sh\n{log}\ncase \"$*\" in *omdrop-identity-expiry*) exit \"${{ARM_RC:-0}}\" ;; esac\nexit 0\n"
+                "#!/bin/sh\n{log}\ncase \"$*\" in *omdrop-identity-expiry*) exit \"${{ARM_RC:-0}}\" ;; *unit=omdrop-window\\ *) [ -n \"$WINDOW_ARM_SLEEP\" ] && sleep \"$WINDOW_ARM_SLEEP\" ;; esac\nexit 0\n"
             ),
         );
         write_exec(
@@ -1000,6 +1000,48 @@ fn a_send_cancelled_while_it_turns_omdrop_on_undoes_that_start() {
         first(&ev, " start 600") < first(&ev, &stop),
         "the start was undone:\n{ev}"
     );
+    assert!(ev.contains("identity stop-end"), "{ev}");
+    assert!(!ev.contains("sender-helper"), "nothing was sent:\n{ev}");
+}
+
+#[test]
+fn a_send_cancelled_after_the_radio_came_up_turns_off_what_its_start_left() {
+    let f = Fixture::new();
+    let file = f.root.join("photo.jpg");
+    std::fs::write(&file, "x").unwrap();
+    let sender = f.root.join("sender");
+    let child = spawn_with(
+        &f,
+        &["send", "Studio Mac", file.to_str().unwrap()],
+        &[
+            ("OMDROP_SENDER", sender.to_str().unwrap()),
+            ("WINDOW_ARM_SLEEP", "5"),
+        ],
+    );
+    // `on` is past its radio, arming the window, where it has no undo of its own.
+    let start = std::time::Instant::now();
+    while !std::fs::read_to_string(&f.capture)
+        .unwrap()
+        .contains("--unit=omdrop-window ")
+    {
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "the automatic on never armed its window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    signal(&child, 15);
+    let out = finish_within(child, std::time::Duration::from_secs(10));
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    assert_eq!(out.status.code(), Some(130), "{ev}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cancelled."));
+    let armed = first(&ev, "--unit=omdrop-window ");
+    let stop = format!("pkexec {} stop", f.helper.display());
+    assert!(
+        armed < first(&ev, "--user stop airdrop-receiver.service"),
+        "the receiver was stopped:\n{ev}"
+    );
+    assert!(armed < first(&ev, &stop), "the radio was stopped:\n{ev}");
     assert!(ev.contains("identity stop-end"), "{ev}");
     assert!(!ev.contains("sender-helper"), "nothing was sent:\n{ev}");
 }

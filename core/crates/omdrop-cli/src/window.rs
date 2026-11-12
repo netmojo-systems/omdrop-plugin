@@ -641,7 +641,7 @@ pub fn cmd_off(args: &[String]) -> i32 {
 /// Under the identity lock, in this order: nothing that starts later can
 /// publish into this window; the receiver stops before the identity it
 /// loaded is released; the window file goes last.
-fn off_under_lock() {
+pub(crate) fn off_under_lock() {
     let lock = identity_lock();
     off_locked();
     drop(lock);

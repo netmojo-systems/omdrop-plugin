@@ -65,58 +65,62 @@ pub fn run_no_stdout<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> i3
     }
 }
 
-/// How long a cancelled `omdrop on` gets to undo its start before it is killed.
-const UNDO_GRACE: Duration = Duration::from_secs(15);
+/// How long a cancelled `omdrop on` gets to finish: the radio helper's `down` hook alone may take 60 s.
+const UNDO_GRACE: Duration = Duration::from_secs(75);
 
-/// `prog args >/dev/null` for a child that undoes its own work when
-/// signalled, as `omdrop on` does. A TERM, INT or HUP here is passed on to
-/// it, it gets [`UNDO_GRACE`] to finish undoing, and then this says
-/// "Cancelled." and exits 130. The child stays in our process group, so a
+/// How a child run by [`run_no_stdout_forwarding`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forwarded {
+    /// It exited by itself with this status.
+    Exited(i32),
+    /// A TERM, INT or HUP reached us and was passed on; its exit status, if it exited within [`UNDO_GRACE`].
+    Cancelled(Option<i32>),
+}
+
+/// `prog args >/dev/null` with TERM, INT and HUP trapped from before the
+/// spawn. A signal is passed on to the child alone, which gets
+/// [`UNDO_GRACE`] to finish before it is killed. The trap stays in place
+/// whichever way it ends, so the caller decides what a cancel undoes and
+/// when to [`untrap_signals`]. The child stays in our process group, so a
 /// password prompt keeps the terminal and a Ctrl-C reaches it directly.
-pub fn run_no_stdout_undoable<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> i32 {
+pub fn run_no_stdout_forwarding<S: AsRef<OsStr>>(prog: impl AsRef<OsStr>, args: &[S]) -> Forwarded {
     let prog = prog.as_ref();
     trap_signals();
     let mut child = match Command::new(prog).args(args).stdout(Stdio::null()).spawn() {
         Ok(c) => c,
-        Err(e) => {
-            untrap_signals();
-            return spawn_failed(prog, &e);
-        }
+        Err(e) => return Forwarded::Exited(spawn_failed(prog, &e)),
     };
     loop {
         match child.try_wait() {
-            Ok(Some(s)) => {
-                untrap_signals();
-                return code_of(s);
-            }
+            Ok(Some(s)) => return Forwarded::Exited(code_of(s)),
             Ok(None) => {}
-            Err(_) => {
-                untrap_signals();
-                return 1;
-            }
+            Err(_) => return Forwarded::Exited(1),
         }
         if caught().is_some() {
-            undo_then_cancel(&mut child);
+            return Forwarded::Cancelled(forward_and_wait(&mut child));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// TERM to the child alone, a bounded wait for its own undo, then KILL.
-fn undo_then_cancel(child: &mut Child) -> ! {
+/// TERM to the child alone, a bounded wait for it, then KILL; its status if it exited by itself.
+fn forward_and_wait(child: &mut Child) -> Option<i32> {
     if let Ok(pid) = i32::try_from(child.id()) {
         // SAFETY: kill(2) on our own unreaped child's pid.
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
     let until = Instant::now() + UNDO_GRACE;
-    while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
+    loop {
+        if let Ok(Some(s)) = child.try_wait() {
+            return Some(code_of(s));
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if matches!(child.try_wait(), Ok(None)) {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    cancelled(None)
 }
 
 /// `$(prog args 2>/dev/null)`: the status and the raw output.
