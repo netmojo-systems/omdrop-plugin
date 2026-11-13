@@ -1171,6 +1171,7 @@ fn follow_stream(watch: &Watch) -> i32 {
         let mut pending: Vec<(String, String)> = Vec::new();
         let known = table
             .iter()
+            .filter(|r| crate::names::heard_now(r))
             .filter_map(|r| names.get(&r.mac).map(|n| (r.mac.as_str(), n)));
         for (mac, name) in known.chain(names.since(since)) {
             if shown.get(mac).map(String::as_str) != Some(name)

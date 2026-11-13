@@ -933,6 +933,7 @@ case "$*" in
     if [ -n "$TABLE_GATE" ] && [ ! -e "$TABLE_GATE" ]; then echo 'table-empty' >> "$CAPTURE"; exit 1; fi
     echo 'e2:9d:03:6c:58:23   -47 dBm  [fe80::1%awdl0]:8770'
     echo '22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770'
+    if [ -n "$STALE_ROW" ]; then echo 'b2:c4:98:5e:e6:be     ? dBm  [fe80::4%awdl0]:8770'; fi
     exit 0 ;;
 esac
 printf 'sent %s\n' "$*" >> "$CAPTURE"
@@ -1305,6 +1306,51 @@ fn a_follower_gets_each_name_of_a_plain_named_listing_as_it_arrives() {
          22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770  hume\n"
     );
     assert_eq!(lookups(&f), 1);
+}
+
+#[test]
+fn a_follower_names_only_devices_the_radio_hears_now() {
+    let (f, sender, gate) = peers_fixture();
+    let env = [
+        ("OMDROP_SENDER", sender.as_str()),
+        ("LINK_LOCAL", "1"),
+        ("GATE", gate.to_str().unwrap()),
+        ("STALE_ROW", "1"),
+    ];
+    // A Mac's old AWDL address: still pinned, no signal, its name still kept.
+    let (out, _) = f.run(&["peers", "-n", "--json"], &env[..2]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let file = f.root.join("run/omdrop/peer-names.json");
+    let mut names: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let learned = names["22:8b:38:31:89:4e"]["at"].as_u64().unwrap();
+    // Learned a minute before this lookup: only the known-names pass can show it.
+    names["b2:c4:98:5e:e6:be"] = serde_json::json!({"name": "Office Mac", "at": learned - 60});
+    std::fs::write(&file, names.to_string()).unwrap();
+    let first = running_lookup(&f, &env);
+    let mut follower = spawn_with(&f, &STREAM, &env);
+    let lines = stdout_lines(&mut follower);
+    // Following: it shows what the table holds before the lookup may end.
+    let mut shown = vec![next_line(&lines)];
+    std::fs::write(&gate, "").unwrap();
+    let out = finish_within(follower, std::time::Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    shown.extend(std::iter::from_fn(|| {
+        lines.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }));
+    assert_eq!(lookups(&f), 2, "the follower ran a lookup of its own");
+    // The live device, heard at -34 dBm, is still named.
+    assert!(
+        shown
+            .iter()
+            .any(|l| l.contains("22:8b:38:31:89:4e") && !l.contains("null")),
+        "{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|l| l.contains("b2:c4:98:5e:e6:be")),
+        "{shown:?}"
+    );
+    finish_within(first, std::time::Duration::from_secs(10));
 }
 
 #[test]
