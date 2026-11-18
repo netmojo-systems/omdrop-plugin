@@ -190,7 +190,7 @@ esac
 # A fallback that silently substitutes for the real value is the same class of
 # defect as a status line reporting a state that was never entered, so this one
 # says when it is guessing, and says when the two disagree.
-VERSION_FALLBACK=0.18.12
+VERSION_FALLBACK=0.19.0
 omdrop_version() {
   local dir manifest version= real
   real=$(readlink -f "$0" 2>/dev/null) || real="$0"
@@ -1274,12 +1274,12 @@ DRIVER_PKG=brcmfmac-awdl-dkms
 # checkout below is detached at this SHA and the build only runs if it
 # succeeded. Bump it, in the same commit, whenever the plugin needs a newer
 # driver: the full 40 characters, because a short SHA is not a pin.
-DRIVER_COMMIT=9b59420299203805b213f7f65fbcba1d7690177f
+DRIVER_COMMIT=815c72208292e684d77bb93b2c32ffe638053426
 # The package version that commit builds, with its pkgrel. install-driver
 # rebuilds any older installed driver: a fix inside the helper, such as 0.5.1's,
 # changes nothing a feature probe could see, and a packaging fix such as
 # 0.6.3-2's (the kernel headers became a dependency) changes only the pkgrel.
-DRIVER_VERSION=0.10.7
+DRIVER_VERSION=0.10.8
 # The first driver whose sender, send-to-peer and advertiser follow
 # docs/identity-contract.md. Moving the identity into 1Password needs it.
 DRIVER_IDENTITY_VERSION=0.7.0
@@ -1349,7 +1349,7 @@ else
   git clone --quiet $DRIVER_REPO '$src'
 fi
 echo 'Building driver commit $DRIVER_COMMIT'
-git -C '$src' checkout --detach 9b59420299203805b213f7f65fbcba1d7690177f && makepkg --dir '$src' -si"
+git -C '$src' checkout --detach 815c72208292e684d77bb93b2c32ffe638053426 && makepkg --dir '$src' -si"
     fi
   fi
 
