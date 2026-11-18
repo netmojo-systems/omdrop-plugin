@@ -100,9 +100,9 @@ impl Names {
     }
 
     /// Give `row` the name learned for its address when it has none of its
-    /// own; true when it did.
+    /// own and the radio hears it now; true when it did.
     pub fn fill(&self, row: &mut Row) -> bool {
-        if !placeholder(row.name.trim()) {
+        if !placeholder(row.name.trim()) || !heard_now(row) {
             return false;
         }
         let Some(name) = self.get(&row.mac) else {
@@ -145,6 +145,12 @@ impl Names {
             self.0.remove(&mac);
         }
     }
+}
+
+/// The radio has a signal reading for `row`: a pinned address with none can
+/// be one the device has already left behind.
+pub fn heard_now(row: &Row) -> bool {
+    row.rssi != "?"
 }
 
 /// A name worth keeping: not one of the sender's placeholders, one line, and
@@ -434,6 +440,23 @@ mod tests {
              noise"
         );
         assert_eq!(names.fill_listing(""), "");
+    }
+
+    #[test]
+    fn an_address_the_radio_no_longer_hears_keeps_no_learned_name() {
+        // A Mac rotates its AWDL address; the old one stays pinned without a
+        // signal and must not be listed as a second "Office Mac".
+        let mut names = Names::default();
+        for (mac, name) in [(A, "Office Mac"), (B, "Office Mac")] {
+            names.learn(&row(mac, name), T);
+        }
+        let listing = "e2:9d:03:6c:58:23     ? dBm  [fe80::1%awdl0]:8770  (no response)\n\
+             22:8b:38:31:89:4e   -45 dBm  [fe80::2%awdl0]:8770  (no response)";
+        assert_eq!(
+            names.fill_listing(listing),
+            "e2:9d:03:6c:58:23     ? dBm  [fe80::1%awdl0]:8770  (no response)\n\
+             22:8b:38:31:89:4e   -45 dBm  [fe80::2%awdl0]:8770  Office Mac"
+        );
     }
 
     #[test]
