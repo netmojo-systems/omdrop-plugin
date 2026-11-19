@@ -1196,8 +1196,10 @@ fn a_named_send_while_a_lookup_runs_waits_for_it_then_runs_its_own() {
 /// send-to-peer for a named send: the lookup logs `lookup PID`, starts a pending peer that
 /// holds it for $PENDING_SECS (default 30) in a child logged as `pending PID`, and only then
 /// prints $FIRST_ROWS (default Studio Mac, then hume); once the child ends it prints
-/// $LATE_ROW if set and logs `lookup-end`. A send logs `pending-at-send alive|gone`, then
-/// `sent ARGS`.
+/// $LATE_ROW if set and logs `lookup-end`. A send logs `pending-at-send alive|zombie|gone`,
+/// then `sent ARGS`. `zombie` is that child dead but not reaped: `kill -0` still finds one,
+/// and where init reaps nothing an orphan stays one. Its state comes from /proc; a child
+/// that can be signalled but not read counts as alive.
 const FIRST_SENDER: &str = r#"#!/bin/sh
 case "$*" in
   --help) echo '  [file ...] --url --names --stream'; exit 0 ;;
@@ -1213,7 +1215,12 @@ case "$*" in
     exit 0 ;;
 esac
 p=$(sed -n 's/^pending //p' "$CAPTURE" | tail -n 1)
-if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then s=alive; else s=gone; fi
+s=$(sed 's/^.*) //; s/ .*//' "/proc/$p/stat" 2>/dev/null)
+case "$s" in
+  Z|X) s=zombie ;;
+  '') if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then s=alive; else s=gone; fi ;;
+  *) s=alive ;;
+esac
 printf 'pending-at-send %s\n' "$s" >> "$CAPTURE"
 printf 'sent %s\n' "$*" >> "$CAPTURE"
 echo '+0.41s FOUND x at y; asking'
@@ -1288,6 +1295,11 @@ fn pending_at_send(ev: &str) -> &str {
         .unwrap_or_else(|| panic!("no pending-at-send in:\n{ev}"))
 }
 
+/// The lookup's pending child could not run when the send began: gone, or dead and unreaped.
+fn assert_pending_stopped(ev: &str) {
+    assert!(matches!(pending_at_send(ev), "gone" | "zombie"), "{ev}");
+}
+
 #[test]
 fn a_clean_sender_sends_to_the_first_exact_name_without_waiting_for_the_rest() {
     let (out, ev) = first_send("Hume", Some(awdl_helper("0.10.8")), &[]);
@@ -1301,7 +1313,7 @@ fn a_clean_sender_sends_to_the_first_exact_name_without_waiting_for_the_rest() {
         "the lookup ran to its end:\n{ev}"
     );
     // The lookup's session was stopped before the send began.
-    assert_eq!(pending_at_send(&ev), "gone", "{ev}");
+    assert_pending_stopped(&ev);
 }
 
 #[test]
@@ -1363,7 +1375,7 @@ fn the_plugin_dispatcher_hands_a_named_send_to_core_which_takes_the_first_exact_
     assert_eq!(sent.len(), 1, "{ev}");
     assert!(sent[0].contains("22:8b:38:31:89:4e"), "{ev}");
     assert!(!ev.contains("lookup-end"), "{ev}");
-    assert_eq!(pending_at_send(&ev), "gone", "{ev}");
+    assert_pending_stopped(&ev);
 }
 
 #[test]
