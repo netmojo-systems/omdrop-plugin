@@ -260,24 +260,39 @@ fn send_env() -> Fake {
 }
 
 #[test]
-fn the_wake_is_up_while_waiting_and_down_before_the_transfer() {
+fn the_wake_is_up_before_the_first_knock_and_through_the_transfer() {
     let env = send_env();
     let rc = run_send(&env, &["--wait", "20"], &[false, false, true]);
     assert_eq!(rc, 0);
     let ev = env.events();
-    assert_eq!(ev[1], Event::WakeUp(20.0));
-    let up = ev.iter().position(|e| *e == Event::WakeUp(20.0)).unwrap();
-    let second_knock = ev
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| matches!(e, Event::Knock(_)))
-        .nth(1)
-        .unwrap()
-        .0;
-    assert!(up < second_knock);
-    let down = ev.iter().position(|e| *e == Event::WakeDown).unwrap();
+    assert_eq!(ev[0], Event::WakeUp(320.0), "{ev:?}");
     let send = ev.iter().position(|e| *e == Event::Send).unwrap();
-    assert!(down < send);
+    let down = ev.iter().position(|e| *e == Event::WakeDown).unwrap();
+    assert!(
+        send < down,
+        "the wake came down before the transfer: {ev:?}"
+    );
+    assert_eq!(
+        ev.iter().filter(|e| matches!(e, Event::WakeUp(_))).count(),
+        1,
+        "{ev:?}"
+    );
+}
+
+#[test]
+fn a_peer_already_listening_still_gets_a_wake_held_through_the_transfer() {
+    let env = send_env();
+    let rc = run_send(&env, &["--wait", "20"], &[true]);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        env.events(),
+        [
+            Event::WakeUp(320.0),
+            Event::Knock(true),
+            Event::Send,
+            Event::WakeDown
+        ]
+    );
 }
 
 #[test]
@@ -292,11 +307,17 @@ fn a_peer_that_never_opens_still_stops_the_wake() {
 }
 
 #[test]
-fn no_wake_is_raised_with_no_wake_or_a_listening_peer() {
+fn no_wake_is_raised_with_no_wake_or_print() {
     let env = send_env();
     run_send(&env, &["--wait", "20", "--no-wake"], &[false, true]);
-    run_send(&env, &["--wait", "20"], &[true]);
     assert!(!env.events().iter().any(|e| matches!(e, Event::WakeUp(_))));
+    let env = send_env();
+    assert_eq!(run_send(&env, &["--wait", "20", "--print"], &[]), 0);
+    assert!(
+        env.events().is_empty(),
+        "--print touched the radio: {:?}",
+        env.events()
+    );
 }
 
 // Beyond the Python file: the listing formats omdrop and the panel parse.

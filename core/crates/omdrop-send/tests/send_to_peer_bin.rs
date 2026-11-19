@@ -283,8 +283,9 @@ fn a_wait_raises_the_wake_and_always_takes_it_down() {
         "{err}"
     );
     let log = bed.log();
+    // The wake covers the wait and the transfer that follows: --wait plus SEND_WAKE_SECONDS.
     assert!(
-        log.contains("adv ble --arm A --seconds 2 --interval-ms 100"),
+        log.contains("adv ble --arm A --seconds 302 --interval-ms 100"),
         "{log}"
     );
     assert!(log.contains("adv-stopped"), "{log}");
@@ -326,7 +327,7 @@ fn a_wake_that_fails_to_register_says_why() {
     let out = bed.command(&["--wait", "1", "f"]).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("wake exited: omdrop-adv ble: no Bluetooth adapter; waiting without a wake"),
+        err.contains("wake exited: omdrop-adv ble: no Bluetooth adapter; sending without a wake"),
         "{err}"
     );
     assert_eq!(out.status.code(), Some(3));

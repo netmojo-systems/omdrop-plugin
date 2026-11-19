@@ -43,6 +43,9 @@ pub const IFACE: &str = "awdl0";
 /// for once we stop transmitting. A send waits, and advertises, for its own
 /// --wait.
 pub const WAKE_SECONDS: f64 = 30.0;
+/// A send's wake lasts at most its --wait plus this: receivers keep their AirDrop server only while
+/// they hear it. A transfer that outlasts it loses the wake.
+pub const SEND_WAKE_SECONDS: f64 = 300.0;
 /// How long to wait for the advertiser to say it registered.
 pub const WAKE_READY: f64 = 5.0;
 /// How often a lookup re-reads the peer table for newcomers.
@@ -706,29 +709,30 @@ pub fn main<E: Env + ?Sized>(
         return 0;
     }
 
-    // An iPhone does not keep an AirDrop server listening while it is merely
-    // discoverable: measured 2026-09-18, port 8770 refused instantly, was open
-    // for seconds around other sharingd work, and was gone a minute later.
-    // Two transfers landed by firing inside that window. Waiting alone relied
-    // on something else waking the phone, and choosing a file closes the
-    // panel whose lookups did; so the wait raises the same wake the lookups
-    // use, for as long as it waits, and stops it before the transfer starts.
+    // One wake per send, from before its first knock until the sender exits or the wake's ceiling
+    // ends: an iPhone keeps no AirDrop server while merely discoverable (measured 2026-09-18), and
+    // the lookup's own wake has ended by now.
+    let _send_wake = do_wake.then(|| {
+        wake(
+            env,
+            wait_secs + SEND_WAKE_SECONDS,
+            "sending without a wake",
+            err,
+        )
+    });
     if wait_secs > 0.0 && !env.listening(ll, port, 2.0) {
         let _ = writeln!(
             err,
             "waiting up to {wait_secs:.0}s for {mac} to start listening on {port}"
         );
         let mut opened = false;
-        {
-            let _guard = do_wake.then(|| wake(env, wait_secs, "waiting without a wake", err));
-            let deadline = env.monotonic() + wait_secs;
-            while env.monotonic() < deadline {
-                if env.listening(ll, port, 2.0) {
-                    opened = true;
-                    break;
-                }
-                env.sleep(1.0);
+        let deadline = env.monotonic() + wait_secs;
+        while env.monotonic() < deadline {
+            if env.listening(ll, port, 2.0) {
+                opened = true;
+                break;
             }
+            env.sleep(1.0);
         }
         if !opened {
             let _ = writeln!(
