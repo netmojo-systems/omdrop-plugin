@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -606,7 +607,11 @@ fn choose_peer(to: &str, payload: &[String]) -> String {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
     let by_name = !want.is_empty() && !want.contains(':') && !full_mac;
     let (listing, rc) = if by_name {
-        find_by_name(&want, to)
+        let (listing, rc, latched) = find_by_name(&want, to);
+        if let Some(mac) = latched {
+            return mac;
+        }
+        (listing, rc)
     } else {
         let mut list = sender_cmd();
         list.arg("--list");
@@ -702,21 +707,28 @@ fn choose_peer(to: &str, payload: &[String]) -> String {
 }
 
 /// Ask for names until the one wanted answers, keeping answers across
-/// passes but finishing each pass before choosing: another device may have
-/// the same name. Every wait is bounded by OMDROP_NAME_WAIT, including a
-/// lookup that closes its output but stays alive; each pass runs in its own
+/// passes. Every wait is bounded by OMDROP_NAME_WAIT, including a lookup
+/// that closes its output but stays alive; each pass runs in its own
 /// session, so a cancel or the deadline stops its probes and Bluetooth
 /// advertising together (TERM, then KILL two seconds later). Each pass takes
-/// the named-lookup turn, waiting out another program's lookup first: only
-/// a whole pass of its own shows a name is unique.
-fn find_by_name(want: &str, shown: &str) -> (String, i32) {
+/// the named-lookup turn, waiting out another program's lookup first.
+///
+/// When the sender's rows can be trusted as they stream in
+/// (`sender_names_clean`), the first device whose whole name is the one
+/// wanted, ignoring case, is chosen the moment it answers: its address is
+/// returned latched and the rest of the pass is stopped, so a slower device,
+/// even one with the same name, is not waited for. Otherwise, and for a name
+/// only part of one, each pass is finished before choosing.
+fn find_by_name(want: &str, shown: &str) -> (String, i32, Option<String>) {
     let c = ctx();
     let start = Instant::now();
     let deadline = start + Duration::from_secs(c.name_wait);
+    let fast = crate::driver::sender_names_clean();
     let mut order: Vec<String> = Vec::new();
     let mut row_of: HashMap<String, String> = HashMap::new();
     let mut said: HashMap<String, ()> = HashMap::new();
     let mut found = false;
+    let mut latched: Option<String> = None;
     let mut passes = 0;
     let mut said_waiting = false;
     let mut note_at = start;
@@ -760,7 +772,12 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
                     if said.insert(row.mac.clone(), ()).is_none() {
                         outln!("Heard from {}.", row.name);
                     }
-                    if row.name.to_lowercase().contains(want) {
+                    let name = row.name.to_lowercase();
+                    if fast && name == want {
+                        latched = Some(row.mac);
+                        return ControlFlow::Break(());
+                    }
+                    if name.contains(want) {
                         found = true;
                     }
                 }
@@ -768,9 +785,11 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
                 other.push_str(line);
                 other.push('\n');
             }
+            ControlFlow::Continue(())
         });
         drop(turn);
         let rc = match pass {
+            Pass::Selected => break,
             Pass::Done(rc) => rc,
             Pass::TimedOut => {
                 // A truncated pass cannot establish uniqueness, even if a
@@ -818,30 +837,35 @@ fn find_by_name(want: &str, shown: &str) -> (String, i32) {
             c.name_wait
         ));
     }
+    if latched.is_some() {
+        return (String::new(), 0, latched);
+    }
     let listing = order
         .iter()
         .map(|m| row_of[m].clone())
         .collect::<Vec<_>>()
         .join("\n");
     let rc = if order.is_empty() { 1 } else { 0 };
-    (listing, rc)
+    (listing, rc, latched)
 }
 
 enum Pass {
     Done(i32),
     TimedOut,
+    /// `on_line` chose a device and the pass was stopped.
+    Selected,
 }
 
 /// One lookup: probe whether the sender can stream names (so they arrive
 /// as each device answers), then `--list --names [--stream]`, its stdout
 /// and stderr together, line by line, all before the deadline.
-fn name_pass(deadline: Instant, on_line: &mut dyn FnMut(&str)) -> Pass {
+fn name_pass(deadline: Instant, on_line: &mut dyn FnMut(&str) -> ControlFlow<()>) -> Pass {
     let mut probe = sender_cmd();
     probe.arg("--help");
-    let help = match run_bounded(&mut probe, deadline, &mut |_| {}) {
+    let help = match run_bounded(&mut probe, deadline, &mut |_| ControlFlow::Continue(())) {
         Bounded::Done(_, out) => out,
         Bounded::TimedOut => return Pass::TimedOut,
-        Bounded::Failed(_) => String::new(),
+        Bounded::Failed(_) | Bounded::Stopped => String::new(),
     };
     let mut lookup = sender_cmd();
     lookup.args(["--list", "--names"]);
@@ -852,6 +876,7 @@ fn name_pass(deadline: Instant, on_line: &mut dyn FnMut(&str)) -> Pass {
         Bounded::Done(rc, _) => Pass::Done(rc),
         Bounded::TimedOut => Pass::TimedOut,
         Bounded::Failed(rc) => Pass::Done(rc),
+        Bounded::Stopped => Pass::Selected,
     }
 }
 
@@ -859,12 +884,18 @@ enum Bounded {
     Done(i32, String),
     TimedOut,
     Failed(i32),
+    /// `on_line` asked to stop; the session was stopped and its pipe closed.
+    Stopped,
 }
 
 /// Run in a session of its own with stdout and stderr on one pipe, handing
-/// each line over as it comes. At the deadline, or on a cancel, the whole
-/// session goes.
-fn run_bounded(cmd: &mut Command, deadline: Instant, on_line: &mut dyn FnMut(&str)) -> Bounded {
+/// each line over as it comes. At the deadline, on a cancel, or when
+/// `on_line` breaks, the whole session goes.
+fn run_bounded(
+    cmd: &mut Command,
+    deadline: Instant,
+    on_line: &mut dyn FnMut(&str) -> ControlFlow<()>,
+) -> Bounded {
     let Ok((read, write)) = pipe() else {
         return Bounded::Failed(126);
     };
@@ -879,7 +910,7 @@ fn run_bounded(cmd: &mut Command, deadline: Instant, on_line: &mut dyn FnMut(&st
     let mut child: Child = match spawned {
         Ok(c) => c,
         Err(e) => {
-            on_line(&format!(
+            let _ = on_line(&format!(
                 "omdrop: {}: {e}",
                 cmd.get_program().to_string_lossy()
             ));
@@ -897,7 +928,11 @@ fn run_bounded(cmd: &mut Command, deadline: Instant, on_line: &mut dyn FnMut(&st
             Read1::Signal => cancelled(Some(&mut child)),
             Read1::Line(l) => {
                 let line = String::from_utf8_lossy(&l).into_owned();
-                on_line(&line);
+                if on_line(&line).is_break() {
+                    stop_group(&mut child);
+                    drop(reader);
+                    return Bounded::Stopped;
+                }
                 all.push_str(&line);
                 all.push('\n');
             }

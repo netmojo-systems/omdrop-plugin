@@ -45,6 +45,9 @@ const RECEIVER_PKGS: &str = "python-libarchive-c keyutils";
 /// follow the identity contract. Newer features are found by asking the
 /// sender (`--help`), not by version.
 const BACKEND_CONTRACT_MIN: &str = "0.7.0";
+/// The first omdrop-awdl whose sender keeps every peer on one line of its own (the plugin's
+/// NAMES_CLEAN_VERSION): a streamed row from it can't be forged inside another device's name.
+const NAMES_CLEAN_VERSION: &str = "0.10.1";
 /// Item IDs Omdrop reports itself, and the panel acts on. A backend's own
 /// item under one of these names is passed on as backend-<id>, so its
 /// sentence still shows but no button offers a fix that cannot fix it.
@@ -243,6 +246,17 @@ fn awdl_backend() -> bool {
 /// leaves alone. One that hangs counts: it is not known to be omdrop-awdl.
 fn foreign_backend() -> bool {
     probing() && !awdl_backend()
+}
+
+/// Whether each streamed `--list --names` row can be trusted as it arrives: core's own sender,
+/// or omdrop-awdl at NAMES_CLEAN_VERSION or newer, by its probe. A missing or hung probe, another
+/// backend, or an older version all count as no, as `sender_names_clean` does in `bin/omdrop`.
+pub fn sender_names_clean() -> bool {
+    ctx().core_sender
+        || (awdl_backend() && {
+            let version = probe_field("version");
+            !version.is_empty() && vercmp(&version, NAMES_CLEAN_VERSION).is_ge()
+        })
 }
 
 fn radio_probe_hung() -> bool {

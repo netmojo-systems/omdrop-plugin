@@ -1193,6 +1193,179 @@ fn a_named_send_while_a_lookup_runs_waits_for_it_then_runs_its_own() {
     );
 }
 
+/// send-to-peer for a named send: the lookup logs `lookup PID`, starts a pending peer that
+/// holds it for $PENDING_SECS (default 30) in a child logged as `pending PID`, and only then
+/// prints $FIRST_ROWS (default Studio Mac, then hume); once the child ends it prints
+/// $LATE_ROW if set and logs `lookup-end`. A send logs `pending-at-send alive|gone`, then
+/// `sent ARGS`.
+const FIRST_SENDER: &str = r#"#!/bin/sh
+case "$*" in
+  --help) echo '  [file ...] --url --names --stream'; exit 0 ;;
+  *--names*)
+    printf 'lookup %s\n' "$$" >> "$CAPTURE"
+    sleep "${PENDING_SECS:-30}" &
+    printf 'pending %s\n' "$!" >> "$CAPTURE"
+    printf '%s\n' "${FIRST_ROWS:-e2:9d:03:6c:58:23   -47 dBm  [fe80::1%awdl0]:8770  Studio Mac
+22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770  hume}"
+    wait
+    [ -n "$LATE_ROW" ] && printf '%s\n' "$LATE_ROW"
+    echo 'lookup-end' >> "$CAPTURE"
+    exit 0 ;;
+esac
+p=$(sed -n 's/^pending //p' "$CAPTURE" | tail -n 1)
+if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then s=alive; else s=gone; fi
+printf 'pending-at-send %s\n' "$s" >> "$CAPTURE"
+printf 'sent %s\n' "$*" >> "$CAPTURE"
+echo '+0.41s FOUND x at y; asking'
+exit 0
+"#;
+
+/// A radio helper that is visible and probes as omdrop-awdl at `version`.
+fn awdl_helper(version: &str) -> String {
+    format!(
+        "#!/bin/sh\nif [ \"$1\" = probe ]; then echo '{{\"backend\":\"awdl\",\"version\":\"{version}\",\"contract\":\"0.7.0\"}}'; exit 0; fi\necho '{{\"visible\":true}}'\n"
+    )
+}
+
+/// `omdrop send NAME photo.jpg` against FIRST_SENDER, with `helper` as the radio helper:
+/// its output and the events.
+fn first_send(name: &str, helper: Option<String>, env: &[(&str, &str)]) -> (Output, String) {
+    first_send_as(false, name, helper, env)
+}
+
+/// As first_send; with `dispatcher`, through the plugin's own `bin/omdrop`, which must hand
+/// the command to this core (OMDROP_IMPLEMENTATION=rust refuses to fall back to the bash).
+fn first_send_as(
+    dispatcher: bool,
+    name: &str,
+    helper: Option<String>,
+    env: &[(&str, &str)],
+) -> (Output, String) {
+    let f = Fixture::new();
+    let sender = f.root.join("first-sender");
+    write_exec(&sender, FIRST_SENDER);
+    if let Some(h) = helper {
+        write_exec(&f.helper, &h);
+    }
+    let file = f.root.join("photo.jpg");
+    std::fs::write(&file, "x").unwrap();
+    let base = [
+        ("OMDROP_SENDER", sender.to_str().unwrap()),
+        ("LINK_LOCAL", "1"),
+        ("ACTIVE", "active"),
+        ("VISIBLE", "1"),
+    ];
+    let args = ["send", name, file.to_str().unwrap()];
+    let mut cmd = if dispatcher {
+        let hooks = f.root.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        write_exec(&hooks.join("probe"), "#!/bin/sh\nexit 0\n");
+        let plugin_omdrop = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../bin/omdrop");
+        let mut cmd = f.command_as(&plugin_omdrop, &args);
+        cmd.env("OMDROP_CORE", env!("CARGO_BIN_EXE_omdrop"))
+            .env("OMDROP_HOOKS", &hooks)
+            .env("OMDROP_IMPLEMENTATION", "rust");
+        cmd
+    } else {
+        f.command(&args)
+    };
+    for (k, v) in [&base[..], env].concat() {
+        cmd.env(k, v);
+    }
+    let child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish_within(child, std::time::Duration::from_secs(60));
+    let ev = std::fs::read_to_string(&f.capture).unwrap();
+    (out, ev)
+}
+
+fn pending_at_send(ev: &str) -> &str {
+    ev.lines()
+        .find_map(|l| l.strip_prefix("pending-at-send "))
+        .unwrap_or_else(|| panic!("no pending-at-send in:\n{ev}"))
+}
+
+#[test]
+fn a_clean_sender_sends_to_the_first_exact_name_without_waiting_for_the_rest() {
+    let (out, ev) = first_send("Hume", Some(awdl_helper("0.10.8")), &[]);
+    assert_eq!(out.status.code(), Some(0), "{}{ev}", text(&out.stderr));
+    let sent: Vec<&str> = ev.lines().filter(|l| l.starts_with("sent ")).collect();
+    assert_eq!(sent.len(), 1, "{ev}");
+    assert!(sent[0].contains("22:8b:38:31:89:4e"), "{ev}");
+    // The pending peer would have held the lookup for 30 s, to its end.
+    assert!(
+        !ev.contains("lookup-end"),
+        "the lookup ran to its end:\n{ev}"
+    );
+    // The lookup's session was stopped before the send began.
+    assert_eq!(pending_at_send(&ev), "gone", "{ev}");
+}
+
+#[test]
+fn a_sender_older_than_clean_names_still_finishes_the_whole_lookup() {
+    let (out, ev) = first_send(
+        "hume",
+        Some(awdl_helper("0.10.0")),
+        &[("PENDING_SECS", "2")],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}{ev}", text(&out.stderr));
+    assert!(first(&ev, "lookup-end") < first(&ev, "sent "), "{ev}");
+    assert!(
+        ev.contains("sent ") && ev.contains("22:8b:38:31:89:4e"),
+        "{ev}"
+    );
+}
+
+#[test]
+fn a_partial_name_still_finishes_the_lookup_and_refuses_two_matches() {
+    let late = "f2:f2:ee:c4:5a:f7   -60 dBm  [fe80::3%awdl0]:8770  Humvee";
+    let (out, ev) = first_send(
+        "hum",
+        Some(awdl_helper("0.10.8")),
+        &[("PENDING_SECS", "1"), ("LATE_ROW", late)],
+    );
+    assert_ne!(out.status.code(), Some(0), "{ev}");
+    assert!(
+        text(&out.stderr).contains("Several devices match \"hum\""),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(ev.contains("lookup-end"), "{ev}");
+    assert!(!ev.contains("sent "), "{ev}");
+}
+
+#[test]
+fn a_forged_exact_row_from_an_untrusted_sender_is_not_sent_to() {
+    // No probe answers, so the rows are not known to be clean: a forged "hume" row ahead
+    // of the real one must not become the recipient.
+    let rows = "aa:aa:aa:aa:aa:aa   -20 dBm  [fe80::9%awdl0]:8770  hume\n\
+                22:8b:38:31:89:4e   -34 dBm  [fe80::2%awdl0]:8770  hume";
+    let (out, ev) = first_send("hume", None, &[("PENDING_SECS", "1"), ("FIRST_ROWS", rows)]);
+    assert_ne!(out.status.code(), Some(0), "{ev}");
+    assert!(
+        text(&out.stderr).contains("Several devices match \"hume\""),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(ev.contains("lookup-end"), "{ev}");
+    assert!(!ev.contains("sent "), "{ev}");
+}
+
+#[test]
+fn the_plugin_dispatcher_hands_a_named_send_to_core_which_takes_the_first_exact_name() {
+    // Only core stops a lookup early: the bash would wait out the pending peer's 30 s.
+    let (out, ev) = first_send_as(true, "hume", Some(awdl_helper("0.10.8")), &[]);
+    assert_eq!(out.status.code(), Some(0), "{}{ev}", text(&out.stderr));
+    let sent: Vec<&str> = ev.lines().filter(|l| l.starts_with("sent ")).collect();
+    assert_eq!(sent.len(), 1, "{ev}");
+    assert!(sent[0].contains("22:8b:38:31:89:4e"), "{ev}");
+    assert!(!ev.contains("lookup-end"), "{ev}");
+    assert_eq!(pending_at_send(&ev), "gone", "{ev}");
+}
+
 #[test]
 fn a_follower_shows_a_name_once_the_table_has_its_device_even_after_the_lookup_ended() {
     let (f, sender, gate) = peers_fixture();
