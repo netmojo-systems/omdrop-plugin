@@ -58,6 +58,8 @@ pub struct Ctx {
     pub runtime: PathBuf,
     pub discoverable: PathBuf,
     pub sender: PathBuf,
+    /// The sender is core's own `send-to-peer`, which cleans every peer name onto one row.
+    pub core_sender: bool,
     /// `None`: the plugin's `airdrop-serve.py`.
     pub receiver: Option<PathBuf>,
     pub legacy: bool,
@@ -102,6 +104,11 @@ impl Ctx {
 
         let discoverable = find_discoverable(legacy, &proj);
         let sender = find_sender(legacy, &siblings, &proj);
+        let core_sender = !legacy
+            && find_sibling(&siblings, "send-to-peer")
+                .map(resolved)
+                .as_ref()
+                == Some(&sender);
         let receiver = if legacy {
             None
         } else {
@@ -118,6 +125,7 @@ impl Ctx {
             runtime,
             discoverable,
             sender,
+            core_sender,
             receiver,
             legacy,
             name_wait: name_wait(std::env::var("OMDROP_NAME_WAIT").ok().as_deref()),
