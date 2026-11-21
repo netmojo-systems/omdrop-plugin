@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Layouts
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -75,6 +76,75 @@ Panel {
       hoverEnabled: true
       cursorShape: tab.selected ? Qt.ArrowCursor : Qt.PointingHandCursor
       onClicked: tab.chosen()
+    }
+  }
+
+  component RadarMark: Item {
+    id: mark
+    property color color: root.foreground
+    property bool turning: false
+    property real bearing: 48
+    readonly property real unit: width / 28
+    readonly property real reach: 13 * unit
+
+    implicitWidth: Style.font.display
+    implicitHeight: implicitWidth
+
+    NumberAnimation on bearing {
+      running: mark.turning && Style.duration(1400) > 0
+      from: 48
+      to: 408
+      duration: 1400
+      loops: Animation.Infinite
+      onRunningChanged: if (!running) mark.bearing = 48
+    }
+
+    Rectangle {
+      anchors.centerIn: parent
+      width: mark.reach * 2
+      height: width
+      radius: width / 2
+      color: "transparent"
+      border.width: 2 * mark.unit
+      border.color: mark.color
+      antialiasing: true
+    }
+
+    Item {
+      anchors.fill: parent
+      rotation: mark.bearing
+
+      Shape {
+        anchors.fill: parent
+        preferredRendererType: Shape.CurveRenderer
+        ShapePath {
+          strokeWidth: 0
+          strokeColor: "transparent"
+          fillGradient: ConicalGradient {
+            centerX: mark.width / 2
+            centerY: mark.height / 2
+            angle: 90
+            GradientStop { position: 0; color: Qt.rgba(mark.color.r, mark.color.g, mark.color.b, 0.85) }
+            GradientStop { position: 130 / 360; color: Qt.rgba(mark.color.r, mark.color.g, mark.color.b, 0) }
+            GradientStop { position: 1; color: Qt.rgba(mark.color.r, mark.color.g, mark.color.b, 0) }
+          }
+          startX: mark.width / 2
+          startY: mark.height / 2 - mark.reach
+          PathArc { x: mark.width / 2; y: mark.height / 2 + mark.reach; radiusX: mark.reach; radiusY: mark.reach }
+          PathArc { x: mark.width / 2; y: mark.height / 2 - mark.reach; radiusX: mark.reach; radiusY: mark.reach }
+        }
+      }
+    }
+
+    Rectangle {
+      width: 2 * mark.unit
+      height: mark.reach - mark.unit
+      color: mark.color
+      x: mark.width / 2 - width / 2
+      y: mark.height / 2 - height
+      transformOrigin: Item.Bottom
+      rotation: mark.bearing
+      antialiasing: true
     }
   }
 
@@ -305,14 +375,26 @@ Panel {
     return (m < 10 ? "0" : "") + m + ":" + (sec < 10 ? "0" : "") + sec
   }
 
-  readonly property string countdownText: {
+  readonly property string heroStatus: {
+    if (!usable) return "Not available"
     if (busy) {
-      if (busyElapsed < 4) return ""
+      if (busyElapsed < 4) return (turningOn ? "Turning on" : "Turning off") + busyDots
       var m = Math.floor(busyElapsed / 60), s2 = busyElapsed % 60
-      var phase = turningOn ? "WAKING THE RADIO" : "STOPPING"
-      return phase + " · " + m + ":" + (s2 < 10 ? "0" : "") + s2
+      return (turningOn ? "Waking the radio" : "Stopping") + " · " + m + ":" + (s2 < 10 ? "0" : "") + s2
     }
-    return ""
+    if (settling) return "Waking the radio" + busyDots
+    if (!receiving) return "Off"
+    if (visibility === 0) return "Not visible"
+    if (detailUrgent) return "Nobody can send"
+    return audience === "contacts" ? "Visible to contacts" : "Visible in AirDrop"
+  }
+
+  readonly property string heroNote: {
+    if (!usable) return detailText
+    if (lastError !== "") return lastError
+    if (reasonText !== "") return reasonText
+    if (busy || settling || !receiving) return ""
+    return visibility === 0 || detailUrgent ? detailText : ""
   }
 
   function toggleOmdrop() {
@@ -1084,86 +1166,58 @@ Panel {
         anchors.top: parent.top
         spacing: Style.space(12)
 
-        Item {
+        Column {
           width: parent.width
-          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroSwitch.implicitHeight)
+          spacing: Style.space(8)
 
-          OmdropIcon {
-            id: heroIcon
-            iconSize: Style.font.display
-            color: root.busy || root.receiving ? root.foreground : root.dim
-            crossed: !root.usable
-            drifting: root.busy || root.settling
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-          }
-
-          ToggleSwitch {
-            id: heroSwitch
-            visible: root.usable
-            checked: root.receiving
-            busy: root.busy
+          PanelHero {
+            id: hero
+            width: parent.width + Style.space(6)
+            title: root.shownName || "Omdrop"
+            meta: root.heroStatus
             foreground: root.foreground
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            onToggled: root.toggleOmdrop()
-          }
-
-          Column {
-            id: heroLabels
-            anchors.left: heroIcon.right
-            anchors.leftMargin: Style.space(14)
-            anchors.right: parent.right
-            anchors.rightMargin: heroSwitch.visible ? heroSwitch.width + Style.space(12) : 0
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(2)
-
-            Text {
-              width: parent.width
-              text: root.stateText
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              elide: Text.ElideRight
+            fontFamily: root.fontFamily
+            iconComponent: Component {
+              RadarMark {
+                turning: root.busy || root.settling
+                color: root.heroNote !== "" ? root.urgent : root.busy || root.receiving ? root.foreground : root.dim
+              }
             }
-
-            Text {
-              width: parent.width
-              visible: root.countdownText !== ""
-              text: root.countdownText
-              color: Qt.darker(root.foreground, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1.2
+            trailingControl: Component {
+              ToggleSwitch {
+                visible: root.usable
+                checked: root.receiving
+                busy: root.busy
+                foreground: root.foreground
+                onToggled: root.toggleOmdrop()
+              }
             }
           }
-        }
 
-        PanelSeparator { foreground: root.foreground }
+          Text {
+            x: Style.font.display + Style.space(14)
+            width: parent.width - x
+            visible: text !== ""
+            text: root.heroNote
+            color: root.detailUrgent ? root.urgent : Qt.darker(root.foreground, 1.22)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
 
-        Text {
-          width: parent.width
-          visible: text !== ""
-          text: root.detailText
-          color: root.detailUrgent ? root.urgent : Qt.darker(root.foreground, 1.5)
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.WordWrap
-        }
-
-        // The one thing a first run can act on from here. Everything else
-        // doctor reports is either a command (`omdrop setup`) or a restart, so
-        // only the missing driver gets a button -- and it opens a terminal
-        // rather than installing anything quietly. Installing a kernel module
-        // is the user's decision, taken at their own sudo prompt.
-        Button {
-          visible: root.driverInstallable
-          text: "Install the Wi-Fi driver"
-          bordered: true
-          foreground: root.foreground
-          onClicked: installDriverProc.running = true
+          // The one thing a first run can act on from here. Everything else
+          // doctor reports is either a command (`omdrop setup`) or a restart, so
+          // only the missing driver gets a button -- and it opens a terminal
+          // rather than installing anything quietly. Installing a kernel module
+          // is the user's decision, taken at their own sudo prompt.
+          Button {
+            x: Style.font.display + Style.space(14)
+            visible: root.driverInstallable
+            text: "Install the Wi-Fi driver"
+            bordered: true
+            foreground: root.foreground
+            onClicked: installDriverProc.running = true
+          }
         }
 
         PanelSeparator { visible: root.usable; foreground: root.foreground }
