@@ -44,7 +44,7 @@ Panel {
     implicitHeight: implicitWidth
 
     NumberAnimation on bearing {
-      running: mark.turning && Style.duration(1400) > 0
+      running: mark.turning && !Style.reduceMotion
       from: 48
       to: 408
       duration: 1400
@@ -157,7 +157,7 @@ Panel {
       color: row.valueColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
-      Behavior on color { ColorAnimation { duration: 200 } }
+      Behavior on color { ColorAnimation { duration: Style.duration(200) } }
     }
 
     Text {
@@ -170,7 +170,7 @@ Panel {
       color: row.open || rowMouse.containsMouse ? root.foreground : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
-      Behavior on rotation { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+      Behavior on rotation { NumberAnimation { duration: Style.duration(180); easing.type: Easing.OutCubic } }
     }
 
     MouseArea {
@@ -236,7 +236,7 @@ Panel {
     height: open ? drawerColumn.implicitHeight : 0
     visible: height > 0
     clip: true
-    Behavior on height { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+    Behavior on height { NumberAnimation { duration: Style.duration(260); easing.type: Easing.OutCubic } }
 
     Column {
       id: drawerColumn
@@ -1343,7 +1343,7 @@ Panel {
             width: parent.width
             height: root.radarOpen ? radarColumn.implicitHeight : 0
             clip: true
-            Behavior on height { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+            Behavior on height { NumberAnimation { duration: Style.duration(260); easing.type: Easing.OutCubic } }
 
             Column {
               id: radarColumn
@@ -1690,8 +1690,8 @@ Panel {
 
       SequentialAnimation {
         id: flashAnim
-        NumberAnimation { target: flash; property: "opacity"; to: 0.45; duration: 120; easing.type: Easing.OutQuad }
-        NumberAnimation { target: flash; property: "opacity"; to: 0; duration: 1400; easing.type: Easing.InQuad }
+        NumberAnimation { target: flash; property: "opacity"; to: 0.45; duration: Style.duration(120); easing.type: Easing.OutQuad }
+        NumberAnimation { target: flash; property: "opacity"; to: 0; duration: Style.duration(1400); easing.type: Easing.InQuad }
       }
     }
     Component.onCompleted: if (root.claimFlash(peer.mac)) flashAnim.start()
@@ -1813,7 +1813,7 @@ Panel {
           width: track.width * 0.3
 
           NumberAnimation on x {
-            running: segment.visible && track.visible
+            running: segment.visible && track.visible && !Style.reduceMotion
             loops: Animation.Infinite
             from: -segment.width; to: track.width
             duration: 1100; easing.type: Easing.InOutQuad

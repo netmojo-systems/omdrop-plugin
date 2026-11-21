@@ -208,7 +208,8 @@ Item {
   Process { id: voiceThree; property string peerMac: "" }
   NumberAnimation on sweepAngle {
     from: 0; to: 360; duration: 4000; loops: Animation.Infinite
-    running: root.active
+    running: root.active && !Style.reduceMotion
+    onRunningChanged: root.previousSweepAngle = -1
   }
 
   Repeater {
@@ -239,7 +240,7 @@ Item {
     anchors.centerIn: parent
     width: root.radius * 2; height: width
     rotation: root.sweepAngle
-    visible: root.scanning
+    visible: root.scanning && !Style.reduceMotion
     Shape {
       anchors.fill: parent
       ShapePath {
@@ -313,7 +314,7 @@ Item {
         target: contact
         property: "flare"
         to: 0
-        duration: 600
+        duration: Style.duration(600)
         easing.type: Easing.OutCubic
       }
       property real entrance: 0
@@ -321,10 +322,10 @@ Item {
       y: targetY
       opacity: present ? entrance : 0
       scale: 0.65 + 0.35 * entrance
-      Behavior on opacity { enabled: root.visible; NumberAnimation { duration: 200 } }
-      NumberAnimation on entrance { from: 0; to: 1; duration: 220; running: root.visible }
-      Behavior on x { enabled: root.visible; NumberAnimation { duration: 400 } }
-      Behavior on y { enabled: root.visible; NumberAnimation { duration: 400 } }
+      Behavior on opacity { enabled: root.visible; NumberAnimation { duration: Style.duration(200) } }
+      NumberAnimation on entrance { from: 0; to: 1; duration: Style.duration(220); running: root.visible }
+      Behavior on x { enabled: root.visible; NumberAnimation { duration: Style.duration(400) } }
+      Behavior on y { enabled: root.visible; NumberAnimation { duration: Style.duration(400) } }
 
       Rectangle {
         anchors.centerIn: parent
@@ -407,7 +408,7 @@ Item {
     anchors.bottom: parent.bottom; anchors.right: parent.right
     activeFocusOnTab: root.visible
     opacity: muteMouse.containsMouse || activeFocus ? 0.85 : 0.3
-    Behavior on opacity { NumberAnimation { duration: 150 } }
+    Behavior on opacity { NumberAnimation { duration: Style.duration(150) } }
     Accessible.role: Accessible.Button
     Accessible.name: root.muted ? "Unmute radar sound" : "Mute radar sound"
     Accessible.onPressAction: root.muteToggled()

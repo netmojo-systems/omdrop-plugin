@@ -36,7 +36,7 @@ Item {
     // when drifting stops: a loop ending at its far swing left the icon
     // tilted in the panel for as long as it stayed open.
     SequentialAnimation on anchors.verticalCenterOffset {
-      running: root.drifting
+      running: root.drifting && !Style.reduceMotion
       loops: Animation.Infinite
       alwaysRunToEnd: true
       NumberAnimation { to: 1.6; duration: 750; easing.type: Easing.OutSine }
@@ -45,7 +45,7 @@ Item {
     }
 
     SequentialAnimation on rotation {
-      running: root.drifting
+      running: root.drifting && !Style.reduceMotion
       loops: Animation.Infinite
       alwaysRunToEnd: true
       NumberAnimation { to: 4; duration: 950; easing.type: Easing.OutSine }
