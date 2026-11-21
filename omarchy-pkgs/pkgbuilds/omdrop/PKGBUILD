@@ -78,7 +78,7 @@ package() {
   # The plugin, as `omarchy plugin add` would clone it, minus what only
   # development needs: core's source, the tests, CI and this recipe. Without
   # core/PKGBUILD the plugin never offers to build or update core itself.
-  install -Dm644 -t "${share}" "${src}"/{manifest.json,Panel.qml,Radar.qml,OmdropIcon.qml,preview.png,README.md,LICENSE}
+  install -Dm644 -t "${share}" "${src}"/{manifest.json,Panel.qml,Radar.qml,OmdropIcon.qml,EveryBar.js,preview.png,README.md,LICENSE}
   install -Dm755 -t "${share}/bin" "${src}/bin/omdrop"
   install -Dm644 -t "${share}/bin" "${src}"/bin/*.py
   cp -r --no-preserve=ownership "${src}/bin/apple-ca" "${share}/bin/"

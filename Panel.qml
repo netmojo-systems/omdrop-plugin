@@ -6,6 +6,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
+import "EveryBar.js" as EveryBar
 
 // omdrop -- receive files from nearby Apple devices.
 //
@@ -122,10 +123,6 @@ Panel {
     else receivedProc.running = true
   }
 
-  function markReceivedSeen() {
-    if (received.length > 0) seenUntil = Math.max(seenUntil, latestArrival)
-  }
-
   function fileUrl(path) {
     return "file://" + path.split("/").map(encodeURIComponent).join("/")
   }
@@ -154,15 +151,18 @@ Panel {
         var list = []
         try { list = JSON.parse(text) } catch (e) {}
         root.received = Array.isArray(list) ? list.slice(0, 5) : []
-        if (root.seenUntil < 0) root.seenUntil = root.latestArrival
-        if (root.opened) root.markReceivedSeen()
+        if (root.opened || root.seenUntil < 0) EveryBar.markSeenUntil(root.latestArrival)
       }
     }
   }
 
   Process { id: openReceivedProc }
 
-  Component.onCompleted: refreshReceived()
+  Component.onCompleted: {
+    seenUntil = EveryBar.join(root)
+    refreshReceived()
+  }
+  Component.onDestruction: EveryBar.leave(root)
 
   readonly property var cursorTargets: {
     if (!usable) return []
@@ -1368,7 +1368,7 @@ Panel {
     target: root.ipcTarget
     function toggle(): string { root.toggleOmdrop(); return "ok" }
     function status(): string { return root.stateText }
-    function refresh(): string { root.refreshStatus(); root.refreshReceived(); return "ok" }
+    function refresh(): string { root.refreshStatus(); EveryBar.refreshReceived(); return "ok" }
   }
 
   BarIconButton {
