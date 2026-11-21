@@ -605,6 +605,90 @@ fn copy_to_clipboard(f: &Path) {
     }
 }
 
+const RECEIVED_FILE: &str = "received";
+const RECEIVED_LIST: usize = 20;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Arrival {
+    path: String,
+    time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preview: Option<String>,
+}
+
+fn note_arrival(dir: &Path, f: &Path, preview: Option<&Path>, time: u64) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(path) = f.to_str() else {
+        return;
+    };
+    let arrival = Arrival {
+        path: path.to_owned(),
+        time,
+        preview: preview.and_then(Path::to_str).map(str::to_owned),
+    };
+    let Ok(record) = serde_json::to_string(&arrival) else {
+        return;
+    };
+    let line = format!("\n{record}\n");
+    if mkdir_private(dir).is_err() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(RECEIVED_FILE))
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn arrivals_in(dir: &Path, limit: usize) -> Vec<Arrival> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut text = String::new();
+    let read = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(RECEIVED_FILE))
+        .and_then(|mut file| file.read_to_string(&mut text));
+    if read.is_err() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Arrival>(line).ok())
+        .filter(|a| seen.insert(a.path.clone()) && Path::new(&a.path).is_file())
+        .map(|mut a| {
+            if a.preview
+                .as_deref()
+                .is_some_and(|p| !Path::new(p).is_file())
+            {
+                a.preview = None;
+            }
+            a
+        })
+        .take(limit)
+        .collect()
+}
+
+pub fn cmd_received(args: &[OsString]) -> i32 {
+    let list = arrivals_in(&ctx().state_dir(), RECEIVED_LIST);
+    if args.first().is_some_and(|a| a == "--json") {
+        outln!(
+            "{}",
+            serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+        );
+    } else {
+        for arrival in &list {
+            outln!("{}", arrival.path);
+        }
+    }
+    0
+}
+
 /// Save, copy, announce. Opening is left to a click on the notification, so
 /// nothing runs on the person's behalf unasked. -t 8000 because the shell
 /// treats the timeout as a floor of 5 s for low urgency, and this toast is
@@ -626,6 +710,12 @@ pub fn cmd_handle(args: &[OsString]) -> i32 {
     } else {
         None
     };
+    note_arrival(
+        &ctx().state_dir(),
+        f,
+        image.as_deref().filter(|p| *p != f),
+        crate::names::now(),
+    );
     let where_ = tildify(&dirname(f.as_os_str()).to_string_lossy());
     let what = if have("wl-copy") {
         format!("Copied to clipboard, saved to {where_}/")
@@ -1260,6 +1350,25 @@ pub fn cmd_skill(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn received_lists_each_file_once_newest_first_while_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jpg");
+        let b = dir.path().join("b.pdf");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        note_arrival(dir.path(), &a, None, 1);
+        note_arrival(dir.path(), &dir.path().join("gone.txt"), None, 2);
+        note_arrival(dir.path(), &b, None, 3);
+        note_arrival(dir.path(), &a, None, 4);
+        let listed: Vec<(String, u64)> = arrivals_in(dir.path(), RECEIVED_LIST)
+            .into_iter()
+            .map(|x| (x.path, x.time))
+            .collect();
+        let name = |p: &Path| p.to_str().unwrap().to_owned();
+        assert_eq!(listed, vec![(name(&a), 4), (name(&b), 3)]);
+    }
 
     #[test]
     fn a_url_line_outside_the_shortcut_section_is_not_the_link() {

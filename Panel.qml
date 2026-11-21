@@ -108,12 +108,69 @@ Panel {
   property bool windowOpen: false
   property bool settingsOpen: false
   property string cursorTarget: ""
+  property var received: []
+  property real seenUntil: -1
+  property real shownSince: -1
+  property bool receivedOpen: false
+  property bool receivedAgain: false
+  readonly property bool unseen: received.length > 0 && seenUntil >= 0 && received[0].time > seenUntil
+  readonly property int newCount: shownSince < 0 ? 0 : received.filter(function(a) { return a.time > shownSince }).length
+
+  function refreshReceived() {
+    if (receivedProc.running) receivedAgain = true
+    else receivedProc.running = true
+  }
+
+  function markReceivedSeen() {
+    if (received.length > 0) seenUntil = Math.max(seenUntil, received[0].time)
+  }
+
+  function fileUrl(path) {
+    return "file://" + path.split("/").map(encodeURIComponent).join("/")
+  }
+
+  function thumbnailOf(arrival) {
+    if (arrival.preview) return fileUrl(arrival.preview)
+    return /\.(jpe?g|png|gif|webp|bmp)$/i.test(arrival.path) ? fileUrl(arrival.path) : ""
+  }
+
+  function openReceived(path) {
+    if (openReceivedProc.running) return
+    openReceivedProc.command = [root.cli, "act", "open", path]
+    openReceivedProc.running = true
+  }
+
+  Process {
+    id: receivedProc
+    command: [root.cli, "received", "--json"]
+    onExited: if (root.receivedAgain) {
+      root.receivedAgain = false
+      running = true
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var list = []
+        try { list = JSON.parse(text) } catch (e) {}
+        root.received = Array.isArray(list) ? list.slice(0, 5) : []
+        if (root.seenUntil < 0) root.seenUntil = root.received.length > 0 ? root.received[0].time : 0
+        if (root.opened) root.markReceivedSeen()
+      }
+    }
+  }
+
+  Process { id: openReceivedProc }
+
+  Component.onCompleted: refreshReceived()
 
   readonly property var cursorTargets: {
     if (!usable) return []
     var targets = ["header", "send"]
     if (radarOpen)
       for (var i = 0; i < peerRows.count; i++) targets.push("peer:" + peerRows.get(i).mac)
+    if (received.length > 0) targets.push("received")
+    if (receivedOpen)
+      for (var r = 0; r < received.length; r++) targets.push("received:" + received[r].path)
     targets.push("window")
     if (windowOpen) targets.push("slider")
     targets.push("audience")
@@ -134,6 +191,8 @@ Panel {
     if (key === "slider") return "window"
     if (key.indexOf("sender:") === 0 || key === "senderField" || key === "everyone" || key === "contacts") return "audience"
     if (key === "name" || key === "folder") return "settings"
+    if (key.indexOf("received:") === 0) return "received"
+    if (key === "received") return "window"
     return ""
   }
 
@@ -168,6 +227,8 @@ Panel {
     var target = cursorTarget
     if (target === "" || target === "header") toggleOmdrop()
     else if (target === "send") openRadar()
+    else if (target === "received") receivedOpen = !receivedOpen
+    else if (target.indexOf("received:") === 0) openReceived(target.substring(9))
     else if (target === "window") windowOpen = !windowOpen
     else if (target === "audience") toggleSenders()
     else if (target === "everyone" || target === "contacts") setAudience(target)
@@ -1285,7 +1346,13 @@ Panel {
   onOpenedChanged: {
     if (opened && !busy) root.refreshStatus()
     if (!opened && !sendProc.running && !pickingDir) radarOpen = false
+    if (opened) {
+      shownSince = seenUntil
+      refreshReceived()
+    }
     if (!opened && !pickingDir) {
+      receivedOpen = false
+      shownSince = -1
       windowOpen = false
       settingsOpen = false
       cursorTarget = ""
@@ -1300,7 +1367,7 @@ Panel {
     target: root.ipcTarget
     function toggle(): string { root.toggleOmdrop(); return "ok" }
     function status(): string { return root.stateText }
-    function refresh(): string { root.refreshStatus(); return "ok" }
+    function refresh(): string { root.refreshStatus(); root.refreshReceived(); return "ok" }
   }
 
   BarIconButton {
@@ -1322,6 +1389,17 @@ Panel {
       if (buttonCode === Qt.RightButton) root.toggleOmdrop()
       else root.toggle()
     }
+  }
+
+  Rectangle {
+    visible: root.unseen
+    width: Math.max(4, Style.space(5))
+    height: width
+    radius: width / 2
+    color: Commons.Color.accent
+    anchors.centerIn: button
+    anchors.horizontalCenterOffset: Style.bar.iconSize * 0.62
+    anchors.verticalCenterOffset: -Style.bar.iconSize * 0.52
   }
 
   KeyboardPanel {
@@ -1514,6 +1592,99 @@ Panel {
                 soundDir: Qt.resolvedUrl("share/sounds").toString().replace("file://", "")
                 onMuteToggled: root.toggleSound()
                 onPeerClicked: function(mac) { root.sendTo(mac) }
+              }
+            }
+          }
+
+          DisclosureRow {
+            key: "received"
+            visible: root.received.length > 0
+            glyph: "\uDB80\uDDDA"
+            label: "Received"
+            value: root.newCount > 0 ? root.newCount + " new" : ""
+            valueColor: Commons.Color.accent
+            open: root.receivedOpen
+            onClicked: root.receivedOpen = !root.receivedOpen
+          }
+
+          Drawer {
+            open: root.receivedOpen && root.received.length > 0
+            bottomPadding: Style.space(4)
+
+            Repeater {
+              model: root.received
+              delegate: CursorSurface {
+                id: arrivalRow
+                required property var modelData
+                readonly property string key: "received:" + modelData.path
+                hasCursor: root.cursorTarget === key
+                foreground: root.foreground
+                width: parent.width
+                implicitHeight: Style.space(34)
+
+                Item {
+                  id: arrivalThumbBox
+                  x: root.rowInset - Style.space(1.6)
+                  width: Style.font.display
+                  height: width
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Image {
+                    id: arrivalThumb
+                    anchors.centerIn: parent
+                    width: Style.space(22)
+                    height: width
+                    source: root.thumbnailOf(arrivalRow.modelData)
+                    sourceSize.width: width * 2
+                    sourceSize.height: height * 2
+                    fillMode: Image.PreserveAspectCrop
+                    asynchronous: true
+                    cache: false
+                    visible: status === Image.Ready
+                  }
+
+                  Text {
+                    anchors.centerIn: parent
+                    visible: arrivalThumb.status !== Image.Ready
+                    text: "\uDB80\uDE14"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.icon
+                  }
+                }
+
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: root.textColumn
+                  anchors.right: arrivalTime.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: arrivalRow.modelData.path.split("/").pop()
+                  textFormat: Text.PlainText
+                  elide: Text.ElideMiddle
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                Text {
+                  id: arrivalTime
+                  anchors.right: parent.right
+                  anchors.rightMargin: root.rowInset
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: Qt.formatTime(new Date(arrivalRow.modelData.time * 1000), "HH:mm")
+                  color: root.note
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onContainsMouseChanged: root.hoverCursor(arrivalRow.key, containsMouse)
+                  onClicked: root.openReceived(arrivalRow.modelData.path)
+                }
               }
             }
           }

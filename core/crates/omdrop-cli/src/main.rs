@@ -48,6 +48,7 @@ const USAGE: &str = r#"omdrop -- send and receive files with nearby Apple device
                     off; --force stops anyway
   toggle            off if receiving, on if not
   status [--json]   receiving or not, time left, the name Macs see
+  received [--json] the files that arrived since login, newest first
   send [NAME] FILE...|URL...
                     send files to a nearby Apple device, as one transfer
                     it accepts once, or send http/https links. A .webloc or
@@ -186,6 +187,7 @@ fn main() {
         "watch" => links::cmd_watch(&s),
         "resume" => window::cmd_resume(),
         "handle" => links::cmd_handle(rest),
+        "received" => links::cmd_received(rest),
         identity::IDENTITY_SUBCOMMAND => identity::cmd_identity_child(&s),
         "-V" | "--version" | "version" => cmd_version(),
         "-h" | "--help" | "help" => {
