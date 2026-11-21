@@ -113,7 +113,8 @@ Panel {
   property real shownSince: -1
   property bool receivedOpen: false
   property bool receivedAgain: false
-  readonly property bool unseen: received.length > 0 && seenUntil >= 0 && received[0].time > seenUntil
+  readonly property real latestArrival: received.reduce(function(latest, a) { return Math.max(latest, a.time) }, 0)
+  readonly property bool unseen: seenUntil >= 0 && latestArrival > seenUntil
   readonly property int newCount: shownSince < 0 ? 0 : received.filter(function(a) { return a.time > shownSince }).length
 
   function refreshReceived() {
@@ -122,7 +123,7 @@ Panel {
   }
 
   function markReceivedSeen() {
-    if (received.length > 0) seenUntil = Math.max(seenUntil, received[0].time)
+    if (received.length > 0) seenUntil = Math.max(seenUntil, latestArrival)
   }
 
   function fileUrl(path) {
@@ -153,7 +154,7 @@ Panel {
         var list = []
         try { list = JSON.parse(text) } catch (e) {}
         root.received = Array.isArray(list) ? list.slice(0, 5) : []
-        if (root.seenUntil < 0) root.seenUntil = root.received.length > 0 ? root.received[0].time : 0
+        if (root.seenUntil < 0) root.seenUntil = root.latestArrival
         if (root.opened) root.markReceivedSeen()
       }
     }
@@ -1672,7 +1673,7 @@ Panel {
                   anchors.right: parent.right
                   anchors.rightMargin: root.rowInset
                   anchors.verticalCenter: parent.verticalCenter
-                  text: Qt.formatTime(new Date(arrivalRow.modelData.time * 1000), "HH:mm")
+                  text: Qt.formatTime(new Date(arrivalRow.modelData.time), "HH:mm")
                   color: root.note
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
