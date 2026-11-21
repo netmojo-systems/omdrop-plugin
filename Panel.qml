@@ -32,53 +32,6 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  // One of the Everyone / Contacts Only tabs. The chosen one is lit; the
-  // other stays dark until hovered, when it brightens to say it can be clicked.
-  component AudienceTab: Item {
-    id: tab
-    property string glyph
-    property string label
-    property bool selected
-    signal chosen()
-
-    implicitWidth: tabRow.implicitWidth
-    implicitHeight: tabRow.implicitHeight
-
-    readonly property bool hovered: tabMouse.containsMouse && !selected
-    readonly property color tint: selected ? root.foreground
-                                  : hovered ? Qt.darker(root.foreground, 1.4)
-                                  : Qt.darker(root.foreground, 2.0)
-
-    Row {
-      id: tabRow
-      spacing: Style.space(6)
-      Text {
-        text: tab.glyph
-        color: tab.tint
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        anchors.verticalCenter: parent.verticalCenter
-      }
-      Text {
-        text: tab.label
-        color: tab.tint
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        font.bold: true
-        font.letterSpacing: 1.2
-        anchors.verticalCenter: parent.verticalCenter
-      }
-    }
-
-    MouseArea {
-      id: tabMouse
-      anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: tab.selected ? Qt.ArrowCursor : Qt.PointingHandCursor
-      onClicked: tab.chosen()
-    }
-  }
-
   component RadarMark: Item {
     id: mark
     property color color: root.foreground
@@ -227,6 +180,47 @@ Panel {
       cursorShape: Qt.PointingHandCursor
       onContainsMouseChanged: row.hasCursor = containsMouse
       onClicked: row.clicked()
+    }
+  }
+
+  component ChoiceRow: CursorSurface {
+    id: choice
+    property string label
+    property bool chosen: false
+    signal picked()
+
+    foreground: root.foreground
+    width: parent ? parent.width : 0
+    implicitHeight: Style.space(30)
+
+    Text {
+      anchors.left: parent.left
+      anchors.leftMargin: root.textColumn
+      anchors.right: choiceMark.left
+      anchors.verticalCenter: parent.verticalCenter
+      text: choice.label
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    Text {
+      id: choiceMark
+      anchors.right: parent.right
+      anchors.rightMargin: root.rowInset
+      anchors.verticalCenter: parent.verticalCenter
+      text: choice.chosen ? "\uDB81\uDC3E" : "\uDB81\uDC3D"
+      color: choice.chosen ? Commons.Color.accent : root.note
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.iconLarge
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: choice.chosen ? Qt.ArrowCursor : Qt.PointingHandCursor
+      onContainsMouseChanged: choice.hasCursor = containsMouse
+      onClicked: choice.picked()
     }
   }
 
@@ -1468,188 +1462,123 @@ Panel {
               }
             }
           }
-        }
 
-        // Who may send. Shown while Omdrop is off too, so the choice can be
-        // made before a window opens rather than a few seconds into one. It is
-        // saved, and applies to every window until changed.
-        PanelSeparator { visible: root.usable; foreground: root.foreground }
-
-        Item {
-          visible: root.usable
-          width: parent.width
-          implicitHeight: Math.max(audienceTabs.implicitHeight, sendersButton.implicitHeight)
-
-          Row {
-            id: audienceTabs
-            spacing: Style.space(22)
-            anchors.verticalCenter: parent.verticalCenter
-
-            // nf-md-account_multiple (U+F000E) and nf-md-account_circle
-            // (U+F0009), written as surrogate pairs.
-            AudienceTab {
-              glyph: "\uDB80\uDC0E"
-              label: "EVERYONE"
-              selected: root.audience === "everyone"
-              onChosen: root.setAudience("everyone")
-            }
-            AudienceTab {
-              glyph: "\uDB80\uDC09"
-              label: "CONTACTS ONLY"
-              selected: root.audience === "contacts"
-              onChosen: root.setAudience("contacts")
-            }
+          DisclosureRow {
+            glyph: "\uDB80\uDC0E"
+            label: "Receive from"
+            value: root.sendersOpen ? "" : root.audience === "contacts" ? "Contacts only" : "Everyone"
+            open: root.sendersOpen
+            onClicked: root.toggleSenders()
           }
 
-          // Opens the known-senders list. The count sits beside the icon in
-          // the same dark colour, and is left out while the list is empty.
-          Item {
-            id: sendersButton
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            implicitWidth: sendersRow.implicitWidth
-            implicitHeight: sendersRow.implicitHeight + Style.space(4)
-            width: implicitWidth
-            height: implicitHeight
-            readonly property color tint: root.sendersOpen || sendersMouse.containsMouse
-                                          ? root.foreground : Qt.darker(root.foreground, 2.0)
+          Drawer {
+            open: root.sendersOpen
+            spacing: Style.space(2)
+            bottomPadding: Style.space(8)
 
-            Row {
-              id: sendersRow
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(3)
-              Text {
-                // nf-md-account_multiple_plus (U+F0010)
-                text: "\uDB80\uDC10"
-                color: sendersButton.tint
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                anchors.verticalCenter: parent.verticalCenter
+            ChoiceRow {
+              label: "Everyone"
+              chosen: root.audience === "everyone"
+              onPicked: root.setAudience("everyone")
+            }
+
+            ChoiceRow {
+              label: "Contacts only"
+              chosen: root.audience === "contacts"
+              onPicked: root.setAudience("contacts")
+            }
+
+            Repeater {
+              model: root.audience === "contacts" ? root.senderList : []
+              delegate: Item {
+                id: senderRow
+                required property string modelData
+                width: parent.width
+                implicitHeight: Style.space(28)
+
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: root.textColumn
+                  anchors.right: removeGlyph.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: senderRow.modelData
+                  textFormat: Text.PlainText
+                  elide: Text.ElideRight
+                  color: root.note
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+                Text {
+                  id: removeGlyph
+                  anchors.right: parent.right
+                  anchors.rightMargin: root.rowInset + Style.space(3.6)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "\uDB80\uDD56"
+                  color: senderMouse.containsMouse ? root.foreground : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.icon
+                }
+                MouseArea {
+                  id: senderMouse
+                  anchors.fill: removeGlyph
+                  anchors.margins: -Style.space(6)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.removeSender(senderRow.modelData)
+                }
+                PanelToolTip {
+                  visible: senderMouse.containsMouse
+                  text: "Remove " + senderRow.modelData
+                  fontFamily: root.fontFamily
+                }
               }
-              Text {
-                visible: root.senders > 0
-                text: root.senders
-                color: sendersButton.tint
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.verticalCenter: parent.verticalCenter
-              }
             }
 
-            MouseArea {
-              id: sendersMouse
-              anchors.fill: parent
-              anchors.margins: -Style.space(4)
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.toggleSenders()
-            }
-
-            PanelToolTip {
-              visible: sendersMouse.containsMouse
-              text: "Known senders, for Contacts Only"
-              fontFamily: root.fontFamily
-            }
-          }
-        }
-
-        // The known-senders list, opened from the button above.
-        Column {
-          visible: root.usable && root.sendersOpen
-          width: parent.width
-          spacing: Style.space(2)
-
-          Repeater {
-            model: root.senderList
-            delegate: Item {
-              id: senderRow
-              required property string modelData
+            Item {
+              visible: root.audience === "contacts"
               width: parent.width
-              implicitHeight: senderText.implicitHeight + Style.space(10)
+              implicitHeight: senderField.implicitHeight + Style.space(6)
 
-              Rectangle {
-                anchors.fill: parent
-                visible: senderMouse.containsMouse
-                color: Style.hoverFillFor(root.foreground, Commons.Color.accent)
-              }
-              Text {
-                id: senderText
+              TextField {
+                id: senderField
                 anchors.left: parent.left
-                anchors.leftMargin: Style.space(10)
-                anchors.right: removeGlyph.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: senderRow.modelData
-                textFormat: Text.PlainText
-                elide: Text.ElideRight
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
-              Text {
-                id: removeGlyph
+                anchors.leftMargin: root.textColumn
                 anchors.right: parent.right
-                anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-                text: "×"
-                color: senderMouse.containsMouse ? root.foreground : root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              MouseArea {
-                id: senderMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.removeSender(senderRow.modelData)
-              }
-              PanelToolTip {
-                visible: senderMouse.containsMouse
-                text: "Remove " + senderRow.modelData
-                fontFamily: root.fontFamily
+                anchors.rightMargin: root.rowInset
+                anchors.bottom: parent.bottom
+                foreground: root.foreground
+                placeholderText: "Apple ID email or phone number"
+                onTextEdited: root.senderError = ""
+                onAccepted: root.addSender(text)
+                Keys.onEscapePressed: keyCatcher.forceActiveFocus()
               }
             }
+
+            Text {
+              x: root.textColumn
+              width: parent.width - x - root.rowInset
+              visible: root.audience === "contacts" && root.senderError !== ""
+              text: root.senderError
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              topPadding: Style.space(4)
+            }
+
+            Text {
+              x: root.textColumn
+              width: parent.width - x - root.rowInset
+              visible: root.audience === "contacts" && root.senderList.length === 0 && root.senderError === ""
+              text: "Only these people can send to you. Use the email or phone number of their Apple ID."
+              color: Qt.darker(root.foreground, 1.5)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              topPadding: Style.space(4)
+            }
           }
-
-          TextField {
-            id: senderField
-            width: parent.width
-            foreground: root.foreground
-            placeholderText: "Apple ID email or phone number"
-            onTextEdited: root.senderError = ""
-            onAccepted: root.addSender(text)
-            Keys.onEscapePressed: keyCatcher.forceActiveFocus()
-          }
-
-          Text {
-            width: parent.width
-            visible: root.senderError !== ""
-            text: root.senderError
-            color: root.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-            topPadding: Style.space(4)
-          }
-
-          Text {
-            width: parent.width
-            visible: root.senderList.length === 0 && root.senderError === ""
-            text: "In Contacts Only, only these people can send to you. Use the email or phone number of their Apple ID."
-            color: Qt.darker(root.foreground, 1.5)
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-            topPadding: Style.space(4)
-          }
-        }
-
-        PanelSeparator { visible: root.usable; foreground: root.foreground }
-
-        Column {
-          visible: root.usable
-          width: parent.width
-          spacing: Style.space(2)
 
           DisclosureRow {
             glyph: "\uDB81\uDC93"
