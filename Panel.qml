@@ -1203,7 +1203,7 @@ Panel {
   onOpenedChanged: {
     if (opened && !busy) root.refreshStatus()
     if (!opened && !sendProc.running && !pickingDir) radarOpen = false
-    if (!opened) {
+    if (!opened && !pickingDir) {
       windowOpen = false
       settingsOpen = false
     }
