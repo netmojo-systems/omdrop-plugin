@@ -1903,7 +1903,11 @@ fn clip_dirs_left(f: &Fixture) -> Vec<PathBuf> {
     std::fs::read_dir(f.root.join("run/omdrop"))
         .map(|d| {
             d.map(|e| e.unwrap().path())
-                .filter(|p| !p.ends_with("previews") && !p.ends_with("decode.lock"))
+                .filter(|p| {
+                    !p.ends_with("previews")
+                        && !p.ends_with("decode.lock")
+                        && !p.ends_with("received")
+                })
                 .collect()
         })
         .unwrap_or_default()

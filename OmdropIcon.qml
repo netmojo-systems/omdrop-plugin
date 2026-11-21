@@ -24,7 +24,12 @@ Item {
   implicitHeight: iconSize
 
   Item {
+    property real sway: 0
+    property real tilt: 0
+
     anchors.centerIn: parent
+    anchors.verticalCenterOffset: Style.reduceMotion ? 0 : sway
+    rotation: Style.reduceMotion ? 0 : tilt
     width: 24
     height: 24
     scale: root.iconSize / 24
@@ -35,8 +40,8 @@ Item {
     // ends back at rest, because alwaysRunToEnd finishes the loop in progress
     // when drifting stops: a loop ending at its far swing left the icon
     // tilted in the panel for as long as it stayed open.
-    SequentialAnimation on anchors.verticalCenterOffset {
-      running: root.drifting
+    SequentialAnimation on sway {
+      running: root.drifting && !Style.reduceMotion
       loops: Animation.Infinite
       alwaysRunToEnd: true
       NumberAnimation { to: 1.6; duration: 750; easing.type: Easing.OutSine }
@@ -44,8 +49,8 @@ Item {
       NumberAnimation { to: 0; duration: 750; easing.type: Easing.InSine }
     }
 
-    SequentialAnimation on rotation {
-      running: root.drifting
+    SequentialAnimation on tilt {
+      running: root.drifting && !Style.reduceMotion
       loops: Animation.Infinite
       alwaysRunToEnd: true
       NumberAnimation { to: 4; duration: 950; easing.type: Easing.OutSine }
