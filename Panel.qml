@@ -129,7 +129,19 @@ Panel {
     return targets
   }
 
-  onCursorTargetsChanged: if (cursorTarget !== "" && cursorTargets.indexOf(cursorTarget) < 0) cursorTarget = ""
+  function rowHolding(key) {
+    if (key.indexOf("peer:") === 0) return "send"
+    if (key === "slider") return "window"
+    if (key.indexOf("sender:") === 0 || key === "senderField" || key === "everyone" || key === "contacts") return "audience"
+    if (key === "name" || key === "folder") return "settings"
+    return ""
+  }
+
+  onCursorTargetsChanged: {
+    var target = cursorTarget
+    while (target !== "" && cursorTargets.indexOf(target) < 0) target = rowHolding(target)
+    cursorTarget = target
+  }
 
   function hoverCursor(key, inside) {
     if (inside && cursorTargets.indexOf(key) >= 0) cursorTarget = key
