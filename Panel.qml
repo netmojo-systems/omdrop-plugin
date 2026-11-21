@@ -144,6 +144,7 @@ Panel {
   }
 
   function hoverCursor(key, inside) {
+    if (keyCatcher.blocked) return
     if (inside && cursorTargets.indexOf(key) >= 0) cursorTarget = key
     else if (!inside && cursorTarget === key) cursorTarget = ""
   }
@@ -1538,6 +1539,8 @@ Panel {
               width: parent.width
               implicitHeight: windowSlider.implicitHeight + Style.space(2)
 
+              HoverHandler { onHoveredChanged: root.hoverCursor("slider", hovered) }
+
               PanelSlider {
                 id: windowSlider
                 anchors.left: parent.left
@@ -1652,6 +1655,8 @@ Panel {
                 id: senderField
                 onVisibleChanged: if (!visible && activeFocus) keyCatcher.forceActiveFocus()
                 hasCursor: root.cursorTarget === "senderField"
+                onHoveredChanged: root.hoverCursor("senderField", hovered)
+                onActiveFocusChanged: if (activeFocus && root.cursorTargets.indexOf("senderField") >= 0) root.cursorTarget = "senderField"
                 anchors.left: parent.left
                 anchors.leftMargin: root.textColumn
                 anchors.right: parent.right
@@ -1721,6 +1726,7 @@ Panel {
                 id: nameField
                 onVisibleChanged: if (!visible && activeFocus) keyCatcher.forceActiveFocus()
                 hasCursor: root.cursorTarget === "name"
+                onHoveredChanged: root.hoverCursor("name", hovered)
                 anchors.left: parent.left
                 anchors.leftMargin: root.settingInset
                 anchors.right: parent.right
@@ -1730,7 +1736,9 @@ Panel {
                 // Don't fight the user's typing: the polled name is only taken
                 // back while this field is not being edited. Leaving the field
                 // keeps what was typed, the same as Enter.
-                onActiveFocusChanged: if (!activeFocus) {
+                onActiveFocusChanged: if (activeFocus) {
+                  if (root.cursorTargets.indexOf("name") >= 0) root.cursorTarget = "name"
+                } else {
                   root.setDeviceName(text)
                   text = root.shownName
                 }
