@@ -1542,6 +1542,7 @@ Panel {
 
               TextField {
                 id: senderField
+                onVisibleChanged: if (!visible && activeFocus) keyCatcher.forceActiveFocus()
                 anchors.left: parent.left
                 anchors.leftMargin: root.textColumn
                 anchors.right: parent.right
