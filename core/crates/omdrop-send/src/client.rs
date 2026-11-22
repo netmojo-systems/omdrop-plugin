@@ -500,13 +500,19 @@ impl<'a> Client<'a> {
         if self.conn.as_ref().is_none_or(|c| c.closed) {
             self.reconnect()?;
         }
-        if let Some(conn) = self.conn.as_ref()
-            && let crate::http::UploadTcp::Stock(e) = conn.bound_upload_retransmits()?
-        {
-            self.log.warning(
-                "airdrop",
-                &format!("upload keeps stock TCP retransmissions: {e}"),
-            );
+        if let Some(conn) = self.conn.as_ref() {
+            match conn.bound_upload_retransmits() {
+                Ok(crate::http::UploadTcp::Capped) => {}
+                Ok(crate::http::UploadTcp::Stock(e)) => self.log.warning(
+                    "airdrop",
+                    &format!("upload keeps stock TCP retransmissions: {e}"),
+                ),
+                Err(e) => {
+                    // As post() does after a failed exchange: this socket is in no known state.
+                    self.conn = None;
+                    return Err(e);
+                }
+            }
         }
         let mode = debugdump::mode(self.sender.verbose);
         let mut cpio_bytes = 0u64;

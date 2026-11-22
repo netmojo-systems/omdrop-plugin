@@ -780,10 +780,13 @@ mod tests {
 
     #[test]
     fn a_restore_that_cannot_be_verified_fails_the_upload() {
+        // The cap is set, reads back wrong, and then can't be put back to 120000.
         let f = Fake {
-            fail_set: Some((TCP_RTO_MAX_MS, None)),
+            lie: Some((TCP_RTO_MAX_MS, 1300)),
+            fail_set: Some((TCP_RTO_MAX_MS, Some(120_000))),
             ..Fake::stock()
         };
         assert!(bound_upload_retransmits(&f).is_err());
+        assert_eq!(f.now().0, 1300, "the cap was mutated and left set");
     }
 }
