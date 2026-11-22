@@ -28,7 +28,7 @@ pub const DRIVER_PKG: &str = "brcmfmac-awdl-dkms";
 /// drift away from what anyone reviewed. It also appears literally in the
 /// build script below, because a baseline scanner cannot resolve a variable;
 /// a test keeps the two equal.
-pub const DRIVER_COMMIT: &str = "7a19bce180526f6768e08114201939106156de8a";
+pub const DRIVER_COMMIT: &str = "f552084028de3eab06980102141f8d1a4140ab54";
 /// The package version that commit builds. install-driver rebuilds any older
 /// installed driver: a fix inside the helper changes nothing a feature probe
 /// could see.
@@ -892,7 +892,7 @@ pub fn build_script(
             // source they built as root, /tmp is RAM on this hardware, and a
             // later version is a pull rather than a fresh clone.
             build.push_str(&format!(
-                "\nmkdir -p \"$(dirname '{src}')\"\nif [ -d '{src}/.git' ]; then\n  git -C '{src}' fetch --quiet origin\nelse\n  git clone --quiet {DRIVER_REPO} '{src}'\nfi\necho 'Building driver commit {DRIVER_COMMIT}'\ngit -C '{src}' checkout --detach 7a19bce180526f6768e08114201939106156de8a && makepkg --dir '{src}' -si"
+                "\nmkdir -p \"$(dirname '{src}')\"\nif [ -d '{src}/.git' ]; then\n  git -C '{src}' fetch --quiet origin\nelse\n  git clone --quiet {DRIVER_REPO} '{src}'\nfi\necho 'Building driver commit {DRIVER_COMMIT}'\ngit -C '{src}' checkout --detach f552084028de3eab06980102141f8d1a4140ab54 && makepkg --dir '{src}' -si"
             ));
         }
     }

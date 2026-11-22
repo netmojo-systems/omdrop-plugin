@@ -1275,7 +1275,7 @@ DRIVER_PKG=brcmfmac-awdl-dkms
 # checkout below is detached at this SHA and the build only runs if it
 # succeeded. Bump it, in the same commit, whenever the plugin needs a newer
 # driver: the full 40 characters, because a short SHA is not a pin.
-DRIVER_COMMIT=7a19bce180526f6768e08114201939106156de8a
+DRIVER_COMMIT=f552084028de3eab06980102141f8d1a4140ab54
 # The package version that commit builds, with its pkgrel. install-driver
 # rebuilds any older installed driver: a fix inside the helper, such as 0.5.1's,
 # changes nothing a feature probe could see, and a packaging fix such as
@@ -1350,7 +1350,7 @@ else
   git clone --quiet $DRIVER_REPO '$src'
 fi
 echo 'Building driver commit $DRIVER_COMMIT'
-git -C '$src' checkout --detach 7a19bce180526f6768e08114201939106156de8a && makepkg --dir '$src' -si"
+git -C '$src' checkout --detach f552084028de3eab06980102141f8d1a4140ab54 && makepkg --dir '$src' -si"
     fi
   fi
 
