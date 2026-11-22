@@ -31,61 +31,98 @@ const CHUNK_BYTES: usize = 64 << 10;
 /// The Upload socket's cap on TCP's retransmission timeout (#79): through an
 /// AWDL blackout, keep retrying every 1.3 s instead of backing off to minutes,
 /// so the first frame after the peer returns is answered.
-const UPLOAD_RTO_MAX_MS: u32 = 1300;
+const UPLOAD_RTO_MAX_MS: libc::c_int = 1300;
 /// How long the capped Upload keeps retrying without an ACK: without it, the
 /// kernel's tcp_retries2 model gives a 1.3 s cap only about 18 s.
-const UPLOAD_USER_TIMEOUT_MS: u32 = 120_000;
+const UPLOAD_USER_TIMEOUT_MS: libc::c_int = 120_000;
 /// From linux/tcp.h (Linux 6.15); libc does not define it yet.
 const TCP_RTO_MAX_MS: libc::c_int = 44;
 
-/// Set an IPPROTO_TCP option and read it back.
-fn tcp_opt(sock: &TcpStream, name: libc::c_int, value: u32) -> io::Result<()> {
-    let fd = sock.as_raw_fd();
-    let set = libc::c_int::try_from(value).map_err(io::Error::other)?;
-    // SAFETY: fd is a live TCP socket owned by `sock`; the buffer is a local c_int.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            name,
-            (&raw const set).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+/// IPPROTO_TCP integer options, so the cap's rollback can be tested without a kernel.
+trait TcpOpts {
+    fn get(&self, name: libc::c_int) -> io::Result<libc::c_int>;
+    fn set(&self, name: libc::c_int, value: libc::c_int) -> io::Result<()>;
+}
+
+impl TcpOpts for TcpStream {
+    fn get(&self, name: libc::c_int) -> io::Result<libc::c_int> {
+        let mut got: libc::c_int = 0;
+        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: a live TCP socket owned by `self`; `got` and `len` are valid for writes.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                name,
+                (&raw mut got).cast(),
+                &raw mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(got)
     }
-    let mut got: libc::c_int = 0;
-    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: as above; `got` and `len` are valid for writes.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            name,
-            (&raw mut got).cast(),
-            &raw mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+
+    fn set(&self, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
+        // SAFETY: as above; the buffer is a local c_int.
+        let rc = unsafe {
+            libc::setsockopt(
+                self.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                name,
+                (&raw const value).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
-    if got != set {
+}
+
+/// How the Upload socket's retransmissions ended up.
+#[derive(Debug)]
+pub enum UploadTcp {
+    Capped,
+    /// Unchanged kernel defaults, verified; why the cap was not applied.
+    Stock(io::Error),
+}
+
+fn set_verified(sock: &impl TcpOpts, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
+    sock.set(name, value)?;
+    let got = sock.get(name)?;
+    if got != value {
         return Err(io::Error::other(format!(
-            "TCP option {name} reads back {got}, not {set}"
+            "TCP option {name} reads back {got}, not {value}"
         )));
     }
     Ok(())
 }
 
-/// The user timeout, then the RTO cap. If the cap can't be set (a kernel before
-/// 6.15), the user timeout goes back to the kernel default, so the socket keeps
-/// stock TCP; the error says why.
-fn bound_upload_retransmits(sock: &TcpStream) -> io::Result<()> {
-    tcp_opt(sock, libc::TCP_USER_TIMEOUT, UPLOAD_USER_TIMEOUT_MS)?;
-    tcp_opt(sock, TCP_RTO_MAX_MS, UPLOAD_RTO_MAX_MS).inspect_err(|_| {
-        let _ = tcp_opt(sock, libc::TCP_USER_TIMEOUT, 0);
-    })
+/// The user timeout and the RTO cap together, or neither. A kernel that can't
+/// read either option is left untouched. A failure part-way restores both
+/// original values and verifies them; an error means the socket is in neither
+/// state and must not carry the Upload.
+fn bound_upload_retransmits(sock: &impl TcpOpts) -> io::Result<UploadTcp> {
+    let (rto, user) = match (sock.get(TCP_RTO_MAX_MS), sock.get(libc::TCP_USER_TIMEOUT)) {
+        (Ok(r), Ok(u)) => (r, u),
+        (Err(e), _) | (_, Err(e)) => return Ok(UploadTcp::Stock(e)),
+    };
+    let applied = set_verified(sock, libc::TCP_USER_TIMEOUT, UPLOAD_USER_TIMEOUT_MS)
+        .and_then(|()| set_verified(sock, TCP_RTO_MAX_MS, UPLOAD_RTO_MAX_MS));
+    let Err(why) = applied else {
+        return Ok(UploadTcp::Capped);
+    };
+    let restored = set_verified(sock, TCP_RTO_MAX_MS, rto);
+    let restored = set_verified(sock, libc::TCP_USER_TIMEOUT, user).and(restored);
+    match restored {
+        Ok(()) => Ok(UploadTcp::Stock(why)),
+        Err(e) => Err(io::Error::other(format!(
+            "the Upload socket's retransmission options are half-set ({why}) and could not be restored: {e}"
+        ))),
+    }
 }
 
 /// A receiver's address, and the host text Python used for it.
@@ -303,7 +340,7 @@ impl Conn {
     }
 
     /// Bound this connection's retransmissions for the Upload (#79).
-    pub fn bound_upload_retransmits(&self) -> io::Result<()> {
+    pub fn bound_upload_retransmits(&self) -> io::Result<UploadTcp> {
         bound_upload_retransmits(&self.stream.sock.sock)
     }
 
@@ -604,6 +641,9 @@ impl<W: Write> Write for Chunked<'_, W> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -638,33 +678,112 @@ mod tests {
         assert_eq!(out, b"5\r\nhello\r\n0\r\n\r\n");
     }
 
-    fn tcp_get(sock: &TcpStream, name: libc::c_int) -> libc::c_int {
-        let mut got: libc::c_int = -1;
-        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: a live socket; `got` and `len` are valid for writes.
-        let rc = unsafe {
-            libc::getsockopt(
-                sock.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                name,
-                (&raw mut got).cast(),
-                &raw mut len,
-            )
-        };
-        if rc == 0 { got } else { -1 }
+    /// A socket whose options live in a map. `fail_get` names an option whose
+    /// read errors; `fail_set` an option (and value, or None for any) whose
+    /// set errors; `lie` an option that reads back wrong while it holds that value.
+    #[derive(Default)]
+    struct Fake {
+        opts: RefCell<HashMap<libc::c_int, libc::c_int>>,
+        fail_get: Option<libc::c_int>,
+        fail_set: Option<(libc::c_int, Option<libc::c_int>)>,
+        lie: Option<(libc::c_int, libc::c_int)>,
+    }
+
+    impl Fake {
+        fn stock() -> Fake {
+            let f = Fake::default();
+            f.opts
+                .borrow_mut()
+                .extend([(TCP_RTO_MAX_MS, 120_000), (libc::TCP_USER_TIMEOUT, 0)]);
+            f
+        }
+        fn now(&self) -> (libc::c_int, libc::c_int) {
+            let o = self.opts.borrow();
+            (o[&TCP_RTO_MAX_MS], o[&libc::TCP_USER_TIMEOUT])
+        }
+    }
+
+    impl TcpOpts for Fake {
+        fn get(&self, name: libc::c_int) -> io::Result<libc::c_int> {
+            if self.fail_get == Some(name) {
+                return Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT));
+            }
+            let v = self.opts.borrow()[&name];
+            Ok(if self.lie == Some((name, v)) {
+                v + 1
+            } else {
+                v
+            })
+        }
+        fn set(&self, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
+            if let Some((n, v)) = self.fail_set
+                && n == name
+                && v.is_none_or(|v| v == value)
+            {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            self.opts.borrow_mut().insert(name, value);
+            Ok(())
+        }
     }
 
     #[test]
-    fn upload_retransmits_are_capped_or_left_stock() {
+    fn upload_retransmits_on_a_real_socket_are_capped_or_left_stock() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let sock = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        match bound_upload_retransmits(&sock) {
-            Ok(()) => {
-                assert_eq!(tcp_get(&sock, TCP_RTO_MAX_MS), 1300);
-                assert_eq!(tcp_get(&sock, libc::TCP_USER_TIMEOUT), 120_000);
+        match bound_upload_retransmits(&sock).unwrap() {
+            UploadTcp::Capped => {
+                assert_eq!(sock.get(TCP_RTO_MAX_MS).unwrap(), 1300);
+                assert_eq!(sock.get(libc::TCP_USER_TIMEOUT).unwrap(), 120_000);
             }
-            // A kernel without TCP_RTO_MAX_MS: no half-applied user timeout.
-            Err(_) => assert_eq!(tcp_get(&sock, libc::TCP_USER_TIMEOUT), 0),
+            UploadTcp::Stock(_) => assert_eq!(sock.get(libc::TCP_USER_TIMEOUT).unwrap(), 0),
         }
+    }
+
+    #[test]
+    fn a_kernel_without_the_cap_is_left_untouched() {
+        let f = Fake {
+            fail_get: Some(TCP_RTO_MAX_MS),
+            ..Fake::stock()
+        };
+        assert!(matches!(
+            bound_upload_retransmits(&f),
+            Ok(UploadTcp::Stock(_))
+        ));
+        assert_eq!(f.now(), (120_000, 0));
+    }
+
+    #[test]
+    fn a_failure_part_way_restores_both_options() {
+        let cases = [
+            Fake {
+                lie: Some((TCP_RTO_MAX_MS, 1300)),
+                ..Fake::stock()
+            },
+            Fake {
+                lie: Some((libc::TCP_USER_TIMEOUT, 120_000)),
+                ..Fake::stock()
+            },
+            Fake {
+                fail_set: Some((TCP_RTO_MAX_MS, Some(1300))),
+                ..Fake::stock()
+            },
+        ];
+        for (i, f) in cases.iter().enumerate() {
+            assert!(
+                matches!(bound_upload_retransmits(f), Ok(UploadTcp::Stock(_))),
+                "case {i}"
+            );
+            assert_eq!(f.now(), (120_000, 0), "case {i}");
+        }
+    }
+
+    #[test]
+    fn a_restore_that_cannot_be_verified_fails_the_upload() {
+        let f = Fake {
+            fail_set: Some((TCP_RTO_MAX_MS, None)),
+            ..Fake::stock()
+        };
+        assert!(bound_upload_retransmits(&f).is_err());
     }
 }

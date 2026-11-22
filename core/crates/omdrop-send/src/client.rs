@@ -501,7 +501,7 @@ impl<'a> Client<'a> {
             self.reconnect()?;
         }
         if let Some(conn) = self.conn.as_ref()
-            && let Err(e) = conn.bound_upload_retransmits()
+            && let crate::http::UploadTcp::Stock(e) = conn.bound_upload_retransmits()?
         {
             self.log.warning(
                 "airdrop",
