@@ -54,6 +54,8 @@ pub struct Sender {
     pub should_convert: bool,
     /// Per-operation socket timeout; `None` blocks (`--op-timeout 0`).
     pub op_timeout: Option<Duration>,
+    /// Cap the Upload socket's retransmission timeout (#79); off, the Upload keeps stock TCP.
+    pub bound_upload: bool,
 }
 
 /// A file to send: the open file, and the name it travels under.
@@ -497,20 +499,22 @@ impl<'a> Client<'a> {
             ("TotalBytes", total.to_string()),
             ("TransferID", tid.clone()),
         ];
-        if self.conn.as_ref().is_none_or(|c| c.closed) {
-            self.reconnect()?;
-        }
-        if let Some(conn) = self.conn.as_ref() {
-            match conn.bound_upload_retransmits() {
-                Ok(crate::http::UploadTcp::Capped) => {}
-                Ok(crate::http::UploadTcp::Stock(e)) => self.log.warning(
-                    "airdrop",
-                    &format!("upload keeps stock TCP retransmissions: {e}"),
-                ),
-                Err(e) => {
-                    // As post() does after a failed exchange: this socket is in no known state.
-                    self.conn = None;
-                    return Err(e);
+        if self.sender.bound_upload {
+            if self.conn.as_ref().is_none_or(|c| c.closed) {
+                self.reconnect()?;
+            }
+            if let Some(conn) = self.conn.as_ref() {
+                match conn.bound_upload_retransmits() {
+                    Ok(crate::http::UploadTcp::Capped) => {}
+                    Ok(crate::http::UploadTcp::Stock(e)) => self.log.warning(
+                        "airdrop",
+                        &format!("upload keeps stock TCP retransmissions: {e}"),
+                    ),
+                    Err(e) => {
+                        // As post() does after a failed exchange: this socket is in no known state.
+                        self.conn = None;
+                        return Err(e);
+                    }
                 }
             }
         }
