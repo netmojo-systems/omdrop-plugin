@@ -296,8 +296,14 @@ pub fn parse_options(argv: &[String]) -> Result<Options, Exit> {
             .map_err(|e| SPEC.error(&format!("{f}: {}", strip_os_error(&e))))?;
         files.push(out);
     }
-    let upload_rto_cap = upload_rto_cap(std::env::var("OMDROP_UPLOAD_RTO_CAP").ok().as_deref())
-        .map_err(|e| SPEC.error(&e))?;
+    let upload_rto_cap = match std::env::var("OMDROP_UPLOAD_RTO_CAP") {
+        Ok(v) => upload_rto_cap(Some(&v)),
+        Err(std::env::VarError::NotPresent) => upload_rto_cap(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("OMDROP_UPLOAD_RTO_CAP must be 0 or 1, not a non-UTF-8 value".to_owned())
+        }
+    }
+    .map_err(|e| SPEC.error(&e))?;
     Ok(Options {
         files,
         urls,
