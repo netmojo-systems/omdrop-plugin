@@ -497,6 +497,17 @@ impl<'a> Client<'a> {
             ("TotalBytes", total.to_string()),
             ("TransferID", tid.clone()),
         ];
+        if self.conn.as_ref().is_none_or(|c| c.closed) {
+            self.reconnect()?;
+        }
+        if let Some(conn) = self.conn.as_ref()
+            && let Err(e) = conn.bound_upload_retransmits()
+        {
+            self.log.warning(
+                "airdrop",
+                &format!("upload keeps stock TCP retransmissions: {e}"),
+            );
+        }
         let mode = debugdump::mode(self.sender.verbose);
         let mut cpio_bytes = 0u64;
         let mut dvzip_bytes = 0u64;

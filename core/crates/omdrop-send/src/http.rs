@@ -12,6 +12,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,66 @@ const MAX_RESPONSE_BYTES: usize = 4 << 20;
 const MAX_HEAD_BYTES: usize = 64 << 10;
 /// Chunk size for a streamed (chunked) request body.
 const CHUNK_BYTES: usize = 64 << 10;
+
+/// The Upload socket's cap on TCP's retransmission timeout (#79): through an
+/// AWDL blackout, keep retrying every 1.3 s instead of backing off to minutes,
+/// so the first frame after the peer returns is answered.
+const UPLOAD_RTO_MAX_MS: u32 = 1300;
+/// How long the capped Upload keeps retrying without an ACK: without it, the
+/// kernel's tcp_retries2 model gives a 1.3 s cap only about 18 s.
+const UPLOAD_USER_TIMEOUT_MS: u32 = 120_000;
+/// From linux/tcp.h (Linux 6.15); libc does not define it yet.
+const TCP_RTO_MAX_MS: libc::c_int = 44;
+
+/// Set an IPPROTO_TCP option and read it back.
+fn tcp_opt(sock: &TcpStream, name: libc::c_int, value: u32) -> io::Result<()> {
+    let fd = sock.as_raw_fd();
+    let set = libc::c_int::try_from(value).map_err(io::Error::other)?;
+    // SAFETY: fd is a live TCP socket owned by `sock`; the buffer is a local c_int.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            name,
+            (&raw const set).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut got: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: as above; `got` and `len` are valid for writes.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            name,
+            (&raw mut got).cast(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if got != set {
+        return Err(io::Error::other(format!(
+            "TCP option {name} reads back {got}, not {set}"
+        )));
+    }
+    Ok(())
+}
+
+/// The user timeout, then the RTO cap. If the cap can't be set (a kernel before
+/// 6.15), the user timeout goes back to the kernel default, so the socket keeps
+/// stock TCP; the error says why.
+fn bound_upload_retransmits(sock: &TcpStream) -> io::Result<()> {
+    tcp_opt(sock, libc::TCP_USER_TIMEOUT, UPLOAD_USER_TIMEOUT_MS)?;
+    tcp_opt(sock, TCP_RTO_MAX_MS, UPLOAD_RTO_MAX_MS).inspect_err(|_| {
+        let _ = tcp_opt(sock, libc::TCP_USER_TIMEOUT, 0);
+    })
+}
 
 /// A receiver's address, and the host text Python used for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,6 +300,11 @@ impl Conn {
     /// for the Upload on the same connection, as `sock.settimeout` did).
     pub fn set_op_timeout(&mut self, op: Option<Duration>) -> io::Result<()> {
         self.stream.sock.set_op(op)
+    }
+
+    /// Bound this connection's retransmissions for the Upload (#79).
+    pub fn bound_upload_retransmits(&self) -> io::Result<()> {
+        bound_upload_retransmits(&self.stream.sock.sock)
     }
 
     /// POST and read the whole answer.
@@ -570,5 +636,35 @@ mod tests {
         c.write_all(b"hello").unwrap();
         c.finish().unwrap();
         assert_eq!(out, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    fn tcp_get(sock: &TcpStream, name: libc::c_int) -> libc::c_int {
+        let mut got: libc::c_int = -1;
+        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: a live socket; `got` and `len` are valid for writes.
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                name,
+                (&raw mut got).cast(),
+                &raw mut len,
+            )
+        };
+        if rc == 0 { got } else { -1 }
+    }
+
+    #[test]
+    fn upload_retransmits_are_capped_or_left_stock() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sock = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        match bound_upload_retransmits(&sock) {
+            Ok(()) => {
+                assert_eq!(tcp_get(&sock, TCP_RTO_MAX_MS), 1300);
+                assert_eq!(tcp_get(&sock, libc::TCP_USER_TIMEOUT), 120_000);
+            }
+            // A kernel without TCP_RTO_MAX_MS: no half-applied user timeout.
+            Err(_) => assert_eq!(tcp_get(&sock, libc::TCP_USER_TIMEOUT), 0),
+        }
     }
 }
