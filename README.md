@@ -77,12 +77,11 @@ Run `omdrop install-core` first, so that `omdrop install-driver` runs as omdrop-
 
 ## Receive files
 
-Click the icon to open the panel:
+Click the icon to open the panel. The header shows the name Apple devices see, with Omdrop's state under it.
 
 - **The switch** turns receiving on and off. Right-clicking the icon does the same.
-- **Stay visible for** sets how long you stay visible: one file, a set time, or until you turn it off.
-- **They see you as** sets the name Apple devices show. It defaults to the hostname.
-- **Save files to** opens a folder chooser. It defaults to `~/Downloads`.
+- **Visible for** shows the time left. Open it to set how long you stay visible: one file, a set time, or until you turn it off.
+- **Settings** holds **Name**, the name Apple devices show, and **Save to**, which opens a folder chooser. They default to the hostname and `~/Downloads`.
 
 After a transfer, you can turn receiving off and on again without waiting for the sender's connection to close.
 
@@ -94,10 +93,10 @@ A shared link arrives as a `.url` or `.webloc` file. Clicking its notification, 
 
 ## Send files
 
-Expand **Send to peers**, or press `n` in the panel. If Omdrop is off, this turns it on, because the receive window is what hears nearby devices.
+Open **Send a file**, or press `n` in the panel. If Omdrop is off, this turns it on, because the receive window is what hears nearby devices.
 
 - A radar shows each nearby device as a dot. Brighter and nearer the centre means a stronger signal, not a direction or distance.
-- Devices that answer with a name are listed under the heading.
+- Devices that answer with a name are listed above the radar.
 - Click a name or any dot, then choose one or more files. They go as one transfer, so the recipient accepts once. The chooser opens in the folder you last sent from. The row shows progress, and an **×** cancels the send.
 - Named devices ping as the sweep passes them. The speaker in the radar's corner mutes the sound, and Omdrop remembers the setting.
 

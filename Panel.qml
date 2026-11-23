@@ -148,6 +148,108 @@ Panel {
     }
   }
 
+  readonly property real rowInset: Style.space(10)
+  readonly property real textColumn: rowInset + Style.font.display + Style.space(14)
+  readonly property real settingInset: textColumn + Style.space(64)
+  readonly property color note: Qt.darker(foreground, 1.22)
+  property bool windowOpen: false
+  property bool settingsOpen: false
+
+  component DisclosureRow: CursorSurface {
+    id: row
+    property string glyph
+    property string label
+    property string value
+    property color valueColor: root.note
+    property bool open: false
+    signal clicked()
+
+    foreground: root.foreground
+    width: parent ? parent.width : 0
+    implicitHeight: Math.max(Style.space(32), rowLabel.implicitHeight + Style.spacing.rowPaddingX)
+
+    Text {
+      x: root.rowInset - Style.space(1.6)
+      width: Style.font.display
+      anchors.verticalCenter: parent.verticalCenter
+      horizontalAlignment: Text.AlignHCenter
+      text: row.glyph
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.icon
+    }
+
+    Text {
+      id: rowLabel
+      anchors.left: parent.left
+      anchors.leftMargin: root.textColumn
+      anchors.right: rowValue.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      text: row.label
+      textFormat: Text.PlainText
+      elide: Text.ElideRight
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    Text {
+      id: rowValue
+      anchors.right: rowChevron.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      text: row.value
+      textFormat: Text.PlainText
+      color: row.valueColor
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      Behavior on color { ColorAnimation { duration: 200 } }
+    }
+
+    Text {
+      id: rowChevron
+      anchors.right: parent.right
+      anchors.rightMargin: root.rowInset - Style.space(2)
+      anchors.verticalCenter: parent.verticalCenter
+      text: "\uDB80\uDD42"
+      rotation: row.open ? 90 : 0
+      color: row.open || rowMouse.containsMouse ? root.foreground : root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      Behavior on rotation { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+    }
+
+    MouseArea {
+      id: rowMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onContainsMouseChanged: row.hasCursor = containsMouse
+      onClicked: row.clicked()
+    }
+  }
+
+  component Drawer: Item {
+    id: drawer
+    property bool open: false
+    property alias spacing: drawerColumn.spacing
+    property alias topPadding: drawerColumn.topPadding
+    property alias bottomPadding: drawerColumn.bottomPadding
+    default property alias content: drawerColumn.data
+
+    width: parent ? parent.width : 0
+    height: open ? drawerColumn.implicitHeight : 0
+    visible: height > 0
+    clip: true
+    Behavior on height { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+
+    Column {
+      id: drawerColumn
+      width: parent.width
+    }
+  }
+
   // Shipped beside this file so the widget works without anything on PATH.
   readonly property string cli: Qt.resolvedUrl("bin/omdrop").toString().replace("file://", "")
 
@@ -372,7 +474,7 @@ Panel {
   readonly property string windowValueText: {
     if (!countingDown) return windowStops[windowIndex].label
     var m = Math.floor(remaining / 60), sec = remaining % 60
-    return (m < 10 ? "0" : "") + m + ":" + (sec < 10 ? "0" : "") + sec
+    return m + ":" + (sec < 10 ? "0" : "") + sec + " left"
   }
 
   readonly property string heroStatus: {
@@ -1101,6 +1203,10 @@ Panel {
   onOpenedChanged: {
     if (opened && !busy) root.refreshStatus()
     if (!opened && !sendProc.running && !pickingDir) radarOpen = false
+    if (!opened && !pickingDir) {
+      windowOpen = false
+      settingsOpen = false
+    }
   }
 
   // `refresh` is how `omdrop on`, `off` and the settings commands, run from a
@@ -1172,7 +1278,8 @@ Panel {
 
           PanelHero {
             id: hero
-            width: parent.width + Style.space(6)
+            x: root.rowInset
+            width: parent.width - 2 * x + Style.space(6)
             title: root.shownName || "Omdrop"
             meta: root.heroStatus
             foreground: root.foreground
@@ -1195,7 +1302,7 @@ Panel {
           }
 
           Text {
-            x: Style.font.display + Style.space(14)
+            x: root.textColumn
             width: parent.width - x
             visible: text !== ""
             text: root.heroNote
@@ -1211,7 +1318,7 @@ Panel {
           // rather than installing anything quietly. Installing a kernel module
           // is the user's decision, taken at their own sudo prompt.
           Button {
-            x: Style.font.display + Style.space(14)
+            x: root.textColumn
             visible: root.driverInstallable
             text: "Install the Wi-Fi driver"
             bordered: true
@@ -1222,57 +1329,143 @@ Panel {
 
         PanelSeparator { visible: root.usable; foreground: root.foreground }
 
-        // How long a press of the switch keeps us visible. Both ends are
-        // modes: the floor stops after one file arrives, the ceiling never
-        // stops on its own.
         Column {
           visible: root.usable
           width: parent.width
-          spacing: Style.space(8)
+          spacing: Style.space(2)
+
+          DisclosureRow {
+            glyph: "\uDB81\uDC8A"
+            label: "Send a file"
+            value: !root.radarOpen && root.namedPeers.length > 0
+                   ? root.namedPeers.length + (root.namedPeers.length === 1 ? " device" : " devices") : ""
+            open: root.radarOpen
+            onClicked: root.openRadar()
+          }
 
           Item {
+            id: radarDrawer
+            visible: root.usable && height > 0
             width: parent.width
-            implicitHeight: Math.max(windowHeader.implicitHeight, windowValue.implicitHeight)
+            height: root.radarOpen ? radarColumn.implicitHeight : 0
+            clip: true
+            Behavior on height { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
 
-            PanelSectionHeader {
-              id: windowHeader
-              text: "STAY VISIBLE FOR"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-            }
+            Column {
+              id: radarColumn
+              width: parent.width
+              spacing: Style.space(10)
 
-            Text {
-              id: windowValue
-              text: root.windowValueText
-              // Under a minute it goes urgent: the last stretch is when you
-              // care whether to press again.
-              color: root.countingDown && root.remaining <= 60 ? root.urgent : root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              font.bold: root.countingDown
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
+              // What the radar is doing, until there is nothing left to say:
+              // searching until a device is heard, resolving until the first
+              // name lookup has answered, then gone.
+              //
+              // The words stay still and only the dots move: the sentence is
+              // centred as if it always carried three dots, and the dots grow to
+              // its right in their own Text. Centring the whole string instead
+              // shifted every word left and right as the dots changed.
+              Item {
+                width: parent.width
+                visible: root.radarWorking
+                implicitHeight: statusWords.implicitHeight
 
-              Behavior on color { ColorAnimation { duration: 200 } }
+                TextMetrics {
+                  id: threeDots
+                  font: statusWords.font
+                  text: "..."
+                }
+
+                Text {
+                  id: statusWords
+                  x: Math.max(0, Math.round((parent.width - implicitWidth - threeDots.advanceWidth) / 2))
+                  textFormat: Text.PlainText
+                  text: root.radarStatus
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Text {
+                  anchors.left: statusWords.right
+                  anchors.baseline: statusWords.baseline
+                  textFormat: Text.PlainText
+                  text: root.radarDots
+                  color: root.dim
+                  font: statusWords.font
+                }
+              }
+
+              // The devices that can be sent to, first under the heading, where a
+              // new one is seen the moment it arrives.
+              Repeater {
+                model: peerRows
+                delegate: PeerRow {
+                  required property string mac
+                  required property string name
+                  width: radarColumn.width
+                  peer: ({ mac: mac, name: name })
+                }
+              }
+
+              PanelSeparator {
+                visible: root.namedPeers.length > 0
+                width: parent.width
+                foreground: root.foreground
+              }
+
+              Radar {
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: Math.min(parent.width, Style.space(220))
+                peers: root.peers
+                scanning: root.scanning
+                muted: !root.soundOn
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                soundDir: Qt.resolvedUrl("share/sounds").toString().replace("file://", "")
+                onMuteToggled: root.toggleSound()
+                onPeerClicked: function(mac) { root.sendTo(mac) }
+              }
             }
           }
 
-          PanelSlider {
-            width: parent.width
-            bar: root.bar
-            minimum: 0
-            maximum: root.windowStops.length - 1
-            step: 1
-            integer: true
-            tickCount: root.windowStops.length
-            value: root.windowIndex
-            onMoved: function(v) { root.windowPicking = true; root.windowIndex = Math.round(v) }
-            onReleased: function(v) {
-              root.windowIndex = Math.round(v)
-              root.windowPicking = false
-              root.rescheduleWindow()
+          DisclosureRow {
+            glyph: "\uDB82\uDD54"
+            label: "Visible for"
+            value: root.windowOpen && !root.windowPicking ? root.windowStops[root.windowIndex].label : root.windowValueText
+            valueColor: root.countingDown && !root.windowOpen && root.remaining <= 60 ? root.urgent : root.note
+            open: root.windowOpen
+            onClicked: root.windowOpen = !root.windowOpen
+          }
+
+          Drawer {
+            open: root.windowOpen
+            topPadding: Style.space(2)
+            bottomPadding: Style.space(2)
+
+            Item {
+              width: parent.width
+              implicitHeight: windowSlider.implicitHeight + Style.space(2)
+
+              PanelSlider {
+                id: windowSlider
+                anchors.left: parent.left
+                anchors.leftMargin: root.textColumn - knobSize / 2
+                anchors.right: parent.right
+                anchors.rightMargin: root.rowInset - knobSize / 2
+                bar: root.bar
+                minimum: 0
+                maximum: root.windowStops.length - 1
+                step: 1
+                integer: true
+                tickCount: root.windowStops.length
+                value: root.windowIndex
+                onMoved: function(v) { root.windowPicking = true; root.windowIndex = Math.round(v) }
+                onReleased: function(v) {
+                  root.windowIndex = Math.round(v)
+                  root.windowPicking = false
+                  root.rescheduleWindow()
+                }
+              }
             }
           }
         }
@@ -1453,196 +1646,93 @@ Panel {
 
         PanelSeparator { visible: root.usable; foreground: root.foreground }
 
-        // Sending. A header that opens downwards onto the radar, the
-        // newest name it has learnt, and the devices that can be sent to.
-        Item {
+        Column {
           visible: root.usable
           width: parent.width
-          implicitHeight: nearbyHeader.implicitHeight + Style.space(4)
+          spacing: Style.space(2)
 
-          PanelSectionHeader {
-            id: nearbyHeader
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "SEND TO PEERS"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
+          DisclosureRow {
+            glyph: "\uDB81\uDC93"
+            label: "Settings"
+            open: root.settingsOpen
+            onClicked: root.settingsOpen = !root.settingsOpen
           }
 
-          Text {
-            anchors.right: chevron.left
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            visible: !root.radarOpen && root.namedPeers.length > 0
-            text: root.namedPeers.length + (root.namedPeers.length === 1 ? " device" : " devices")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
+          Drawer {
+            open: root.settingsOpen
+            spacing: Style.space(8)
+            topPadding: Style.space(4)
+            bottomPadding: Style.space(4)
 
-          Text {
-            id: chevron
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            text: "\uf078"
-            rotation: root.radarOpen ? 180 : 0
-            color: nearbyMouse.containsMouse ? root.foreground : root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            Behavior on rotation { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
-          }
-
-          MouseArea {
-            id: nearbyMouse
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: root.openRadar()
-          }
-        }
-
-        Item {
-          id: radarDrawer
-          visible: root.usable && height > 0
-          width: parent.width
-          height: root.radarOpen ? radarColumn.implicitHeight : 0
-          clip: true
-          Behavior on height { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
-
-          Column {
-            id: radarColumn
-            width: parent.width
-            spacing: Style.space(10)
-
-            // What the radar is doing, until there is nothing left to say:
-            // searching until a device is heard, resolving until the first
-            // name lookup has answered, then gone.
-            //
-            // The words stay still and only the dots move: the sentence is
-            // centred as if it always carried three dots, and the dots grow to
-            // its right in their own Text. Centring the whole string instead
-            // shifted every word left and right as the dots changed.
             Item {
               width: parent.width
-              visible: root.radarWorking
-              implicitHeight: statusWords.implicitHeight
-
-              TextMetrics {
-                id: threeDots
-                font: statusWords.font
-                text: "..."
-              }
+              implicitHeight: nameField.implicitHeight
 
               Text {
-                id: statusWords
-                x: Math.max(0, Math.round((parent.width - implicitWidth - threeDots.advanceWidth) / 2))
-                textFormat: Text.PlainText
-                text: root.radarStatus
-                color: root.dim
+                x: root.textColumn
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Name"
+                color: root.note
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
+                font.pixelSize: Style.font.body
               }
+
+              TextField {
+                id: nameField
+                onVisibleChanged: if (!visible && activeFocus) keyCatcher.forceActiveFocus()
+                anchors.left: parent.left
+                anchors.leftMargin: root.settingInset
+                anchors.right: parent.right
+                anchors.rightMargin: root.rowInset
+                foreground: root.foreground
+                text: root.shownName
+                // Don't fight the user's typing: the polled name is only taken
+                // back while this field is not being edited. Leaving the field
+                // keeps what was typed, the same as Enter.
+                onActiveFocusChanged: if (!activeFocus) {
+                  root.setDeviceName(text)
+                  text = root.shownName
+                }
+                onAccepted: root.setDeviceName(text)
+                // Escape abandons the edit and hands the keys back to the panel.
+                Keys.onEscapePressed: {
+                  text = root.shownName
+                  keyCatcher.forceActiveFocus()
+                }
+              }
+            }
+
+            Item {
+              width: parent.width
+              implicitHeight: folderButton.implicitHeight
 
               Text {
-                anchors.left: statusWords.right
-                anchors.baseline: statusWords.baseline
-                textFormat: Text.PlainText
-                text: root.radarDots
-                color: root.dim
-                font: statusWords.font
+                x: root.textColumn
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Save to"
+                color: root.note
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              // The folder, shown as a button that opens it in the chooser.
+              Button {
+                id: folderButton
+                anchors.left: parent.left
+                anchors.leftMargin: root.settingInset
+                anchors.right: parent.right
+                anchors.rightMargin: root.rowInset
+                leftAlign: true
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.body
+                iconText: "\uf07c"
+                text: root.pickingDir ? "Choosing in Files…" : root.tildify(root.downloadDir)
+                tooltipText: "Choose another folder"
+                onClicked: root.pickDownloadDir()
               }
             }
-
-            // The devices that can be sent to, first under the heading, where a
-            // new one is seen the moment it arrives.
-            Repeater {
-              model: peerRows
-              delegate: PeerRow {
-                required property string mac
-                required property string name
-                width: radarColumn.width
-                peer: ({ mac: mac, name: name })
-              }
-            }
-
-            PanelSeparator {
-              visible: root.namedPeers.length > 0
-              width: parent.width
-              foreground: root.foreground
-            }
-
-            Radar {
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: Math.min(parent.width, Style.space(220))
-              peers: root.peers
-              scanning: root.scanning
-              muted: !root.soundOn
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              soundDir: Qt.resolvedUrl("share/sounds").toString().replace("file://", "")
-              onMuteToggled: root.toggleSound()
-              onPeerClicked: function(mac) { root.sendTo(mac) }
-            }
-          }
-        }
-
-        PanelSeparator { visible: root.usable; foreground: root.foreground }
-
-        Column {
-          visible: root.usable
-          width: parent.width
-          spacing: Style.space(8)
-
-          PanelSectionHeader {
-            text: "THEY SEE YOU AS"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-          }
-
-          TextField {
-            id: nameField
-            width: parent.width
-            foreground: root.foreground
-            text: root.shownName
-            // Don't fight the user's typing: the polled name is only taken
-            // back while this field is not being edited. Leaving the field
-            // keeps what was typed, the same as Enter.
-            onActiveFocusChanged: if (!activeFocus) {
-              root.setDeviceName(text)
-              text = root.shownName
-            }
-            onAccepted: root.setDeviceName(text)
-            // Escape abandons the edit and hands the keys back to the panel.
-            Keys.onEscapePressed: {
-              text = root.shownName
-              keyCatcher.forceActiveFocus()
-            }
-          }
-        }
-
-        Column {
-          visible: root.usable
-          width: parent.width
-          spacing: Style.space(8)
-
-          PanelSectionHeader {
-            text: "SAVE FILES TO"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-          }
-
-          // The folder, shown as a button that opens it in the chooser.
-          Button {
-            width: parent.width
-            leftAlign: true
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            iconText: "\uf07c"
-            text: root.pickingDir ? "Choosing in Files…" : root.tildify(root.downloadDir)
-            tooltipText: "Choose another folder"
-            onClicked: root.pickDownloadDir()
           }
         }
       }
@@ -1681,8 +1771,8 @@ Panel {
       z: 1   // above the row's MouseArea, so the cancel button gets its clicks
       anchors.left: parent.left
       anchors.right: parent.right
-      anchors.leftMargin: Style.spacing.controlPaddingX
-      anchors.rightMargin: Style.spacing.controlPaddingX
+      anchors.leftMargin: root.textColumn
+      anchors.rightMargin: root.rowInset
       anchors.verticalCenter: parent.verticalCenter
       spacing: Style.space(2)
 
