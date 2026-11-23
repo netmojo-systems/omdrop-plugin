@@ -198,6 +198,24 @@ pub struct Options {
     pub model: String,
     pub verbose: bool,
     pub keys: Option<PathBuf>,
+    /// Cap the Upload socket's retransmission timeout (#79): `OMDROP_UPLOAD_RTO_CAP`.
+    pub upload_rto_cap: bool,
+}
+
+/// `OMDROP_UPLOAD_RTO_CAP`'s value when it is unset or empty.
+const UPLOAD_RTO_CAP_DEFAULT: bool = false;
+
+/// `OMDROP_UPLOAD_RTO_CAP`: `1` turns the Upload's retransmission cap on, `0` off.
+fn upload_rto_cap(v: Option<&str>) -> Result<bool, String> {
+    match v {
+        None | Some("") => Ok(UPLOAD_RTO_CAP_DEFAULT),
+        Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(other) => Err(format!(
+            "OMDROP_UPLOAD_RTO_CAP must be 0 or 1, not {}",
+            str_repr(other)
+        )),
+    }
 }
 
 fn hex_bytes(s: &str) -> Option<Vec<u8>> {
@@ -278,6 +296,14 @@ pub fn parse_options(argv: &[String]) -> Result<Options, Exit> {
             .map_err(|e| SPEC.error(&format!("{f}: {}", strip_os_error(&e))))?;
         files.push(out);
     }
+    let upload_rto_cap = match std::env::var("OMDROP_UPLOAD_RTO_CAP") {
+        Ok(v) => upload_rto_cap(Some(&v)),
+        Err(std::env::VarError::NotPresent) => upload_rto_cap(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("OMDROP_UPLOAD_RTO_CAP must be 0 or 1, not a non-UTF-8 value".to_owned())
+        }
+    }
+    .map_err(|e| SPEC.error(&e))?;
     Ok(Options {
         files,
         urls,
@@ -297,6 +323,7 @@ pub fn parse_options(argv: &[String]) -> Result<Options, Exit> {
         model: p.value("--model").unwrap_or("MacBookPro18,3").to_owned(),
         verbose: p.flag("--verbose"),
         keys: p.value("--keys").map(PathBuf::from),
+        upload_rto_cap,
     })
 }
 
@@ -337,6 +364,7 @@ pub fn sender_from_identity(
         auth_tag: opts.auth_tag.clone(),
         should_convert: opts.should_convert,
         op_timeout: opts.op_timeout,
+        bound_upload: opts.upload_rto_cap,
     })
 }
 
@@ -990,5 +1018,16 @@ mod tests {
     fn help_carries_what_omdrop_probes_for() {
         let h = SPEC.help();
         assert!(h.contains("[file ...]") && h.contains("--url"));
+    }
+
+    #[test]
+    fn the_upload_cap_switch_takes_only_0_or_1() {
+        assert_eq!(upload_rto_cap(None), Ok(UPLOAD_RTO_CAP_DEFAULT));
+        assert_eq!(upload_rto_cap(Some("")), Ok(UPLOAD_RTO_CAP_DEFAULT));
+        assert_eq!(upload_rto_cap(Some("1")), Ok(true));
+        assert_eq!(upload_rto_cap(Some("0")), Ok(false));
+        for bad in ["yes", "true", " 1", "2"] {
+            assert!(upload_rto_cap(Some(bad)).is_err(), "{bad}");
+        }
     }
 }

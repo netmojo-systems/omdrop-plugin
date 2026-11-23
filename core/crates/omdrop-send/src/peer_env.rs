@@ -402,6 +402,7 @@ impl RealEnv {
                     auth_tag: None,
                     should_convert: false,
                     op_timeout: None,
+                    bound_upload: false,
                 };
                 // Said once, not per peer: every lookup would fail the same way.
                 Ok(Arc::new(sender))
@@ -434,6 +435,7 @@ fn discover_once(
         verbose: base.verbose,
         auth_tag: None,
         should_convert: false,
+        bound_upload: false,
     };
     let log = Logger::new(Sink::Silent);
     let shown = format!("[{target}%{IFACE}]:{port}");
