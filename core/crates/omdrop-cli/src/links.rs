@@ -606,7 +606,9 @@ fn copy_to_clipboard(f: &Path) {
 }
 
 const RECEIVED_FILE: &str = "received";
-const RECEIVED_LIST: usize = 20;
+const RECEIVED_LIST: usize = 5;
+/// How much of the log's end is read: a sender decides how long the log gets.
+const RECEIVED_TAIL: u64 = 64 * 1024;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Arrival {
@@ -645,19 +647,32 @@ fn note_arrival(dir: &Path, f: &Path, preview: Option<&Path>, time: u64) {
 }
 
 fn arrivals_in(dir: &Path, limit: usize) -> Vec<Arrival> {
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
-    let mut text = String::new();
+    let mut tail = Vec::new();
     let read = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join(RECEIVED_FILE))
-        .and_then(|mut file| file.read_to_string(&mut text));
-    if read.is_err() {
+        .and_then(|mut file| {
+            let start = file.metadata()?.len().saturating_sub(RECEIVED_TAIL);
+            file.seek(SeekFrom::Start(start))?;
+            file.take(RECEIVED_TAIL).read_to_end(&mut tail)?;
+            Ok(start)
+        });
+    let Ok(start) = read else {
         return Vec::new();
-    }
+    };
+    let text = String::from_utf8_lossy(&tail);
+    // A read that starts inside the log starts inside a record.
+    let whole = if start > 0 {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        &text
+    };
     let mut seen = std::collections::HashSet::new();
-    text.lines()
+    whole
+        .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Arrival>(line).ok())
         .filter(|a| seen.insert(a.path.clone()) && Path::new(&a.path).is_file())
@@ -1370,6 +1385,31 @@ mod tests {
             .collect();
         let name = |p: &Path| p.to_str().unwrap().to_owned();
         assert_eq!(listed, vec![(name(&a), 4), (name(&b), 3)]);
+    }
+
+    #[test]
+    fn received_lists_the_five_newest_from_the_end_of_a_long_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<PathBuf> = (0..7)
+            .map(|i| dir.path().join(format!("{i}.pdf")))
+            .collect();
+        for f in &files {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let gone = dir.path().join("gone.pdf");
+        for time in 0..4000 {
+            note_arrival(dir.path(), &gone, None, time);
+        }
+        for (time, f) in (4000..).zip(&files) {
+            note_arrival(dir.path(), f, None, time);
+        }
+        let log = std::fs::metadata(dir.path().join(RECEIVED_FILE)).unwrap();
+        assert!(log.len() > 2 * RECEIVED_TAIL);
+        let listed: Vec<u64> = arrivals_in(dir.path(), RECEIVED_LIST)
+            .into_iter()
+            .map(|x| x.time)
+            .collect();
+        assert_eq!(listed, vec![4006, 4005, 4004, 4003, 4002]);
     }
 
     #[test]

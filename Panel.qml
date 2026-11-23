@@ -149,7 +149,7 @@ Panel {
       onStreamFinished: {
         var list = []
         try { list = JSON.parse(text) } catch (e) {}
-        root.received = Array.isArray(list) ? list.slice(0, 5) : []
+        root.received = Array.isArray(list) ? list : []
         if (root.opened || root.seenUntil < 0) EveryBar.markSeenUntil(root.latestArrival)
       }
     }

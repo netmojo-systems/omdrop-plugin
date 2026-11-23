@@ -48,7 +48,7 @@ const USAGE: &str = r#"omdrop -- send and receive files with nearby Apple device
                     off; --force stops anyway
   toggle            off if receiving, on if not
   status [--json]   receiving or not, time left, the name Macs see
-  received [--json] the files that arrived since login, newest first
+  received [--json] the five newest files that arrived since login
   send [NAME] FILE...|URL...
                     send files to a nearby Apple device, as one transfer
                     it accepts once, or send http/https links. A .webloc or
