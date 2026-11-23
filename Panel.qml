@@ -128,8 +128,7 @@ Panel {
   }
 
   function thumbnailOf(arrival) {
-    if (arrival.preview) return fileUrl(arrival.preview)
-    return /\.(jpe?g|png|gif|webp|bmp)$/i.test(arrival.path) ? fileUrl(arrival.path) : ""
+    return arrival.preview ? fileUrl(arrival.preview) : ""
   }
 
   function openReceived(path) {

@@ -713,7 +713,7 @@ pub fn cmd_handle(args: &[OsString]) -> i32 {
     note_arrival(
         &ctx().state_dir(),
         f,
-        image.as_deref().filter(|p| *p != f),
+        image.as_deref(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),

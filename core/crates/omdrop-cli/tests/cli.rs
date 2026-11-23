@@ -2132,6 +2132,33 @@ fn last_image(f: &Fixture) -> Option<PathBuf> {
 }
 
 #[test]
+fn received_names_the_image_each_toast_showed() {
+    let f = preview_fixture();
+    let mut shown = Vec::new();
+    for name in ["IMG_1.heic", "photo.png", "notes.pdf"] {
+        let file = arrive(&f, name, &[]);
+        shown.push((file, last_image(&f)));
+    }
+    let (out, _) = f.run(&["received", "--json"], &[]);
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed: Vec<(PathBuf, Option<PathBuf>)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|a| {
+            (
+                PathBuf::from(a["path"].as_str().unwrap()),
+                a["preview"].as_str().map(PathBuf::from),
+            )
+        })
+        .collect();
+    assert_eq!(listed, shown);
+    assert_eq!(shown[1].1.as_ref(), Some(&shown[1].0));
+    assert_eq!(shown[2].1, None);
+}
+
+#[test]
 fn a_heic_toast_carries_a_small_preview_in_the_runtime_dir() {
     use std::os::unix::fs::PermissionsExt;
     let f = preview_fixture();
