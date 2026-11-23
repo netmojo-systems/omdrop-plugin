@@ -111,7 +111,7 @@ version_ge() {
 # Hooks are enough for a core that is already installed to run, and
 # core_supported decides where it is offered: omdrop-awdl, and omdrop-owl with
 # its hooks. The check is one file test. OMDROP_HOOKS moves it for tests.
-CORE_MIN=0.1.17
+CORE_MIN=0.1.18
 CORE_TOO_OLD=
 CORE_NO_HOOKS=
 core_version() {
@@ -131,7 +131,7 @@ OMDROP_HOOKS="${OMDROP_HOOKS:-/usr/lib/omdrop/radio}"
 # `status` is not on the list; the panel's refresh runs it.
 changes_panel() {
   case "${1:-}" in
-    on|start|off|stop|toggle|resume|name|dir|sound|limit|visibility|vis|viz|senders|identity) return 0 ;;
+    on|start|off|stop|toggle|resume|name|dir|sound|limit|receive-mode|visibility|vis|viz|senders|identity) return 0 ;;
   esac
   return 1
 }
