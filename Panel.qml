@@ -107,9 +107,93 @@ Panel {
   readonly property color note: Qt.darker(foreground, 1.22)
   property bool windowOpen: false
   property bool settingsOpen: false
+  property string cursorTarget: ""
+
+  readonly property var cursorTargets: {
+    if (!usable) return []
+    var targets = ["header", "send"]
+    if (radarOpen)
+      for (var i = 0; i < peerRows.count; i++) targets.push("peer:" + peerRows.get(i).mac)
+    targets.push("window")
+    if (windowOpen) targets.push("slider")
+    targets.push("audience")
+    if (sendersOpen) {
+      targets.push("everyone", "contacts")
+      if (audience === "contacts") {
+        for (var j = 0; j < senderList.length; j++) targets.push("sender:" + senderList[j])
+        targets.push("senderField")
+      }
+    }
+    targets.push("settings")
+    if (settingsOpen) targets.push("name", "folder")
+    return targets
+  }
+
+  function rowHolding(key) {
+    if (key.indexOf("peer:") === 0) return "send"
+    if (key === "slider") return "window"
+    if (key.indexOf("sender:") === 0 || key === "senderField" || key === "everyone" || key === "contacts") return "audience"
+    if (key === "name" || key === "folder") return "settings"
+    return ""
+  }
+
+  onCursorTargetsChanged: {
+    var target = cursorTarget
+    while (target !== "" && cursorTargets.indexOf(target) < 0) target = rowHolding(target)
+    cursorTarget = target
+  }
+
+  function hoverCursor(key, inside) {
+    if (keyCatcher.blocked) return
+    if (inside && cursorTargets.indexOf(key) >= 0) cursorTarget = key
+    else if (!inside && cursorTarget === key) cursorTarget = ""
+  }
+
+  function moveCursor(dy) {
+    var targets = cursorTargets
+    if (targets.length === 0) return
+    var index = targets.indexOf(cursorTarget)
+    var next = index < 0 ? (dy > 0 ? 0 : targets.length - 1) : Math.max(0, Math.min(targets.length - 1, index + dy))
+    cursorTarget = targets[next]
+  }
+
+  function stepWindow(dx) {
+    if (windowSlider.dragging) return
+    windowPicking = true
+    windowIndex = Math.max(0, Math.min(windowStops.length - 1, windowIndex + dx))
+    windowStepSettle.restart()
+  }
+
+  function activateCursor() {
+    var target = cursorTarget
+    if (target === "" || target === "header") toggleOmdrop()
+    else if (target === "send") openRadar()
+    else if (target === "window") windowOpen = !windowOpen
+    else if (target === "audience") toggleSenders()
+    else if (target === "everyone" || target === "contacts") setAudience(target)
+    else if (target === "settings") settingsOpen = !settingsOpen
+    else if (target === "name") nameField.forceActiveFocus()
+    else if (target === "senderField") senderField.forceActiveFocus()
+    else if (target === "folder") pickDownloadDir()
+    else if (target.indexOf("peer:") === 0) sendTo(target.substring(5))
+  }
+
+  function deleteCursor() {
+    if (cursorTarget.indexOf("sender:") === 0) removeSender(cursorTarget.substring(7))
+  }
+
+  Timer {
+    id: windowStepSettle
+    interval: 600
+    onTriggered: {
+      root.windowPicking = false
+      root.rescheduleWindow()
+    }
+  }
 
   component DisclosureRow: CursorSurface {
     id: row
+    property string key
     property string glyph
     property string label
     property string value
@@ -117,6 +201,7 @@ Panel {
     property bool open: false
     signal clicked()
 
+    hasCursor: root.cursorTarget === key
     foreground: root.foreground
     width: parent ? parent.width : 0
     implicitHeight: Math.max(Style.space(32), rowLabel.implicitHeight + Style.spacing.rowPaddingX)
@@ -167,7 +252,7 @@ Panel {
       anchors.verticalCenter: parent.verticalCenter
       text: "\uDB80\uDD42"
       rotation: row.open ? 90 : 0
-      color: row.open || rowMouse.containsMouse ? root.foreground : root.dim
+      color: row.open || row.hasCursor ? root.foreground : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
       Behavior on rotation { NumberAnimation { duration: Style.duration(180); easing.type: Easing.OutCubic } }
@@ -178,17 +263,19 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      onContainsMouseChanged: row.hasCursor = containsMouse
+      onContainsMouseChanged: root.hoverCursor(row.key, containsMouse)
       onClicked: row.clicked()
     }
   }
 
   component ChoiceRow: CursorSurface {
     id: choice
+    property string key
     property string label
     property bool chosen: false
     signal picked()
 
+    hasCursor: root.cursorTarget === key
     foreground: root.foreground
     width: parent ? parent.width : 0
     implicitHeight: Style.space(30)
@@ -219,7 +306,7 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: choice.chosen ? Qt.ArrowCursor : Qt.PointingHandCursor
-      onContainsMouseChanged: choice.hasCursor = containsMouse
+      onContainsMouseChanged: root.hoverCursor(choice.key, containsMouse)
       onClicked: choice.picked()
     }
   }
@@ -495,6 +582,10 @@ Panel {
 
   function toggleOmdrop() {
     if (busy || !usable) return
+    if (windowStepSettle.running) {
+      windowStepSettle.stop()
+      windowPicking = false
+    }
     turningOn = !receiving
     busy = true
     lastError = ""
@@ -1200,6 +1291,7 @@ Panel {
     if (!opened && !pickingDir) {
       windowOpen = false
       settingsOpen = false
+      cursorTarget = ""
     }
   }
 
@@ -1253,7 +1345,12 @@ Panel {
       // toggle Omdrop, d and n act, and h/j/k/l/x never reach the field.
       blocked: nameField.activeFocus || senderField.activeFocus
       onCloseRequested: root.controller.hide()
-      onActivateRequested: root.toggleOmdrop()
+      onActivateRequested: root.activateCursor()
+      onDeleteRequested: root.deleteCursor()
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) root.moveCursor(dy)
+        else if (root.cursorTarget === "slider") root.stepWindow(dx)
+      }
       onTextKey: function(t) {
         if (t === "d" || t === "D") root.toggleOmdrop()
         else if (t === "n" || t === "N") root.openRadar()
@@ -1289,8 +1386,10 @@ Panel {
                 visible: root.usable
                 checked: root.receiving
                 busy: root.busy
+                hasCursor: root.cursorTarget === "header"
                 foreground: root.foreground
                 onToggled: root.toggleOmdrop()
+                onHovered: function(isHovered) { root.hoverCursor("header", isHovered) }
               }
             }
           }
@@ -1329,6 +1428,7 @@ Panel {
           spacing: Style.space(2)
 
           DisclosureRow {
+            key: "send"
             glyph: "\uDB81\uDC8A"
             label: "Send a file"
             value: !root.radarOpen && root.namedPeers.length > 0
@@ -1423,6 +1523,7 @@ Panel {
           }
 
           DisclosureRow {
+            key: "window"
             glyph: "\uDB82\uDD54"
             label: "Visible for"
             value: root.windowOpen && !root.windowPicking ? root.windowStops[root.windowIndex].label : root.windowValueText
@@ -1436,9 +1537,13 @@ Panel {
             topPadding: Style.space(2)
             bottomPadding: Style.space(2)
 
-            Item {
+            CursorSurface {
+              hasCursor: root.cursorTarget === "slider"
+              foreground: root.foreground
               width: parent.width
               implicitHeight: windowSlider.implicitHeight + Style.space(2)
+
+              HoverHandler { onHoveredChanged: root.hoverCursor("slider", hovered) }
 
               PanelSlider {
                 id: windowSlider
@@ -1453,7 +1558,11 @@ Panel {
                 integer: true
                 tickCount: root.windowStops.length
                 value: root.windowIndex
-                onMoved: function(v) { root.windowPicking = true; root.windowIndex = Math.round(v) }
+                onMoved: function(v) {
+                  windowStepSettle.stop()
+                  root.windowPicking = true
+                  root.windowIndex = Math.round(v)
+                }
                 onReleased: function(v) {
                   root.windowIndex = Math.round(v)
                   root.windowPicking = false
@@ -1464,6 +1573,7 @@ Panel {
           }
 
           DisclosureRow {
+            key: "audience"
             glyph: "\uDB80\uDC0E"
             label: "Receive from"
             value: root.sendersOpen ? "" : root.audience === "contacts" ? "Contacts only" : "Everyone"
@@ -1477,12 +1587,14 @@ Panel {
             bottomPadding: Style.space(8)
 
             ChoiceRow {
+              key: "everyone"
               label: "Everyone"
               chosen: root.audience === "everyone"
               onPicked: root.setAudience("everyone")
             }
 
             ChoiceRow {
+              key: "contacts"
               label: "Contacts only"
               chosen: root.audience === "contacts"
               onPicked: root.setAudience("contacts")
@@ -1490,9 +1602,11 @@ Panel {
 
             Repeater {
               model: root.audience === "contacts" ? root.senderList : []
-              delegate: Item {
+              delegate: CursorSurface {
                 id: senderRow
                 required property string modelData
+                hasCursor: root.cursorTarget === "sender:" + modelData
+                foreground: root.foreground
                 width: parent.width
                 implicitHeight: Style.space(28)
 
@@ -1515,7 +1629,7 @@ Panel {
                   anchors.rightMargin: root.rowInset + Style.space(3.6)
                   anchors.verticalCenter: parent.verticalCenter
                   text: "\uDB80\uDD56"
-                  color: senderMouse.containsMouse ? root.foreground : root.dim
+                  color: senderRow.hasCursor ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.icon
                 }
@@ -1525,6 +1639,7 @@ Panel {
                   anchors.margins: -Style.space(6)
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
+                  onContainsMouseChanged: root.hoverCursor("sender:" + senderRow.modelData, containsMouse)
                   onClicked: root.removeSender(senderRow.modelData)
                 }
                 PanelToolTip {
@@ -1543,6 +1658,9 @@ Panel {
               TextField {
                 id: senderField
                 onVisibleChanged: if (!visible && activeFocus) keyCatcher.forceActiveFocus()
+                hasCursor: root.cursorTarget === "senderField"
+                onHoveredChanged: root.hoverCursor("senderField", hovered)
+                onActiveFocusChanged: if (activeFocus && root.cursorTargets.indexOf("senderField") >= 0) root.cursorTarget = "senderField"
                 anchors.left: parent.left
                 anchors.leftMargin: root.textColumn
                 anchors.right: parent.right
@@ -1582,6 +1700,7 @@ Panel {
           }
 
           DisclosureRow {
+            key: "settings"
             glyph: "\uDB81\uDC93"
             label: "Settings"
             open: root.settingsOpen
@@ -1610,6 +1729,8 @@ Panel {
               TextField {
                 id: nameField
                 onVisibleChanged: if (!visible && activeFocus) keyCatcher.forceActiveFocus()
+                hasCursor: root.cursorTarget === "name"
+                onHoveredChanged: root.hoverCursor("name", hovered)
                 anchors.left: parent.left
                 anchors.leftMargin: root.settingInset
                 anchors.right: parent.right
@@ -1619,7 +1740,9 @@ Panel {
                 // Don't fight the user's typing: the polled name is only taken
                 // back while this field is not being edited. Leaving the field
                 // keeps what was typed, the same as Enter.
-                onActiveFocusChanged: if (!activeFocus) {
+                onActiveFocusChanged: if (activeFocus) {
+                  if (root.cursorTargets.indexOf("name") >= 0) root.cursorTarget = "name"
+                } else {
                   root.setDeviceName(text)
                   text = root.shownName
                 }
@@ -1648,6 +1771,8 @@ Panel {
               // The folder, shown as a button that opens it in the chooser.
               Button {
                 id: folderButton
+                hasCursor: root.cursorTarget === "folder"
+                onHovered: function(isHovered) { root.hoverCursor("folder", isHovered) }
                 anchors.left: parent.left
                 anchors.leftMargin: root.settingInset
                 anchors.right: parent.right
@@ -1676,6 +1801,7 @@ Panel {
     required property var peer
     readonly property bool target: root.sendingTo === peer.mac
 
+    hasCursor: root.cursorTarget === "peer:" + peer.mac
     foreground: root.foreground
     implicitHeight: rowText.implicitHeight + Style.spacing.rowPaddingX
 
@@ -1834,7 +1960,7 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: sendProc.running ? Qt.BusyCursor : Qt.PointingHandCursor
-      onContainsMouseChanged: row.hasCursor = containsMouse
+      onContainsMouseChanged: root.hoverCursor("peer:" + row.peer.mac, containsMouse)
       onClicked: root.sendTo(row.peer.mac)
     }
 
