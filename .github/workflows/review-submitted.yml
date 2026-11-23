@@ -16,4 +16,5 @@ jobs:
     if: github.event.review.state == 'approved'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Approved review on #${{ github.event.pull_request.number }}"
+      # Quoted: unquoted, YAML reads " #" as the start of a comment.
+      - run: 'echo "Approved review on #${{ github.event.pull_request.number }}"'
