@@ -1903,7 +1903,11 @@ fn clip_dirs_left(f: &Fixture) -> Vec<PathBuf> {
     std::fs::read_dir(f.root.join("run/omdrop"))
         .map(|d| {
             d.map(|e| e.unwrap().path())
-                .filter(|p| !p.ends_with("previews") && !p.ends_with("decode.lock"))
+                .filter(|p| {
+                    !p.ends_with("previews")
+                        && !p.ends_with("decode.lock")
+                        && !p.ends_with("received")
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -2125,6 +2129,33 @@ fn toasts(f: &Fixture) -> Vec<(String, Option<PathBuf>)> {
 
 fn last_image(f: &Fixture) -> Option<PathBuf> {
     toasts(f).pop().expect("no toast").1
+}
+
+#[test]
+fn received_names_the_image_each_toast_showed() {
+    let f = preview_fixture();
+    let mut shown = Vec::new();
+    for name in ["IMG_1.heic", "photo.png", "notes.pdf"] {
+        let file = arrive(&f, name, &[]);
+        shown.push((file, last_image(&f)));
+    }
+    let (out, _) = f.run(&["received", "--json"], &[]);
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed: Vec<(PathBuf, Option<PathBuf>)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|a| {
+            (
+                PathBuf::from(a["path"].as_str().unwrap()),
+                a["preview"].as_str().map(PathBuf::from),
+            )
+        })
+        .collect();
+    assert_eq!(listed, shown);
+    assert_eq!(shown[1].1.as_ref(), Some(&shown[1].0));
+    assert_eq!(shown[2].1, None);
 }
 
 #[test]
