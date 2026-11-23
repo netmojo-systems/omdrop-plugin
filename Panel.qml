@@ -238,7 +238,10 @@ Panel {
     else if (target === "senderField") senderField.forceActiveFocus()
     else if (target === "folder") pickDownloadDir()
     else if (target.indexOf("peer:") === 0) sendTo(target.substring(5))
-    else if (target.indexOf("sender:") === 0) removeSender(target.substring(7))
+  }
+
+  function deleteCursor() {
+    if (cursorTarget.indexOf("sender:") === 0) removeSender(cursorTarget.substring(7))
   }
 
   Timer {
@@ -1422,6 +1425,7 @@ Panel {
       blocked: nameField.activeFocus || senderField.activeFocus
       onCloseRequested: root.controller.hide()
       onActivateRequested: root.activateCursor()
+      onDeleteRequested: root.deleteCursor()
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) root.moveCursor(dy)
         else if (root.cursorTarget === "slider") root.stepWindow(dx)
