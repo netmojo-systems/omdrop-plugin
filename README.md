@@ -77,12 +77,11 @@ Run `omdrop install-core` first, so that `omdrop install-driver` runs as omdrop-
 
 ## Receive files
 
-Click the icon to open the panel:
+Click the icon to open the panel. The header shows the name Apple devices see, with Omdrop's state under it.
 
 - **The switch** turns receiving on and off. Right-clicking the icon does the same.
-- **Stay visible for** sets how long you stay visible: one file, a set time, or until you turn it off.
-- **They see you as** sets the name Apple devices show. It defaults to the hostname.
-- **Save files to** opens a folder chooser. It defaults to `~/Downloads`.
+- **Visible for** shows the time left. Open it to set how long you stay visible: one file, a set time, or until you turn it off.
+- **Settings** holds **Name**, the name Apple devices show, and **Save to**, which opens a folder chooser. They default to the hostname and `~/Downloads`.
 
 After a transfer, you can turn receiving off and on again without waiting for the sender's connection to close.
 
@@ -94,10 +93,10 @@ A shared link arrives as a `.url` or `.webloc` file. Clicking its notification, 
 
 ## Send files
 
-Expand **Send to peers**, or press `n` in the panel. If Omdrop is off, this turns it on, because the receive window is what hears nearby devices.
+Open **Send a file**, or press `n` in the panel. If Omdrop is off, this turns it on, because the receive window is what hears nearby devices.
 
 - A radar shows each nearby device as a dot. Brighter and nearer the centre means a stronger signal, not a direction or distance.
-- Devices that answer with a name are listed under the heading.
+- Devices that answer with a name are listed above the radar.
 - Click a name or any dot, then choose one or more files. They go as one transfer, so the recipient accepts once. The chooser opens in the folder you last sent from. The row shows progress, and an **×** cancels the send.
 - Named devices ping as the sweep passes them. The speaker in the radar's corner mutes the sound, and Omdrop remembers the setting.
 
@@ -139,6 +138,8 @@ A name that matches only part of a device's name, any other sender, and the bash
 While a file transfer uploads, omdrop-core's `omdrop send` writes its progress to stderr as `\r<sent> / <total> bytes` steps, at most every 100 ms and once at the end. `<total>` is the size of the files being sent. Programs such as file managers can read the steps to show a progress bar; it's the same format as owly's `owly send`. Link sends have no upload, so they print no progress, and neither does a radio backend's own sender, used when omdrop-core isn't installed.
 
 `OMDROP_NAME_WAIT` sets the discovery timeout in decimal seconds (1–2147483647, default 120). Leading zeros are allowed; invalid values use the default. omdrop-core waits exactly that long; the bash and Python programs count whole seconds of the clock, so their wait is between one second less and the full value. Stopping lookup processes can take up to two additional seconds, including when a helper stops producing output but remains alive. Cancellation stops the lookup and its probes. `--wait` controls the separate receiver-wake wait after discovery, not the name search.
+
+`OMDROP_UPLOAD_RTO_CAP=1` caps how long omdrop-core's sender waits between resends during a file upload, at 1.3 s, and gives up after 120 s with no acknowledgement. Without it, Linux backs off as far as 120 s between resends, so a send that stalls when the receiver briefly stops listening can sit idle long after the link is back. The default is off. It is read from the environment of each send, for example `OMDROP_UPLOAD_RTO_CAP=1 omdrop send iPhone video.mov`; a send started from the panel uses the panel's environment. `0`, empty or unset leaves TCP untouched; any other value is refused. It needs Linux 6.15 or newer. On an older kernel the upload proceeds with Linux's defaults and logs a warning.
 
 In `omdrop peers -n` output, `(no response)` means nothing answered on the AirDrop port, and `(anonymous)` means the device answered but withheld its name. To look up names without the Bluetooth announcement, add `--no-wake`; only devices already listening will answer. AWDL addresses change every session.
 
