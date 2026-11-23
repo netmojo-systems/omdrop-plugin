@@ -975,8 +975,14 @@ Panel {
     sendersEditProc.command = [root.cli, "senders", "add", id]
     sendersEditProc.running = true
   }
+  property string removingSender: ""
   function removeSender(id) {
-    if (sendersEditProc.running) return
+    removingSender = id
+  }
+  function confirmRemoveSender() {
+    var id = removingSender
+    removingSender = ""
+    if (id === "" || sendersEditProc.running) return
     sendersEditProc.clearField = false
     sendersEditProc.command = [root.cli, "senders", "remove", id]
     sendersEditProc.running = true
@@ -1360,6 +1366,7 @@ Panel {
       windowOpen = false
       settingsOpen = false
       cursorTarget = ""
+      removingSender = ""
     }
   }
 
@@ -1422,7 +1429,10 @@ Panel {
       // The catcher sees keys before its descendants, so while a text field
       // is being typed into it must stand aside: otherwise Enter and Space
       // toggle Omdrop, d and n act, and h/j/k/l/x never reach the field.
-      blocked: nameField.activeFocus || senderField.activeFocus
+      blocked: nameField.activeFocus || senderField.activeFocus || removeConfirm.opened
+      Keys.onPressed: function(event) {
+        if (removeConfirm.handleKey(event)) event.accepted = true
+      }
       onCloseRequested: root.controller.hide()
       onActivateRequested: root.activateCursor()
       onDeleteRequested: root.deleteCursor()
@@ -1433,6 +1443,19 @@ Panel {
       onTextKey: function(t) {
         if (t === "d" || t === "D") root.toggleOmdrop()
         else if (t === "n" || t === "N") root.openRadar()
+      }
+
+      ConfirmDialog {
+        id: removeConfirm
+        anchors.fill: parent
+        z: 10
+        opened: root.removingSender !== ""
+        message: "Remove " + root.removingSender + "?"
+        confirmText: "Remove"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onCanceled: root.removingSender = ""
+        onConfirmed: root.confirmRemoveSender()
       }
 
       Column {
