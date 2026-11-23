@@ -83,6 +83,8 @@ Click the icon to open the panel. The header shows the name Apple devices see, w
 - **Visible for** shows the time left. Open it to set how long you stay visible: one file, a set time, or until you turn it off.
 - **Settings** holds **Name**, the name Apple devices show, and **Save to**, which opens a folder chooser. They default to the hostname and `~/Downloads`.
 
+The panel works from the keyboard too. `j` and `k`, or the arrow keys, move a highlight through the switch, the rows, and what an open row shows; Enter or Space acts on the highlighted item, and `h` and `l` move the **Visible for** slider. With nothing highlighted, Enter turns Omdrop on or off, as `d` does. Escape closes the panel.
+
 After a transfer, you can turn receiving off and on again without waiting for the sender's connection to close.
 
 If the computer sleeps while Omdrop is on, omdrop-core brings the window back when it wakes; the Python version leaves it for you to turn off and on again. On a Mac the radio takes from about 20 seconds to 2 minutes to return, and the panel shows **Waking the radio** until it does. A timed window doesn't count the time asleep. A window that can't come back turns off, and so does one whose 1Password identity expired during the sleep.
@@ -159,7 +161,7 @@ omdrop visibility everyone          # back to the default
 
 The panel's **Receive from** row shows the same choice. Open it to pick **Everyone** or **Contacts only**. You can set it while Omdrop is off, and it is saved, so it applies every time you turn Omdrop on.
 
-While **Contacts only** is chosen, the open row lists your known senders. Type an email address or phone number and press Enter to add someone; click the **×** beside a sender to remove them. Changes apply to the next transfer, with no restart.
+While **Contacts only** is chosen, the open row lists your known senders. Type an email address or phone number and press Enter to add someone; click the **×** beside a sender to remove them, or highlight them and press `x` or Delete. Changes apply to the next transfer, with no restart.
 
 A sender is accepted only if Apple's signature on their identity record is valid, the record matches the certificate on the connection, and one of its identifiers is on your list. Anyone else is refused before any file data is read. An empty list refuses everyone.
 
