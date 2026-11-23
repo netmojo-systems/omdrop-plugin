@@ -157,9 +157,9 @@ omdrop visibility contacts
 omdrop visibility everyone          # back to the default
 ```
 
-The panel shows the same choice as **Everyone** and **Contacts Only** tabs under the timer. You can set it while Omdrop is off, and it is saved, so it applies every time you turn Omdrop on.
+The panel's **Receive from** row shows the same choice. Open it to pick **Everyone** or **Contacts only**. You can set it while Omdrop is off, and it is saved, so it applies every time you turn Omdrop on.
 
-The people button at the right of that line opens the known-senders list, with the number of senders beside it. Type an email address or phone number and press Enter to add someone; click a sender to remove them. Changes apply to the next transfer, with no restart.
+While **Contacts only** is chosen, the open row lists your known senders. Type an email address or phone number and press Enter to add someone; click the **×** beside a sender to remove them. Changes apply to the next transfer, with no restart.
 
 A sender is accepted only if Apple's signature on their identity record is valid, the record matches the certificate on the connection, and one of its identifiers is on your list. Anyone else is refused before any file data is read. An empty list refuses everyone.
 
