@@ -77,12 +77,11 @@ Run `omdrop install-core` first, so that `omdrop install-driver` runs as omdrop-
 
 ## Receive files
 
-Click the icon to open the panel:
+Click the icon to open the panel. The header shows the name Apple devices see, with Omdrop's state under it.
 
 - **The switch** turns receiving on and off. Right-clicking the icon does the same.
-- **Stay visible for** sets how long you stay visible: one file, a set time, or until you turn it off.
-- **They see you as** sets the name Apple devices show. It defaults to the hostname.
-- **Save files to** opens a folder chooser. It defaults to `~/Downloads`.
+- **Visible for** shows the time left. Open it to set how long you stay visible: one file, a set time, or until you turn it off.
+- **Settings** holds **Name**, the name Apple devices show, and **Save to**, which opens a folder chooser. They default to the hostname and `~/Downloads`.
 
 After a transfer, you can turn receiving off and on again without waiting for the sender's connection to close.
 
@@ -94,10 +93,10 @@ A shared link arrives as a `.url` or `.webloc` file. Clicking its notification, 
 
 ## Send files
 
-Expand **Send to peers**, or press `n` in the panel. If Omdrop is off, this turns it on, because the receive window is what hears nearby devices.
+Open **Send a file**, or press `n` in the panel. If Omdrop is off, this turns it on, because the receive window is what hears nearby devices.
 
 - A radar shows each nearby device as a dot. Brighter and nearer the centre means a stronger signal, not a direction or distance.
-- Devices that answer with a name are listed under the heading.
+- Devices that answer with a name are listed above the radar.
 - Click a name or any dot, then choose one or more files. They go as one transfer, so the recipient accepts once. The chooser opens in the folder you last sent from. The row shows progress, and an **×** cancels the send.
 - Named devices ping as the sweep passes them. The speaker in the radar's corner mutes the sound, and Omdrop remembers the setting.
 
@@ -140,6 +139,8 @@ While a file transfer uploads, omdrop-core's `omdrop send` writes its progress t
 
 `OMDROP_NAME_WAIT` sets the discovery timeout in decimal seconds (1–2147483647, default 120). Leading zeros are allowed; invalid values use the default. omdrop-core waits exactly that long; the bash and Python programs count whole seconds of the clock, so their wait is between one second less and the full value. Stopping lookup processes can take up to two additional seconds, including when a helper stops producing output but remains alive. Cancellation stops the lookup and its probes. `--wait` controls the separate receiver-wake wait after discovery, not the name search.
 
+`OMDROP_UPLOAD_RTO_CAP=1` caps how long omdrop-core's sender waits between resends during a file upload, at 1.3 s, and gives up after 120 s with no acknowledgement. Without it, Linux backs off as far as 120 s between resends, so a send that stalls when the receiver briefly stops listening can sit idle long after the link is back. The default is off. It is read from the environment of each send, for example `OMDROP_UPLOAD_RTO_CAP=1 omdrop send iPhone video.mov`; a send started from the panel uses the panel's environment. `0`, empty or unset leaves TCP untouched; any other value is refused. It needs Linux 6.15 or newer. On an older kernel the upload proceeds with Linux's defaults and logs a warning.
+
 In `omdrop peers -n` output, `(no response)` means nothing answered on the AirDrop port, and `(anonymous)` means the device answered but withheld its name. To look up names without the Bluetooth announcement, add `--no-wake`; only devices already listening will answer. AWDL addresses change every session.
 
 With omdrop-core, every name a lookup learns is kept for 30 minutes in `$XDG_RUNTIME_DIR/omdrop/peer-names.json`, whichever program ran the lookup. `omdrop peers --json` shows a kept name for as long as its device stays in the table, and `-n` output shows it for a device that didn't answer this time. One named lookup runs at a time. A `peers -n` that starts while another is running doesn't announce or connect: it waits for that lookup and answers with what it learned, or with `--stream` passes on that lookup's names as they arrive, for at most `OMDROP_NAME_WAIT`. An `omdrop send NAME` waits for it too, then runs its own lookup: only a whole lookup of its own shows that one device has the name.
@@ -156,9 +157,9 @@ omdrop visibility contacts
 omdrop visibility everyone          # back to the default
 ```
 
-The panel shows the same choice as **Everyone** and **Contacts Only** tabs under the timer. You can set it while Omdrop is off, and it is saved, so it applies every time you turn Omdrop on.
+The panel's **Receive from** row shows the same choice. Open it to pick **Everyone** or **Contacts only**. You can set it while Omdrop is off, and it is saved, so it applies every time you turn Omdrop on.
 
-The people button at the right of that line opens the known-senders list, with the number of senders beside it. Type an email address or phone number and press Enter to add someone; click a sender to remove them. Changes apply to the next transfer, with no restart.
+While **Contacts only** is chosen, the open row lists your known senders. Type an email address or phone number and press Enter to add someone; click the **×** beside a sender to remove them. Changes apply to the next transfer, with no restart.
 
 A sender is accepted only if Apple's signature on their identity record is valid, the record matches the certificate on the connection, and one of its identifiers is on your list. Anyone else is refused before any file data is read. An empty list refuses everyone.
 
