@@ -1662,7 +1662,7 @@ Panel {
                     anchors.centerIn: parent
                     width: Style.space(22)
                     height: width
-                    source: root.thumbnailOf(arrivalRow.modelData)
+                    source: root.receivedOpen ? root.thumbnailOf(arrivalRow.modelData) : ""
                     sourceSize.width: width * 2
                     sourceSize.height: height * 2
                     fillMode: Image.PreserveAspectCrop
